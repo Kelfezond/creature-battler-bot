@@ -337,7 +337,8 @@ async def spawn(interaction: discord.Interaction):
         logger.exception("Creature generation error")
         return await interaction.followup.send("Creature generator failed. Try again later.")
 
-    stats = allocate_stats(rarity, ai["descriptors"]) \n    async with pool.acquire() as conn:
+    stats = allocate_stats(rarity, ai["descriptors"])
+    async with pool.acquire() as conn:
         await conn.execute(  # Insert Python objects, let asyncpg encode JSON
             "INSERT INTO creatures (owner_id,name,rarity,descriptors,stats,abilities)"
             " VALUES ($1,$2,$3,$4,$5,$6)",

@@ -146,20 +146,43 @@ async def ask_openai(prompt: str) -> str:
 
 
 async def generate_creature(rarity: str) -> Dict[str, any]:
+    """
+    Ask GPT for a creature and return
+      { "name": str, "descriptors": [str, str, str] }
+    """
     prompt = textwrap.dedent(f"""
         You are inventing a dark-fantasy arena monster for a gritty creature-battler game.
-        Output EXACTLY two lines:
-        1. A short unique name (1-3 words).
-        2. Exactly THREE descriptor keywords, comma-separated.
+
+        Reply **only** with valid JSON in this exact schema:
+
+        {{
+          "name": "<short unique name (1-3 words)>",
+          "descriptors": ["<descriptor1>", "<descriptor2>", "<descriptor3>"]
+        }}
+
+        No markdown, no extra keys, no newlines before or after the JSON block.
         Creature rarity: {rarity}.
     """)
-    text = await ask_openai(prompt)
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if len(lines) < 2:
-        raise ValueError("OpenAI response malformed")
-    return {
-        "name": lines[0],
-        "descriptors": [d.strip() for d in lines[1].split(",")][:3],
+
+    # blocking call -> run in executor
+    loop = asyncio.get_running_loop()
+    resp = await loop.run_in_executor(
+        None,
+        lambda: openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "system", "content": prompt}],
+            temperature=0.9,
+            max_tokens=120,
+        ),
+    )
+    txt = resp.choices[0].message.content.strip()
+
+    try:
+        data = json.loads(txt)
+        assert isinstance(data["descriptors"], list) and len(data["descriptors"]) == 3
+        return data
+    except Exception as e:
+        raise ValueError(f"Bad GPT JSON: {txt}") from e
     }
 
 # ─── Bot lifecycle ────────────────────────────────────────────────

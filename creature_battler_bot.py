@@ -1,12 +1,15 @@
 """
-Creature Battler Discord Bot – scaffolding v0.4  (adds abilities)
------------------------------------------------------------------
-New on /spawn:
- • GPT now returns 3-5 abilities.
- • Abilities are stored in the DB (abilities JSONB) and shown in the embed.
+Creature Battler Discord Bot – v0.5  (abilities + anti-repeat)
+--------------------------------------------------------------
+Adds:
+ • Abilities with %-based modifiers.
+ • Prompt includes names/words already in DB so GPT avoids repetition.
+ • Retries up to 3× if GPT returns bad JSON or duplicates.
 
-Dep / runtime stack stays the same:
- discord.py-2.3.2, asyncpg-0.29.0, openai-0.28.1
+Depends on:
+ discord.py==2.3.2
+ asyncpg==0.29.0
+ openai==0.28.1
 """
 
 from __future__ import annotations
@@ -14,29 +17,31 @@ import asyncio, json, logging, os, random, textwrap
 from functools import partial
 from typing import Dict, List
 
-import asyncpg, discord, openai
+import asyncpg
+import discord
 from discord.ext import commands
+import openai                         # pre-1.0 SDK
 
-# ─── ENV ─────────────────────────────────────────────────────────
-TOKEN     = os.getenv("DISCORD_TOKEN")
-CLIENT_ID = os.getenv("CLIENT_ID")
-GUILD_ID  = os.getenv("GUILD_ID")  # "" → global
-DB_URL    = os.getenv("DATABASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ─── Environment ───────────────────────────────────────────────
+TOKEN  = os.getenv("DISCORD_TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
+GUILD_ID = os.getenv("GUILD_ID")      # "" → global
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-for k, v in {"DISCORD_TOKEN": TOKEN, "CLIENT_ID": CLIENT_ID,
-             "DATABASE_URL": DB_URL, "OPENAI_API_KEY": OPENAI_API_KEY}.items():
+for k, v in {
+    "DISCORD_TOKEN": TOKEN,
+    "DATABASE_URL": DB_URL,
+    "OPENAI_API_KEY": openai.api_key,
+}.items():
     if not v:
         raise RuntimeError(f"Missing env var: {k}")
 
-openai.api_key = OPENAI_API_KEY
-
-# ─── DISCORD CLIENT ──────────────────────────────────────────────
+# ─── Discord client ────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ─── POSTGRES ────────────────────────────────────────────────────
+# ─── Postgres helpers ──────────────────────────────────────────
 async def db_pool() -> asyncpg.Pool:
     if not hasattr(bot, "_pool"):
         bot._pool = await asyncpg.create_pool(DB_URL)
@@ -60,7 +65,7 @@ CREATE TABLE IF NOT EXISTS creatures (
 );
 """
 
-# ─── GAME CONSTANTS ──────────────────────────────────────────────
+# ─── Game constants ────────────────────────────────────────────
 RARITY_TABLE = [
     (1, 75, "Common"),
     (76, 88, "Uncommon"),
@@ -68,21 +73,24 @@ RARITY_TABLE = [
     (96, 98, "Epic"),
     (99, 100, "Legendary"),
 ]
+
 POINT_POOLS = {
-    "Common":     (25, 50),
-    "Uncommon":   (50, 100),
-    "Rare":       (100, 200),
-    "Epic":       (200, 400),
-    "Legendary":  (400, 800),
-}
-PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
-BIAS_MAP = {
-    "Rocky":            {"AR": +0.2, "SPD": -0.2},
-    "Lightning-fast":   {"SPD": +0.2, "AR": -0.2},
-    "Giant":            {"HP": +0.2, "SPD": -0.2},
+    "Common":    (25,  50),
+    "Uncommon":  (50, 100),
+    "Rare":      (100, 200),
+    "Epic":      (200, 400),
+    "Legendary": (400, 800),
 }
 
-# ─── UTILS ───────────────────────────────────────────────────────
+PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
+
+BIAS_MAP = {
+    "Rocky":           {"AR": +0.2, "SPD": -0.2},
+    "Lightning-fast":  {"SPD": +0.2, "AR": -0.2},
+    "Giant":           {"HP": +0.2, "SPD": -0.2},
+}
+
+# ─── Utility functions ─────────────────────────────────────────
 def roll_d100() -> int:
     return random.randint(1, 100)
 
@@ -96,71 +104,102 @@ def allocate_stats(rarity: str, descriptors: List[str]) -> Dict[str, int]:
     pool = random.randint(*POINT_POOLS[rarity])
     stats = {s: 1 for s in PRIMARY_STATS}
     pool -= len(PRIMARY_STATS)
-
     weights = {s: 1.0 for s in PRIMARY_STATS}
     for d in descriptors:
         for stat, delta in BIAS_MAP.get(d, {}).items():
             weights[stat] = max(0.1, weights[stat] + delta)
 
-    total = sum(weights.values())
+    total_w = sum(weights.values())
     for _ in range(pool):
-        roll = random.uniform(0, total)
+        r = random.uniform(0, total_w)
         acc = 0
         for stat, w in weights.items():
             acc += w
-            if roll <= acc:
+            if r <= acc:
                 stats[stat] += 1
                 break
     return stats
 
+async def fetch_used_names_words() -> tuple[list[str], list[str]]:
+    rows = await (await db_pool()).fetch("SELECT name, descriptors FROM creatures")
+    names = [r["name"].lower() for r in rows]
+    words = {w.lower() for r in rows for w in r["descriptors"]}
+    # truncate to keep prompt small
+    return names[:60], list(words)[:120]
+
 async def ask_openai(prompt: str) -> str:
     loop = asyncio.get_running_loop()
-    fn = partial(openai.ChatCompletion.create,
-                 model="gpt-3.5-turbo",
-                 messages=[{"role": "system", "content": prompt},
-                           {"role": "user", "content": "Generate now."}],
-                 temperature=0.9,
-                 max_tokens=150)
+    fn = partial(
+        openai.ChatCompletion.create,
+        model="gpt-3.5-turbo",
+        messages=[{"role": "system", "content": prompt},
+                  {"role": "user", "content": "Generate now."}],
+        temperature=1.2,
+        presence_penalty=0.8,
+        max_tokens=180,
+    )
     resp = await loop.run_in_executor(None, fn)
     return resp.choices[0].message.content.strip()
 
 async def generate_creature_json(rarity: str) -> Dict[str, any]:
-    prompt = textwrap.dedent(f"""
-        You are inventing a dark-fantasy arena monster.
+    names_used, words_used = await fetch_used_names_words()
 
-        Reply ONLY with valid JSON in this schema:
-        {{
-          "name": "string  (1-3 words)",
-          "descriptors": ["word1","word2","word3"],
-          "abilities": [
-            {{"name":"<ability>","type":"physical|special|utility","weight":int}},
-            …
-          ]
-        }}
+    base_prompt = textwrap.dedent(f"""
+      You are inventing a dark-fantasy arena monster.
 
-        • Provide 3 to 5 abilities.
-        • Weaker moves receive HIGHER weight numbers (1-100 scale).
-        • Do not include any keys besides those shown.
-        • No markdown, no surrounding text.
+      Reply ONLY with valid JSON:
+      {{
+        "name": "string (1-3 words)",
+        "descriptors": ["word1","word2","word3"],
+        "abilities": [
+          {{
+            "name":"string",
+            "type":"physical|special|utility",
+            "damage_mod": int,     // e.g. 0,+20,-10
+            "defense_mod": int,    // 0 if none
+            "speed_mod": int,      // 0 if none
+            "weight": int          // 1-100 (weaker ⇒ higher)
+          }}
+        ]
+      }}
 
-        Creature rarity: {rarity}
+      • 3-5 abilities total.
+      • Numbers only, no extra keys, no markdown.
+      • Avoid **exact** repeats found below; use synonyms if needed.
+
+      Names already taken: {', '.join(names_used)}
+      Descriptor words already used: {', '.join(words_used)}
+
+      Creature rarity: {rarity}
     """)
-    text = await ask_openai(prompt)
-    data = json.loads(text)
-    assert 3 <= len(data["abilities"]) <= 5
-    return data
 
-# ─── BOT LIFECYCLE ───────────────────────────────────────────────
+    for _ in range(3):  # retry up to 3 times
+        text = await ask_openai(base_prompt)
+        try:
+            data = json.loads(text)
+            # quick validations
+            if (data["name"].lower() in names_used or
+                any(w.lower() in words_used for w in data["descriptors"])):
+                raise ValueError("duplicate")
+            if not (3 <= len(data["abilities"]) <= 5):
+                raise ValueError("ability count")
+            return data
+        except Exception:
+            continue
+    raise RuntimeError("GPT failed 3 times")
+
+# ─── Bot lifecycle ──────────────────────────────────────────────
 @bot.event
 async def setup_hook():
     pool = await db_pool()
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
 
+    # slash-command sync
     if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
+        g = discord.Object(id=int(GUILD_ID))
+        bot.tree.copy_global_to(guild=g)
+        await bot.tree.sync(guild=g)
         print(f"✅ Commands synced to guild {GUILD_ID}")
     else:
         await bot.tree.sync()
@@ -170,7 +209,7 @@ async def setup_hook():
 async def on_ready():
     print(f"🤖 Logged in as {bot.user} ({bot.user.id})")
 
-# ─── COMMANDS ────────────────────────────────────────────────────
+# ─── Commands ───────────────────────────────────────────────────
 @bot.tree.command(description="Register yourself as a trainer")
 async def register(interaction: discord.Interaction):
     uid = interaction.user.id
@@ -207,13 +246,17 @@ async def spawn(interaction: discord.Interaction):
             json.dumps(stats), json.dumps(ai["abilities"])
         )
 
-    # ── Embed ──
     embed = discord.Embed(title=f"{ai['name']} ({rarity})", colour=0x8B0000)
     embed.add_field(name="Descriptors", value=", ".join(ai["descriptors"]), inline=False)
     for s in PRIMARY_STATS:
         embed.add_field(name=s, value=str(stats[s]), inline=True)
 
-    ability_lines = [f"• {ab['name']} ({ab['type']}, w={ab['weight']})" for ab in ai["abilities"]]
+    ability_lines = [
+        f"• {ab['name']} ({ab['type']}, "
+        f"dmg {ab['damage_mod']}%, def {ab['defense_mod']}%, "
+        f"spd {ab['speed_mod']}%, w={ab['weight']})"
+        for ab in ai["abilities"]
+    ]
     embed.add_field(name="Abilities", value="\n".join(ability_lines), inline=False)
     embed.set_footer(text=f"d100 roll: {roll}")
 
@@ -223,22 +266,27 @@ async def spawn(interaction: discord.Interaction):
 async def creatures(interaction: discord.Interaction):
     uid = interaction.user.id
     rows = await (await db_pool()).fetch(
-        "SELECT name, rarity, stats, abilities FROM creatures WHERE owner_id=$1 ORDER BY id", uid
+        "SELECT name, rarity, stats, abilities FROM creatures WHERE owner_id=$1 ORDER BY id",
+        uid,
     )
     if not rows:
         return await interaction.response.send_message("You own no creatures yet.", ephemeral=True)
 
     lines: List[str] = []
     for i, r in enumerate(rows, 1):
-        s = r["stats"] if isinstance(r["stats"], dict) else json.loads(r["stats"])
-        a = r["abilities"] if isinstance(r["abilities"], list) else json.loads(r["abilities"])
-        summary = ", ".join(f"{k}:{v}" for k, v in s.items())
-        abil    = ", ".join(ab['name'] for ab in a)
-        lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {summary} – [{abil}]")
+        stats = r["stats"] if isinstance(r["stats"], dict) else json.loads(r["stats"])
+        abilities = (
+            r["abilities"] if isinstance(r["abilities"], list) else json.loads(r["abilities"])
+        )
+        stat_summary = ", ".join(f"{k}:{v}" for k, v in stats.items())
+        abil_summary = ", ".join(ab["name"] for ab in abilities)
+        lines.append(
+            f"{i}. **{r['name']}** ({r['rarity']}) – {stat_summary} – [{abil_summary}]"
+        )
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-# ─── MAIN ────────────────────────────────────────────────────────
+# ─── Main entry ─────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     bot.run(TOKEN)

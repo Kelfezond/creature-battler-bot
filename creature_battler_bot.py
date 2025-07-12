@@ -109,11 +109,13 @@ active_battles: Dict[int, BattleState] = {}
 def roll_d100() -> int:
     return random.randint(1, 100)
 
+
 def rarity_from_roll(r: int) -> str:
     for low, high, name in RARITY_TABLE:
         if low <= r <= high:
             return name
     return "Common"
+
 
 def allocate_stats(rarity: str, descriptors: List[str], extra: int = 0) -> Dict[str, int]:
     pool = random.randint(*POINT_POOLS[rarity]) + extra
@@ -134,7 +136,15 @@ def allocate_stats(rarity: str, descriptors: List[str], extra: int = 0) -> Dict[
                 break
     return stats
 
-# ─── OpenAI Creature Generator ────────────────────────────────────
+# ─── JSON Fixer ──────────────────────────────────────────────
+def _fix_json(txt: str) -> str:
+    txt = txt.replace("“", '"').replace("”", '"').replace("’", "'")
+    txt = re.sub(r',\s*([}\]])', r'\1', txt)
+    txt += '}' * max(0, txt.count('{') - txt.count('}'))
+    txt += ']' * max(0, txt.count('[') - txt.count(']'))
+    return txt.strip()
+
+# ─── OpenAI Creature Generator ─────────────────────────────────
 async def ask_openai(prompt: str, max_tokens: int = 400) -> Tuple[str, Optional[str]]:
     loop = asyncio.get_running_loop()
     fn = partial(
@@ -204,27 +214,20 @@ async def generate_creature_json(rarity: str) -> Dict[str, Any]:
                 data = json.loads(_fix_json(text))
             except Exception:
                 continue
-        if data.get("name",""
-        ).lower() in names_used or len(data.get("abilities",[])) != 3:
+        if data.get("name", "").lower() in names_used or len(data.get("abilities", [])) != 3:
             continue
         return data
     for _ in range(2):
-        seed = random.randint(1,1_000_000)
-        text,_ = await ask_openai(base_prompt + f"
-SEED:{seed}")
+        seed = random.randint(1, 1_000_000)
+        text, _ = await ask_openai(base_prompt + f" SEED:{seed}")
         try:
             data = json.loads(_fix_json(text))
         except Exception:
             continue
-        if data.get("name",""
-        ).lower() in names_used or len(data.get("abilities",[])) != 3:
+        if data.get("name", "").lower() in names_used or len(data.get("abilities", [])) != 3:
             continue
         return data
     raise RuntimeError("Failed to generate creature JSON")
-
-
-# ─── OpenAI Creature Generator (unchanged) ──────────────────
-# ... (keep generate_creature_json, ask_openai, etc.)
 
 # ─── Battle Simulation ──────────────────────────────────────
 def choose_ability(creature: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,64 +235,55 @@ def choose_ability(creature: Dict[str, Any]) -> Dict[str, Any]:
     weights = [ab["weight"] for ab in abilities]
     return random.choices(abilities, weights=weights, k=1)[0]
 
-
 def simulate_round(state: BattleState):
-    # determine turn order based on SPD
     u_spd = state.user_creature["stats"]["SPD"]
     o_spd = state.opp_creature["stats"]["SPD"]
     order = [("user", state.user_creature), ("opp", state.opp_creature)]
     if o_spd > u_spd or (o_spd == u_spd and random.choice([True, False])):
         order.reverse()
-
     for actor, creature in order:
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             return
         chosen = choose_ability(creature)
         name = creature["name"]
-
-        # UTILITY: buff or heal
         if chosen["type"] == "utility":
             buff = chosen.get("defense_mod", 0)
             if buff > 0:
-                if actor == "user": state.user_creature["stats"]["AR"] += buff
-                else: state.opp_creature["stats"]["AR"] += buff
+                if actor == "user":
+                    state.user_creature["stats"]["AR"] += buff
+                else:
+                    state.opp_creature["stats"]["AR"] += buff
                 state.logs.append(f"{name} used {chosen['name']} and increased AR by {buff}.")
             else:
-                heal_amt = chosen.get("defense_mod", 0) or math.ceil(chosen.get("weight",0)/10)
-                if actor == "user": state.user_current_hp = min(state.user_max_hp, state.user_current_hp + heal_amt)
-                else: state.opp_current_hp = min(state.opp_max_hp, state.opp_current_hp + heal_amt)
+                heal_amt = math.ceil(chosen.get("weight", 0) / 10)
+                if actor == "user":
+                    state.user_current_hp = min(state.user_max_hp, state.user_current_hp + heal_amt)
+                else:
+                    state.opp_current_hp = min(state.opp_max_hp, state.opp_current_hp + heal_amt)
                 state.logs.append(f"{name} used {chosen['name']} and healed {heal_amt} HP.")
             continue
-
-        # OFFENSIVE: roll dice and log
         stats = creature["stats"]
         S = stats["PATK"] if chosen["type"] == "physical" else stats["SATK"]
-        N = math.ceil(S/10)
-        dice = [random.randint(1,6) for _ in range(N)]
+        N = math.ceil(S / 10)
+        dice = [random.randint(1, 6) for _ in range(N)]
         total_roll = sum(dice)
         state.logs.append(f"{name} rolls {N}d6: {dice} → {total_roll}")
-
-        # check ultimate
         max_mod = max(ab["damage_mod"] for ab in creature["abilities"])
         is_ult = chosen["damage_mod"] >= max_mod
         if is_ult:
             if random.random() > 0.3:
                 state.logs.append(f"{name} tried {chosen['name']} but missed.")
                 continue
-            damage_val = total_roll*2
+            damage_val = total_roll * 2
         else:
             damage_val = total_roll
-
-        # apply armor
         if chosen["type"] == "physical":
-            target_stats = state.opp_creature if actor=="user" else state.user_creature
-            ar = target_stats["stats"].get("AR",0)
+            target = state.opp_creature if actor == "user" else state.user_creature
+            ar = target["stats"].get("AR", 0)
             damage = max(1, damage_val - ar)
         else:
             damage = damage_val
-
-        # apply damage
-        if actor=="user":
+        if actor == "user":
             state.opp_current_hp -= damage
         else:
             state.user_current_hp -= damage
@@ -302,53 +296,52 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
     uid = interaction.user.id
     if tier not in TIER_EXTRAS:
         return await interaction.response.send_message("Invalid tier.", ephemeral=True)
-    # Fetch and build user creature
     row = await (await db_pool()).fetchrow(
-        "SELECT name,stats,abilities FROM creatures WHERE owner_id=$1 AND name ILIKE $2", uid, creature_name)
+        "SELECT name, stats, abilities FROM creatures WHERE owner_id=$1 AND name ILIKE $2", uid, creature_name
+    )
     if not row:
         return await interaction.response.send_message("You don't own that creature.", ephemeral=True)
-    user_stats = row['stats'] if isinstance(row['stats'],dict) else json.loads(row['stats'])
-    user_abilities = row['abilities'] if isinstance(row['abilities'],list) else json.loads(row['abilities'])
-    user_creature = {"name":row['name'],"stats":user_stats,"abilities":user_abilities}
+    user_stats = row["stats"] if isinstance(row["stats"], dict) else json.loads(row["stats"])
+    user_abilities = row["abilities"] if isinstance(row["abilities"], list) else json.loads(row["abilities"])
+    user_creature = {"name": row["name"], "stats": user_stats, "abilities": user_abilities}
     # Spawn opponent
-    roll = roll_d100(); rarity = rarity_from_roll(roll)
+    roll = roll_d100()
+    rarity = rarity_from_roll(roll)
     ai = await generate_creature_json(rarity)
     extra = random.randint(*TIER_EXTRAS[tier])
-    opp_stats = allocate_stats(rarity,ai['descriptors'],extra)
-    opp_creature={"name":ai['name'],"stats":opp_stats,"abilities":ai['abilities']}
+    opp_stats = allocate_stats(rarity, ai["descriptors"], extra)
+    opp_creature = {"name": ai["name"], "stats": opp_stats, "abilities": ai["abilities"]}
     # Display creatures
     embed = discord.Embed(title="Battle Start", color=0x3498db)
-    def add_creature_fields(prefix:str, cr:Dict[str,Any], stats:Dict[str,int], abs:list):
-        embed.add_field(name=f"{prefix}: {cr['name']}", value=
-            "\n".join(f"{k}: {stats[k]}" for k in PRIMARY_STATS), inline=True)
-        embed.add_field(name=f"Abilities", value=
-            "\n".join(f"• {a['name']} ({a['type']})" for a in abs), inline=True)
-    add_creature_fields("You",user_creature,user_stats,user_abilities)
-    add_creature_fields("Opponent",opp_creature,opp_stats,opp_creature['abilities'])
-    # Init battle state
-    state=BattleState(uid,user_creature,user_stats['HP'],user_stats['HP'],opp_creature,opp_stats['HP'],opp_stats['HP'],[])
-    active_battles[uid]=state
+    def add_fields(prefix: str, cr: Dict[str, Any], stats: Dict[str,int], abs: List[Any]):
+        embed.add_field(name=f"{prefix}: {cr['name']}", value="\n".join(f"{k}: {stats[k]}" for k in PRIMARY_STATS), inline=True)
+        embed.add_field(name=f"Abilities", value="\n".join(f"• {a['name']} ({a['type']})" for a in abs), inline=True)
+    add_fields("You", user_creature, user_stats, user_abilities)
+    add_fields("Opponent", opp_creature, opp_stats, opp_creature["abilities"])
+    state = BattleState(uid, user_creature, user_stats["HP"], user_stats["HP"], opp_creature, opp_stats["HP"], opp_stats["HP"], [])
+    active_battles[uid] = state
     await interaction.response.send_message(embed=embed)
-    # Run first 10 rounds
     for _ in range(10):
-        if state.user_current_hp<=0 or state.opp_current_hp<=0: break
+        if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+            break
         simulate_round(state)
-    # Send battle log
-    msg = "\n".join(state.logs[:state.rounds*20])
+    msg = "\n".join(state.logs[state.next_log_idx:])
     state.next_log_idx = len(state.logs)
     await interaction.followup.send(msg)
 
 @bot.tree.command(name="continue", description="Continue your ongoing battle")
 async def continue_battle(interaction: discord.Interaction):
-    uid=interaction.user.id
-    state=active_battles.get(uid)
+    uid = interaction.user.id
+    state = active_battles.get(uid)
     if not state:
-        return await interaction.response.send_message("No ongoing battle.",ephemeral=True)
+        return await interaction.response.send_message("No ongoing battle.", ephemeral=True)
     for _ in range(10):
-        if state.user_current_hp<=0 or state.opp_current_hp<=0: break
+        if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+            break
         simulate_round(state)
-    new_logs = state.logs[state.next_log_idx:]
-    state.next_log_idx=len(state.logs)
-    await interaction.response.send_message("\n".join(new_logs))
+    msg = "\n".join(state.logs[state.next_log_idx:])
+    state.next_log_idx = len(state.logs)
+    await interaction.response.send_message(msg)
 
-if __name__=="__main__": bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)

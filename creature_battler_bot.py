@@ -435,8 +435,8 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         out.append("Type /continue to proceed to the next 10 rounds.")
     await interaction.response.send_message("\n".join(out))
 
-@bot.tree.command(description="Continue your ongoing battle")
-async def continue(interaction: discord.Interaction):
+@bot.tree.command(name="continue", description="Continue your ongoing battle")
+async def continue_battle(interaction: discord.Interaction):
     uid = interaction.user.id
     state = active_battles.get(uid)
     if not state:

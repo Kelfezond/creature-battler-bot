@@ -1,34 +1,36 @@
 """
-Creature Battler Discord Bot – v0.5a
-------------------------------------
-• Generates 3-5 abilities with % modifiers
-• Sends GPT a short “avoid list” so names/words repeat far less
-• Retries up to 3×, then seeds the prompt once as a final fallback
-   (so /spawn always returns something)
+Creature Battler Discord Bot – v0.5b
+-----------------------------------
+• Generates 3–5 abilities with %-based modifiers
+• Feeds GPT a short “avoid list” of existing names & words
+• Retries up to 3×; if GPT still misbehaves, adds a random SEED
+• Sanitises trailing-comma JSON so minor format slips don’t break parsing
+• Prints first 300 chars of raw GPT output to logs for easy debugging
 
-Requires:
+Stack (no change):
  discord.py==2.3.2
  asyncpg==0.29.0
  openai==0.28.1
 """
 
 from __future__ import annotations
-import asyncio, json, logging, os, random, textwrap
+import asyncio, json, logging, os, random, re, textwrap
 from functools import partial
 from typing import Dict, List
 
 import asyncpg
 import discord
 from discord.ext import commands
-import openai                         # pre-1.0 SDK
+import openai                              # pre-1.0 SDK
 
 # ─── ENV ────────────────────────────────────────────────────────
-TOKEN      = os.getenv("DISCORD_TOKEN")
-DB_URL     = os.getenv("DATABASE_URL")
-GUILD_ID   = os.getenv("GUILD_ID")          # "" → global
+TOKEN   = os.getenv("DISCORD_TOKEN")
+DB_URL  = os.getenv("DATABASE_URL")
+GUILD_ID = os.getenv("GUILD_ID")           # "" → global
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-for k, v in {"DISCORD_TOKEN": TOKEN, "DATABASE_URL": DB_URL,
+for k, v in {"DISCORD_TOKEN": TOKEN,
+             "DATABASE_URL": DB_URL,
              "OPENAI_API_KEY": openai.api_key}.items():
     if not v:
         raise RuntimeError(f"Missing env var {k}")
@@ -120,19 +122,25 @@ def allocate_stats(rarity: str, descriptors: List[str]) -> Dict[str, int]:
 
 async def fetch_used_lists() -> tuple[list[str], list[str]]:
     rows = await (await db_pool()).fetch("SELECT name, descriptors FROM creatures")
-    names = [r["name"].lower() for r in rows][:40]      # shorter avoid list
+    names = [r["name"].lower() for r in rows][:40]
     words = {w.lower() for r in rows for w in r["descriptors"]}
     return names, list(words)[:80]
 
+def _fix_json(txt: str) -> str:
+    """Remove trailing commas before } or ] so json.loads can succeed."""
+    return re.sub(r',(\s*[}\]])', r'\1', txt).strip()
+
 async def ask_openai(prompt: str) -> str:
     loop = asyncio.get_running_loop()
-    fn = partial(openai.ChatCompletion.create,
-                 model="gpt-3.5-turbo",
-                 messages=[{"role": "system", "content": prompt},
-                           {"role": "user", "content": "Generate now."}],
-                 temperature=1.2,
-                 presence_penalty=0.8,
-                 max_tokens=180)
+    fn = partial(
+        openai.ChatCompletion.create,
+        model="gpt-3.5-turbo",
+        messages=[{"role": "system", "content": prompt},
+                  {"role": "user",   "content": "Generate now."}],
+        temperature=1.2,
+        presence_penalty=0.8,
+        max_tokens=180,
+    )
     resp = await loop.run_in_executor(None, fn)
     return resp.choices[0].message.content.strip()
 
@@ -142,7 +150,7 @@ async def generate_creature_json(rarity: str) -> Dict[str, any]:
     base_prompt = textwrap.dedent(f"""
       You are inventing a dark-fantasy arena monster.
 
-      Reply **only** with JSON:
+      Reply ONLY with JSON:
       {{
         "name": "string (1-3 words)",
         "descriptors": ["word1","word2","word3"],
@@ -158,31 +166,35 @@ async def generate_creature_json(rarity: str) -> Dict[str, any]:
         ]
       }}
 
-      • Provide 3 – 5 abilities.
-      • Lower total effect ⇒ higher weight (1–100 scale).
-      • Do NOT repeat an exact name from this list: {', '.join(names_used)}
+      • 3–5 abilities total.
+      • Lower total effect ⇒ higher weight (1–100).
+      • Do NOT repeat exact name(s): {', '.join(names_used)}
       • Try to avoid descriptor words already used: {', '.join(words_used)}
-      • No markdown, no keys besides the schema.
+      • No markdown, no extra keys.
 
       Creature rarity: {rarity}
     """)
 
     for attempt in range(3):
         text = await ask_openai(base_prompt)
+        print("GPT RAW ►", text[:300])
         try:
             data = json.loads(text)
-            if data["name"].lower() in names_used:
-                raise ValueError("duplicate name")
-            if not 3 <= len(data["abilities"]) <= 5:
-                raise ValueError("ability count")
-            return data
-        except Exception as e:
-            logging.warning(f"GPT attempt {attempt+1} failed: {e}")
+        except json.JSONDecodeError:
+            try:
+                data = json.loads(_fix_json(text))
+            except Exception:
+                continue
+        if data["name"].lower() in names_used:
+            continue
+        if not 3 <= len(data["abilities"]) <= 5:
+            continue
+        return data
 
-    # final try: seed prompt so output changes even if duplicates exist
-    seed_prompt = base_prompt + f"\nSEED:{random.randint(1, 1_000_000)}"
+    # final seeded attempt (accepts duplicates)
+    seed_prompt = base_prompt + f"\nSEED:{random.randint(1,1_000_000)}"
     text = await ask_openai(seed_prompt)
-    return json.loads(text)
+    return json.loads(_fix_json(text))
 
 # ─── Bot lifecycle ──────────────────────────────────────────────
 @bot.event

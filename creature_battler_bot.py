@@ -291,6 +291,61 @@ def simulate_round(state: BattleState):
     state.rounds += 1
 
 # ─── Bot Events & Commands ────────────────────────────────────
+@bot.tree.command(description="Register yourself as a trainer")
+async def register(interaction: discord.Interaction):
+    uid = interaction.user.id
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO trainers (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            uid,
+        )
+    await interaction.response.send_message("Trainer profile created!", ephemeral=True)
+
+@bot.tree.command(description="Spawn a brand-new creature egg")
+async def spawn(interaction: discord.Interaction):
+    uid = interaction.user.id
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_id=$1", uid):
+            return await interaction.response.send_message("Use /register first.", ephemeral=True)
+
+    await interaction.response.defer(thinking=True)
+
+    roll = roll_d100()
+    rarity = rarity_from_roll(roll)
+    try:
+        ai = await generate_creature_json(rarity)
+    except Exception:
+        logger.exception("Creature generation error")
+        return await interaction.followup.send("Creature generator failed. Try again later.")
+
+    stats = allocate_stats(rarity, ai["descriptors"])
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO creatures (owner_id,name,rarity,descriptors,stats,abilities)"
+            " VALUES ($1,$2,$3,$4,$5,$6)",
+            uid,
+            ai["name"],
+            rarity,
+            ai["descriptors"],
+            json.dumps(stats),
+            json.dumps(ai["abilities"]),
+        )
+
+    embed = discord.Embed(title=f"{ai['name']} ({rarity})", color=0x8B0000)
+    embed.add_field(name="Descriptors", value=", ".join(ai["descriptors"]), inline=False)
+    for stat in PRIMARY_STATS:
+        embed.add_field(name=stat, value=str(stats[stat]), inline=True)
+    ab_lines = [f"• {ab['name']} ({ab['type']}, dmg {ab['damage_mod']}%, def {ab['defense_mod']}%, spd {ab['speed_mod']}%, w={ab['weight']})" for ab in ai['abilities']]
+    embed.add_field(name="Abilities", value="
+".join(ab_lines), inline=False)
+    embed.set_footer(text=f"d100 roll: {roll}")
+
+    await interaction.followup.send(embed=embed)
+
+# Existing Battle and Continue commands follow below
 @bot.tree.command(description="Battle your creature against a tiered opponent")
 async def battle(interaction: discord.Interaction, creature_name: str, tier: int):
     uid = interaction.user.id

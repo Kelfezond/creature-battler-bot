@@ -127,8 +127,18 @@ async def fetch_used_lists() -> tuple[list[str], list[str]]:
     return names, list(words)[:80]
 
 def _fix_json(txt: str) -> str:
-    """Remove trailing commas before } or ] so json.loads can succeed."""
-    return re.sub(r',(\s*[}\]])', r'\1', txt).strip()
+    """
+    Best-effort repair:
+    • remove trailing commas like  ,]  or  ,}
+    • replace fancy quotes with plain "
+    • if JSON is truncated, add the right number of } or ]
+    """
+    txt = txt.replace("“", '"').replace("”", '"').replace("’", "'")
+    txt = re.sub(r',\s*([}\]])', r'\1', txt)         # trailing commas
+    # balance braces/brackets
+    txt += '}' * max(0, txt.count('{') - txt.count('}'))
+    txt += ']' * max(0, txt.count('[') - txt.count(']'))
+    return txt.strip()
 
 async def ask_openai(prompt: str) -> str:
     loop = asyncio.get_running_loop()

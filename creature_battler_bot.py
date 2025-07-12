@@ -183,7 +183,6 @@ async def generate_creature(rarity: str) -> Dict[str, any]:
         return data
     except Exception as e:
         raise ValueError(f"Bad GPT JSON: {txt}") from e
-    }
 
 # ─── Bot lifecycle ────────────────────────────────────────────────
 @bot.event

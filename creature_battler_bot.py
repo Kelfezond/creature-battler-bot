@@ -65,14 +65,14 @@ RARITY_TABLE: List[Tuple[int, int, str]] = [
     (96, 98, "Epic"),
     (99, 100, "Legendary"),
 ]
-POINT_POOLS: Dict[str, Tuple[int,int]] = {
+POINT_POOLS: Dict[str, Tuple[int, int]] = {
     "Common":    (25, 50),
     "Uncommon":  (50, 100),
     "Rare":      (100, 200),
     "Epic":      (200, 400),
     "Legendary": (400, 800),
 }
-TIER_EXTRAS: Dict[int, Tuple[int,int]] = {
+TIER_EXTRAS: Dict[int, Tuple[int, int]] = {
     1: (0, 10),
     2: (10, 30),
     3: (30, 60),
@@ -117,7 +117,6 @@ def allocate_stats(rarity: str, descriptors: List[str], extra: int = 0) -> Dict[
     pool = random.randint(*POINT_POOLS[rarity]) + extra
     stats = {s: 1 for s in PRIMARY_STATS}
     pool -= len(PRIMARY_STATS)
-    # descriptors bias removed for simplicity, can re-add if desired
     for _ in range(pool):
         stat = random.choice(PRIMARY_STATS)
         stats[stat] += 1
@@ -140,8 +139,7 @@ async def ask_openai(prompt: str, max_tokens: int = 100) -> Optional[str]:
             max_tokens=max_tokens,
         )
     )
-    choice = resp.choices[0]
-    return choice.message.content.strip()
+    return resp.choices[0].message.content.strip()
 
 async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     names_used, words_used = await fetch_used_lists()
@@ -166,8 +164,7 @@ Reply ONLY with JSON:
                 return data
         except json.JSONDecodeError:
             continue
-    # fallback name
-    return {"name": f"Creature{random.randint(1000,9999)}", "descriptors": []}
+    return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
 # ─── Battle Simulation ─────────────────────────────────────
 def simulate_round(state: BattleState):
@@ -175,25 +172,27 @@ def simulate_round(state: BattleState):
     o = state.opp_creature
     u_spd = u["stats"]["SPD"]
     o_spd = o["stats"]["SPD"]
-    if u_spd > o_spd or (u_spd == o_spd and random.choice([True, False])):
-        order = [("user", u, o)]
-    else:
-        order = [("opp", o, u)]
-    for actor, attacker, defender in order:
+    first, second = (u, o) if (u_spd > o_spd or (u_spd == o_spd and random.choice([True, False]))) else (o, u)
+    actors = [("user", first, second)]
+    for actor, attacker, defender in actors:
         attacks = 2 if attacker["stats"]["SPD"] >= 2 * defender["stats"]["SPD"] else 1
         for _ in range(attacks):
             if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
                 return
             S = max(attacker["stats"]["PATK"], attacker["stats"]["SATK"])
             N = math.ceil(S / 10)
-            roll_sum = sum(random.randint(1, 6) for _ in range(N))
+            rolls = [random.randint(1, 6) for _ in range(N)]
+            roll_sum = sum(rolls)
             defense = defender["stats"].get("AR", 0)
             damage = max(1, roll_sum - defense)
             if actor == "user":
                 state.opp_current_hp -= damage
             else:
                 state.user_current_hp -= damage
-            state.logs.append(f"{attacker['name']} attacked and dealt {damage} damage.")
+            state.logs.append(
+                f"{attacker['name']} rolled {rolls} (sum {roll_sum}), "
+                f"defender AR {defense} -> dealt {damage} damage"
+            )
     state.rounds += 1
 
 # ─── Bot Lifecycle Events ────────────────────────────────────
@@ -235,7 +234,7 @@ async def spawn(interaction: discord.Interaction):
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     meta = await generate_creature_meta(rarity)
-    name = meta.get("name", f"Creature{roll}{random.randint(1000,9999)}")
+    name = meta.get("name")
     descriptors = meta.get("descriptors", [])
     stats = allocate_stats(rarity, descriptors)
     async with (await db_pool()).acquire() as conn:
@@ -245,8 +244,7 @@ async def spawn(interaction: discord.Interaction):
             uid, name, rarity, descriptors, json.dumps(stats)
         )
     embed = discord.Embed(title=f"{name} ({rarity})", color=0x8B0000)
-    hp_display = stats["HP"] * 5
-    embed.add_field(name="HP", value=str(hp_display), inline=True)
+    embed.add_field(name="HP", value=str(stats["HP"]*5), inline=True)
     embed.add_field(name="AR", value=str(stats["AR"]), inline=True)
     embed.add_field(name="PATK", value=str(stats["PATK"]), inline=True)
     embed.add_field(name="SATK", value=str(stats["SATK"]), inline=True)
@@ -265,7 +263,7 @@ async def creatures(interaction: discord.Interaction):
     lines: List[str] = []
     for i, r in enumerate(rows, 1):
         stats = r['stats'] if isinstance(r['stats'], dict) else json.loads(r['stats'])
-        hp = stats['HP'] * 5
+        hp = stats['HP']*5
         stat_str = f"HP:{hp}, AR:{stats['AR']}, PATK:{stats['PATK']}, SATK:{stats['SATK']}, SPD:{stats['SPD']}"
         desc_str = ", ".join(r['descriptors']) if r.get('descriptors') else 'None'
         lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {stat_str} – [{desc_str}]")
@@ -283,19 +281,22 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         return await interaction.response.send_message("You don't own a creature with that name.", ephemeral=True)
     user_stats = row['stats'] if isinstance(row['stats'], dict) else json.loads(row['stats'])
     user_creature = {"name": row['name'], "stats": user_stats}
+    # generate opponent
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
-    extra = random.randint(*TIER_EXTRAS[tier])
-    opp_stats = allocate_stats(rarity, [], extra)
-    opp_creature = {"name": f"Wild{roll}{random.randint(1000,9999)}", "stats": opp_stats}
+    meta = await generate_creature_meta(rarity)
+    name = meta.get("name")
+    descriptors = meta.get("descriptors", [])
+    opp_stats = allocate_stats(rarity, descriptors, random.randint(*TIER_EXTRAS[tier]))
+    opp_creature = {"name": name, "stats": opp_stats}
     state = BattleState(
         user_id=uid,
         user_creature=user_creature,
-        user_current_hp=user_stats['HP'] * 5,
-        user_max_hp=user_stats['HP'] * 5,
+        user_current_hp=user_stats['HP']*5,
+        user_max_hp=user_stats['HP']*5,
         opp_creature=opp_creature,
-        opp_current_hp=opp_stats['HP'] * 5,
-        opp_max_hp=opp_stats['HP'] * 5,
+        opp_current_hp=opp_stats['HP']*5,
+        opp_max_hp=opp_stats['HP']*5,
         logs=[]
     )
     active_battles[uid] = state

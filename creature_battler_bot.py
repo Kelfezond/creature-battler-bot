@@ -195,25 +195,54 @@ async def register(interaction: discord.Interaction):
 @bot.tree.command(description="Spawn a creature egg")
 async def spawn(interaction: discord.Interaction):
     uid = interaction.user.id
-    async with (await db_pool()).acquire() as conn:
-        if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_id=$1", uid):
-            return await interaction.response.send_message("Use /register first.", ephemeral=True)
-    await interaction.response.defer()
-    roll, rar = roll_d100(), rarity_from_roll(roll)
-    meta = await generate_creature_meta(rar)
-    stats = allocate_stats(rar, meta.get("descriptors", []))
-    async with (await db_pool()).acquire() as conn:
-        await conn.execute(
-            "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats)"
-            " VALUES($1,$2,$3,$4,$5)", uid, meta['name'], rar, meta['descriptors'], json.dumps(stats)
-        )
-    emb = discord.Embed(title=f"{meta['name']} ({rar})", color=0x00ff00)
-    for k in ['HP','AR','PATK','SATK','SPD']:
-        emb.add_field(name=k, value=str(stats[k] if k!='HP' else stats[k]*5), inline=True)
-    emb.set_footer(text=f"Roll: {roll}")
-    await interaction.followup.send(embed=emb)
+    try:
+        # ensure registered
+        async with (await db_pool()).acquire() as conn:
+            if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_id=$1", uid):
+                return await interaction.response.send_message("Use /register first.", ephemeral=True)
 
-@bot.tree.command(description="List your creatures")
+        # defer initial response
+        await interaction.response.defer(thinking=True)
+
+        # roll and rarity
+        roll = roll_d100()
+        rar = rarity_from_roll(roll)
+
+        # generate metadata with timeout fallback
+        try:
+            meta = await asyncio.wait_for(generate_creature_meta(rar), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("AI metadata generation timed out; using fallback")
+            meta = {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
+
+        # allocate stats and persist
+        stats = allocate_stats(rar, meta.get("descriptors", []))
+        async with (await db_pool()).acquire() as conn:
+            await conn.execute(
+                "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats)"
+                " VALUES($1,$2,$3,$4,$5)",
+                uid, meta['name'], rar, meta.get('descriptors', []), json.dumps(stats)
+            )
+
+        # build and send embed
+        embed = discord.Embed(title=f"{meta['name']} ({rar})", color=0x00ff00)
+        embed.add_field(name="HP", value=str(stats["HP"]*5), inline=True)
+        embed.add_field(name="AR", value=str(stats["AR"]), inline=True)
+        embed.add_field(name="PATK", value=str(stats["PATK"]), inline=True)
+        embed.add_field(name="SATK", value=str(stats["SATK"]), inline=True)
+        embed.add_field(name="SPD", value=str(stats["SPD"]), inline=True)
+        desc_val = ", ".join(meta.get('descriptors', [])) or "None"
+        embed.add_field(name="Descriptors", value=desc_val, inline=False)
+        embed.set_footer(text=f"Roll: {roll}")
+        await interaction.followup.send(embed=embed)
+    except Exception:
+        logger.exception("Error in /spawn command")
+        try:
+            await interaction.followup.send("⚠️ An error occurred while spawning your creature.")
+        except:
+            pass
+
+@bot.tree.command(description="List your creatures"))
 async def creatures(interaction: discord.Interaction):
     rows = await (await db_pool()).fetch("SELECT name,rarity,stats,descriptors FROM creatures WHERE owner_id=$1", interaction.user.id)
     if not rows: return await interaction.response.send_message("No creatures.", ephemeral=True)

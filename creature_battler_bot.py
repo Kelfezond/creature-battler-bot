@@ -235,9 +235,22 @@ async def send_chunks(interaction: discord.Interaction, content: str, use_follow
 # ─── Slash Commands ─────────────────────────────────────────
 @bot.tree.command(description="Register yourself as a trainer")
 async def register(interaction: discord.Interaction):
-    async with (await db_pool()).acquire() as conn:
-        await conn.execute("INSERT INTO trainers(user_id) VALUES($1) ON CONFLICT DO NOTHING", interaction.user.id)
-    await interaction.response.send_message("Trainer profile created!", ephemeral=True)
+    uid = interaction.user.id
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        # Check if already registered
+        existing = await conn.fetchrow("SELECT user_id FROM trainers WHERE user_id=$1", uid)
+        if existing:
+            return await interaction.response.send_message("You are already registered!", ephemeral=True)
+        # First-time registration: insert with initial cash and points
+        await conn.execute(
+            "INSERT INTO trainers(user_id, cash, trainer_points) VALUES($1, $2, $3)",
+            uid, 20000, 5
+        )
+    await interaction.response.send_message(
+        "Trainer profile created! You receive 20,000 cash and 5 trainer points.",
+        ephemeral=True
+    )
 
 @bot.tree.command(description="Spawn a brand-new creature egg (costs 10000 cash)")
 async def spawn(interaction: discord.Interaction):

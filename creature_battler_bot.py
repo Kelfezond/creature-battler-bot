@@ -12,6 +12,7 @@ import asyncpg
 import discord
 from discord.ext import commands
 import openai  # pre-1.0 SDK
+
 # ─── Configuration & Logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -168,12 +169,10 @@ Reply ONLY with JSON:
 def simulate_round(state: BattleState):
     u, o = state.user_creature, state.opp_creature
     u_spd, o_spd = u["stats"]["SPD"], o["stats"]["SPD"]
-    # determine order
     if u_spd > o_spd or (u_spd == o_spd and random.choice([True, False])):
         order = [("user", u, o), ("opp", o, u)]
     else:
         order = [("opp", o, u), ("user", u, o)]
-    # each actor attacks
     for actor, attacker, defender in order:
         attacks = 2 if attacker["stats"]["SPD"] >= 2 * defender["stats"]["SPD"] else 1
         for _ in range(attacks):
@@ -193,7 +192,6 @@ def simulate_round(state: BattleState):
                 f"{attacker['name']} rolled {rolls} (sum {roll_sum}), defender AR {defense} -> dealt {damage}"
             )
     state.rounds += 1
-    # log health after round
     state.logs.append(
         f"After round {state.rounds}: {state.user_creature['name']} HP {state.user_current_hp}/{state.user_max_hp}, "
         f"{state.opp_creature['name']} HP {state.opp_current_hp}/{state.opp_max_hp}"
@@ -232,7 +230,8 @@ async def spawn(interaction: discord.Interaction):
     uid = interaction.user.id
     pool = await db_pool()
     async with pool.acquire() as conn:
-        if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_user_id=$1", uid):
+        # Fixed column name from user_user_id to user_id
+        if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_id=$1", uid):
             return await interaction.response.send_message("Use /register first.", ephemeral=True)
     await interaction.response.defer(thinking=True)
     roll = roll_d100()
@@ -285,7 +284,6 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         return await interaction.response.send_message("You don't own a creature with that name.", ephemeral=True)
     user_stats = row['stats'] if isinstance(row['stats'], dict) else json.loads(row['stats'])
     user_creature = {"name": row['name'], "stats": user_stats}
-    # generate opponent
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     meta = await generate_creature_meta(rarity)
@@ -304,7 +302,6 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         logs=[]
     )
     active_battles[uid] = state
-    # simulate 10 full rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break

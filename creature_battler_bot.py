@@ -270,15 +270,13 @@ async def spawn(interaction: discord.Interaction):
             "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats) VALUES($1,$2,$3,$4,$5)",
             uid, meta["name"], rarity, meta["descriptors"], json.dumps(stats)
         )
-    embed = discord.Embed(title=f"{meta['name']} ({rarity})")
-    # Add stat fields
+    embed = discord.Embed(
+        title=f"{meta['name']} ({rarity})",
+        description=f"Descriptors: {', '.join(meta.get('descriptors', []))}"
+    )
     for stat, value in stats.items():
         display = value * 5 if stat == "HP" else value
         embed.add_field(name=stat, value=str(display), inline=True)
-    # Include descriptors
-    descriptors_list = meta.get('descriptors', [])
-    if descriptors_list:
-        embed.add_field(name="Descriptors", value=", ".join(descriptors_list), inline=False)
     embed.set_footer(text=f"d100 roll: {roll}")
     await interaction.followup.send(embed=embed)
 
@@ -293,16 +291,146 @@ async def creatures(interaction: discord.Interaction):
     lines = []
     for idx, r in enumerate(rows, 1):
         stats = json.loads(r['stats'])
-        descs = r['descriptors'] or []
-        desc_str = f" - Descriptors: {', '.join(descs)}" if descs else ""
+        descriptors = ", ".join(r['descriptors']) if r['descriptors'] else "None"
         lines.append(
-            f"{idx}. **{r['name']}** ({r['rarity']}) - "
+            f"{idx}. **{r['name']}** ({r['rarity']}) - Descriptors: {descriptors} - "
             f"HP:{stats['HP']*5}, AR:{stats['AR']}, PATK:{stats['PATK']}, SATK:{stats['SATK']}, SPD:{stats['SPD']}"
-            f"{desc_str}"
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-# ... rest of commands unchanged ...
+@bot.tree.command(description="Battle your creature against a tiered opponent")
+async def battle(interaction: discord.Interaction, creature_name: str, tier: int):
+    uid = interaction.user.id
+    if tier not in TIER_EXTRAS:
+        return await interaction.response.send_message("Invalid tier.", ephemeral=True)
+    row = await (await db_pool()).fetchrow(
+        "SELECT name,stats FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        uid, creature_name
+    )
+    if not row:
+        return await interaction.response.send_message("You don't own that creature.", ephemeral=True)
+    user_stats = json.loads(row['stats'])
+    user_creature = {"name": row['name'], "stats": user_stats}
+    roll = roll_d100()
+    rarity = rarity_from_roll(roll)
+    meta = await generate_creature_meta(rarity)
+    extra = random.randint(*TIER_EXTRAS[tier])
+    opp_stats = allocate_stats(rarity, meta.get("descriptors", []), extra)
+    opp_creature = {"name": meta['name'], "stats": opp_stats}
+    state = BattleState(
+        uid, user_creature, user_stats['HP']*5, user_stats['HP']*5,
+        opp_creature, opp_stats['HP']*5, opp_stats['HP']*5, []
+    )
+    active_battles[uid] = state
+    state.logs.extend([
+        "Battle Start",
+        f"Tier {tier} (+{extra} points)",
+        f"{user_creature['name']} vs {opp_creature['name']}",
+        f"Roll {roll} -> {rarity}",
+        ""
+    ])
+    for _ in range(10):
+        if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+            break
+        simulate_round(state)
+    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+        winner = user_creature['name'] if state.opp_current_hp <= 0 else opp_creature['name']
+        state.logs.append(f"Winner: {winner}")
+        active_battles.pop(uid, None)
+    else:
+        state.logs.append("Type /continue to proceed.")
+    await send_chunks(interaction, "\n".join(state.logs))
+
+@bot.tree.command(name="continue", description="Continue your ongoing battle")
+async def continue_battle(interaction: discord.Interaction):
+    uid = interaction.user.id
+    state = active_battles.get(uid)
+    if not state:
+        return await interaction.response.send_message("No ongoing battle.", ephemeral=True)
+    await interaction.response.defer()
+    for _ in range(10):
+        if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+            break
+        simulate_round(state)
+    new_logs = state.logs[state.next_log_idx:]
+    state.next_log_idx = len(state.logs)
+    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+        winner = state.user_creature['name'] if state.opp_current_hp <= 0 else state.opp_creature['name']
+        new_logs.append(f"Winner: {winner}")
+        active_battles.pop(uid, None)
+    else:
+        new_logs.append("Type /continue to proceed.")
+    await send_chunks(interaction, "\n".join(new_logs), use_followup_first=True)
+
+@bot.tree.command(description="Check your cash balance")
+async def cash(interaction: discord.Interaction):
+    row = await (await db_pool()).fetchrow("SELECT cash FROM trainers WHERE user_id=$1", interaction.user.id)
+    if not row:
+        return await interaction.response.send_message("Use /register first.", ephemeral=True)
+    await interaction.response.send_message(f"You have {row['cash']} cash.", ephemeral=True)
+
+@bot.tree.command(description="Add cash to your balance")
+async def cashadd(interaction: discord.Interaction, amount: int):
+    if amount <= 0:
+        return await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+    async with (await db_pool()).acquire() as conn:
+        row = await conn.fetchrow("SELECT cash FROM trainers WHERE user_id=$1", interaction.user.id)
+        if not row:
+            return await interaction.response.send_message("Use /register first.", ephemeral=True)
+        await conn.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id = $2", amount, interaction.user.id)
+    await interaction.response.send_message(f"Added {amount} cash.", ephemeral=True)
+
+@bot.tree.command(description="Check your trainer points")
+async def trainerpoints(interaction: discord.Interaction):
+    row = await (await db_pool()).fetchrow("SELECT trainer_points FROM trainers WHERE user_id=$1", interaction.user.id)
+    if not row:
+        return await interaction.response.send_message("Use /register first.", ephemeral=True)
+    await interaction.response.send_message(f"You have {row['trainer_points']} trainer points.", ephemeral=True)
+
+@bot.tree.command(description="Train a creature stat using trainer points")
+async def train(
+    interaction: discord.Interaction,
+    creature_name: str,
+    stat: str,
+    increase: int
+):
+    stat = stat.upper()
+    if stat not in PRIMARY_STATS:
+        return await interaction.response.send_message(f"Invalid stat; choose one of {', '.join(PRIMARY_STATS)}.", ephemeral=True)
+    if increase <= 0:
+        return await interaction.response.send_message("Increase must be positive.", ephemeral=True)
+    uid = interaction.user.id
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT trainer_points FROM trainers WHERE user_id=$1", uid)
+        if not row:
+            return await interaction.response.send_message("Use /register first.", ephemeral=True)
+        if row['trainer_points'] < increase:
+            return await interaction.response.send_message("Not enough trainer points.", ephemeral=True)
+        creature = await conn.fetchrow(
+            "SELECT id, stats FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            uid, creature_name
+        )
+        if not creature:
+            return await interaction.response.send_message("Creature not found.", ephemeral=True)
+        stats = json.loads(creature['stats'])
+        if stat == 'HP':
+            stats['HP'] += increase
+        else:
+            stats[stat] += increase
+        await conn.execute(
+            "UPDATE creatures SET stats = $1 WHERE id = $2",
+            json.dumps(stats), creature['id']
+        )
+        await conn.execute(
+            "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id = $2",
+            increase, uid
+        )
+    display_inc = increase * 5 if stat == 'HP' else increase
+    await interaction.response.send_message(
+        f"Trained {creature_name.title()}: +{display_inc} {stat}. You have {row['trainer_points'] - increase} points left.",
+        ephemeral=True
+    )
 
 if __name__ == "__main__":
     bot.run(TOKEN)

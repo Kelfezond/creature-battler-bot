@@ -160,6 +160,8 @@ Reply ONLY with JSON:
         try:
             data = json.loads(text)
             if "name" in data and len(data.get("descriptors", [])) == 3:
+                # Ensure each word in the name is capitalized
+                data["name"] = data["name"].title()
                 return data
         except json.JSONDecodeError:
             continue
@@ -167,7 +169,6 @@ Reply ONLY with JSON:
 
 # ─── Battle Simulation ─────────────────────────────────
 def simulate_round(state: BattleState):
-    # Start new round
     state.rounds += 1
     state.logs.append(f"Round {state.rounds}")
 
@@ -184,7 +185,6 @@ def simulate_round(state: BattleState):
             if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
                 return
 
-            # Pre-attack HP
             if actor == "user":
                 attacker_hp = state.user_current_hp
                 max_hp = state.user_max_hp
@@ -192,7 +192,6 @@ def simulate_round(state: BattleState):
                 attacker_hp = state.opp_current_hp
                 max_hp = state.opp_max_hp
 
-            # Damage roll
             S = max(attacker["stats"]["PATK"], attacker["stats"]["SATK"])
             N = math.ceil(S / 10)
             rolls = [random.randint(1, 6) for _ in range(N)]
@@ -200,25 +199,19 @@ def simulate_round(state: BattleState):
             defense = defender["stats"].get("AR", 0)
             damage = max(1, math.ceil((roll_sum ** 2) / (roll_sum + defense)))
 
-            # Apply damage
             if actor == "user":
                 state.opp_current_hp -= damage
             else:
                 state.user_current_hp -= damage
 
-            # Log simplified attack
             state.logs.append(
-                f"{attacker['name']} [HP {attacker_hp}/{max_hp}] attacked for {damage} "
-                f"(rolls {rolls}, sum {roll_sum})"
+                f"{attacker['name']} [HP {attacker_hp}/{max_hp}] attacked for {damage} (rolls {rolls}, sum {roll_sum})"
             )
 
-            # Knockout check
             if (actor == "user" and state.opp_current_hp <= 0) or (actor == "opp" and state.user_current_hp <= 0):
-                defender_name = defender['name']
-                state.logs.append(f"{defender_name} is down!")
+                state.logs.append(f"{defender['name']} is down!")
                 return
 
-    # Blank line for readability
     state.logs.append("")
 
 # ─── Bot Lifecycle Events ────────────────────────────────────
@@ -240,7 +233,6 @@ async def setup_hook():
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
 
-# ─── Helper for chunked messages ─────────────────────────────
 async def send_chunks(interaction: discord.Interaction, content: str, use_followup_first: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
     if use_followup_first:
@@ -251,9 +243,8 @@ async def send_chunks(interaction: discord.Interaction, content: str, use_follow
         for chunk in chunks[1:]:
             await interaction.followup.send(chunk)
 
-# ─── Slash Commands ─────────────────────────────────────────
 @bot.tree.command(description="Register yourself as a trainer")
-async def register(interaction: discord.InterACTION):
+async def register(interaction: discord.Interaction):
     async with (await db_pool()).acquire() as conn:
         await conn.execute(
             "INSERT INTO trainers(user_id) VALUES($1) ON CONFLICT DO NOTHING", interaction.user.id
@@ -261,25 +252,28 @@ async def register(interaction: discord.InterACTION):
     await interaction.response.send_message("Trainer profile created!", ephemeral=True)
 
 @bot.tree.command(description="Spawn a brand-new creature egg")
-async def spawn(interaction: discord.InterACTION):
+async def spawn(interaction: discord.Interaction):
     uid = interaction.user.id
     pool = await db_pool()
     async with pool.acquire() as conn:
         if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_id=$1", uid):
             return await interaction.response.send_message("Use /register first.", ephemeral=True)
     await interaction.response.defer(thinking=True)
+
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     meta = await generate_creature_meta(rarity)
     name = meta.get("name")
     descriptors = meta.get("descriptors", [])
     stats = allocate_stats(rarity, descriptors)
+
     async with (await db_pool()).acquire() as conn:
         await conn.execute(
             "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats)"
             " VALUES($1,$2,$3,$4,$5)",
             uid, name, rarity, descriptors, json.dumps(stats)
         )
+
     embed = discord.Embed(title=f"{name} ({rarity})", color=0x8B0000)
     embed.add_field(name="HP", value=str(stats["HP"]*5), inline=True)
     embed.add_field(name="AR", value=str(stats["AR"]), inline=True)
@@ -291,40 +285,45 @@ async def spawn(interaction: discord.InterACTION):
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(description="List your creatures")
-async def creatures(interaction: discord.InterACTION):
+async def creatures(interaction: discord.Interaction):
     rows = await (await db_pool()).fetch(
         "SELECT name,rarity,stats,descriptors FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id
     )
     if not rows:
         return await interaction.response.send_message("You own no creatures yet.", ephemeral=True)
+
     lines: List[str] = []
-    for i, r in enumerate(rows, 1):
+    for idx, r in enumerate(rows, 1):
         stats = r['stats'] if isinstance(r['stats'], dict) else json.loads(r['stats'])
-        hp = stats['HP']*5
-        stat_str = f"HP:{hp}, AR:{stats['AR']}, PATK:{stats['PATK']}, SATK:{stats['SATK']}, SPD:{stats['SPD']}"
-        desc_str = ", ".join(r['descriptors']) if r.get('descriptors') else 'None'
-        lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {stat_str} – [{desc_str}]")
+        hp_val = stats['HP'] * 5
+        lines.append(
+            f"{idx}. **{r['name']}** ({r['rarity']}) – "
+            f"HP:{hp_val}, AR:{stats['AR']}, PATK:{stats['PATK']}, "
+            f"SATK:{stats['SATK']}, SPD:{stats['SPD']} – "
+            f"[{', '.join(r.get('descriptors', [])) or 'None'}]"
+        )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(description="Battle your creature against a tiered opponent")
-async def battle(interaction: discord.InterACTION, creature_name: str, tier: int):
+async def battle(interaction: discord.Interaction, creature_name: str, tier: int):
     uid = interaction.user.id
     if tier not in TIER_EXTRAS:
         return await interaction.response.send_message("Invalid tier.", ephemeral=True)
+
     row = await (await db_pool()).fetchrow(
         "SELECT name,rarity,stats FROM creatures WHERE owner_id=$1 AND name ILIKE $2", uid, creature_name
     )
     if not row:
         return await interaction.response.send_message("You don't own a creature with that name.", ephemeral=True)
+
     user_stats = row['stats'] if isinstance(row['stats'], dict) else json.loads(row['stats'])
     user_creature = {"name": row['name'], "stats": user_stats}
+
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     meta = await generate_creature_meta(rarity)
-    opp_name = meta.get("name")
-    opp_desc = meta.get("descriptors", [])
-    opp_stats = allocate_stats(rarity, opp_desc, random.randint(*TIER_EXTRAS[tier]))
-    opp_creature = {"name": opp_name, "stats": opp_stats}
+    opp_stats = allocate_stats(rarity, meta.get("descriptors", []), random.randint(*TIER_EXTRAS[tier]))
+    opp_creature = {"name": meta.get("name"), "stats": opp_stats}
 
     state = BattleState(
         user_id=uid,
@@ -339,16 +338,18 @@ async def battle(interaction: discord.InterACTION, creature_name: str, tier: int
     active_battles[uid] = state
 
     # Header
-    state.logs.append("Battle Start")
-    state.logs.append(f"Tier {tier}")
-    state.logs.append(f"{user_creature['name']} vs {opp_creature['name']}")
-    state.logs.append(
-        f"{user_creature['name']} Stats: HP {state.user_max_hp}, AR {user_stats['AR']}, PATK {user_stats['PATK']}, SATK {user_stats['SATK']}, SPD {user_stats['SPD']}" +
-        f" | {opp_creature['name']} Stats: HP {state.opp_max_hp}, AR {opp_stats['AR']}, PATK {opp_stats['PATK']}, SATK {opp_stats['SATK']}, SPD {opp_stats['SPD']}"
-    )
-    state.logs.append("")  # blank line
+    state.logs.extend([
+        "Battle Start",
+        f"Tier {tier}",
+        f"{user_creature['name']} vs {opp_creature['name']}",
+        f"{user_creature['name']} Stats: HP {state.user_max_hp}, AR {user_stats['AR']}, "
+        f"PATK {user_stats['PATK']}, SATK {user_stats['SATK']}, SPD {user_stats['SPD']} | "
+        f"{opp_creature['name']} Stats: HP {state.opp_max_hp}, AR {opp_stats['AR']}, "
+        f"PATK {opp_stats['PATK']}, SATK {opp_stats['SATK']}, SPD {opp_stats['SPD']}",
+        ""
+    ])
 
-    # Simulate up to 10 rounds
+    # Simulate rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
@@ -356,8 +357,8 @@ async def battle(interaction: discord.InterACTION, creature_name: str, tier: int
 
     # Outcome
     if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
-        winner_name = user_creature['name'] if state.opp_current_hp <= 0 else opp_creature['name']
-        state.logs.append(f"{winner_name} wins!")
+        winner = state.user_creature['name'] if state.opp_current_hp <= 0 else state.opp_creature['name']
+        state.logs.append(f"{winner} wins!")
         active_battles.pop(uid, None)
     else:
         state.logs.append("Type /continue to proceed to the next 10 rounds.")
@@ -365,7 +366,7 @@ async def battle(interaction: discord.InterACTION, creature_name: str, tier: int
     await send_chunks(interaction, "\n".join(state.logs))
 
 @bot.tree.command(name="continue", description="Continue your ongoing battle")
-async def continue_battle(interaction: discord.InterACTION):
+async def continue_battle(interaction: discord.Interaction):
     uid = interaction.user.id
     state = active_battles.get(uid)
     if not state:
@@ -377,17 +378,17 @@ async def continue_battle(interaction: discord.InterACTION):
             break
         simulate_round(state)
 
-    out = state.logs[state.next_log_idx:]
+    new_logs = state.logs[state.next_log_idx:]
     state.next_log_idx = len(state.logs)
 
     if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
-        winner_name = state.user_creature['name'] if state.opp_current_hp <= 0 else state.opp_creature['name']
-        out.append(f"{winner_name} wins!")
+        winner = state.user_creature['name'] if state.opp_current_hp <= 0 else state.opp_creature['name']
+        new_logs.append(f"{winner} wins!")
         active_battles.pop(uid, None)
     else:
-        out.append("Type /continue to proceed to the next 10 rounds.")
+        new_logs.append("Type /continue to proceed to the next 10 rounds.")
 
-    await send_chunks(interaction, "\n".join(out), use_followup_first=True)
+    await send_chunks(interaction, "\n".join(new_logs), use_followup_first=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN)

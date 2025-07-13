@@ -159,7 +159,7 @@ Reply ONLY with JSON:
         text = await ask_openai(prompt)
         try:
             data = json.loads(text)
-            if "name" in data and len(data.get("descriptors", [])) == 3:
+            if 'name' in data and len(data.get('descriptors', [])) == 3:
                 return data
         except json.JSONDecodeError:
             continue
@@ -167,36 +167,64 @@ Reply ONLY with JSON:
 
 # ─── Battle Simulation ─────────────────────────────────
 def simulate_round(state: BattleState):
+    # Start of a new round
+    state.rounds += 1
+    state.logs.append(f"Round {state.rounds}")
+
     u, o = state.user_creature, state.opp_creature
-    u_spd, o_spd = u["stats"]["SPD"], o["stats"]["SPD"]
-    if u_spd > o_spd or (u_spd == o_spd and random.choice([True, False])):
+    # Determine order by SPD
+    if u['stats']['SPD'] > o['stats']['SPD'] or \
+       (u['stats']['SPD'] == o['stats']['SPD'] and random.choice([True, False])):
         order = [("user", u, o), ("opp", o, u)]
     else:
         order = [("opp", o, u), ("user", u, o)]
+
     for actor, attacker, defender in order:
-        attacks = 2 if attacker["stats"]["SPD"] >= 2 * defender["stats"]["SPD"] else 1
+        attacks = 2 if attacker['stats']['SPD'] >= 2 * defender['stats']['SPD'] else 1
         for _ in range(attacks):
             if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
                 return
-            S = max(attacker["stats"]["PATK"], attacker["stats"]["SATK"])
+
+            # Pre-attack HP & Max
+            if actor == 'user':
+                atk_hp = state.user_current_hp
+                atk_max = state.user_max_hp
+                def_hp = state.opp_current_hp
+                def_max = state.opp_max_hp
+            else:
+                atk_hp = state.opp_current_hp
+                atk_max = state.opp_max_hp
+                def_hp = state.user_current_hp
+                def_max = state.user_max_hp
+
+            # Roll attack
+            S = max(attacker['stats']['PATK'], attacker['stats']['SATK'])
             N = math.ceil(S / 10)
             rolls = [random.randint(1, 6) for _ in range(N)]
             roll_sum = sum(rolls)
-            defender_AR = defender["stats"].get("AR", 0)
-            # Updated damage formula
-            damage = max(1, math.ceil(6 * (roll_sum ** 2) / (roll_sum + defender_AR)))
-            if actor == "user":
-                state.opp_current_hp -= damage
+            defense = defender['stats'].get('AR', 0)
+            raw = (roll_sum ** 2) / (roll_sum + defense) if roll_sum + defense > 0 else 0
+            dmg = max(1, math.ceil(raw))
+
+            # Apply damage
+            if actor == 'user':
+                state.opp_current_hp = max(0, state.opp_current_hp - dmg)
             else:
-                state.user_current_hp -= damage
+                state.user_current_hp = max(0, state.user_current_hp - dmg)
+
+            # Log attack
             state.logs.append(
-                f"{attacker['name']} rolled {rolls} (sum {roll_sum}), defender AR {defender_AR} -> dealt {damage}"
+                f"{attacker['name']} [{atk_hp}/{atk_max}] attacked for {dmg} "
+                f"(rolls: {rolls}, sum: {roll_sum}, formula: ceil({roll_sum}^2/({roll_sum}+{defense})={raw:.2f}))"
             )
-    state.rounds += 1
-    state.logs.append(
-        f"After round {state.rounds}: {state.user_creature['name']} HP {state.user_current_hp}/{state.user_max_hp}, "
-        f"{state.opp_creature['name']} HP {state.opp_current_hp}/{state.opp_max_hp}"
-    )
+
+            # Check for defeat
+            if state.user_current_hp <= 0:
+                state.logs.append(f"{state.user_creature['name']} is down!")
+                return
+            if state.opp_current_hp <= 0:
+                state.logs.append(f"{state.opp_creature['name']} is down!")
+                return
 
 # ─── Bot Lifecycle Events ────────────────────────────────────
 @bot.event
@@ -207,7 +235,7 @@ async def setup_hook():
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
         bot.tree.copy_global_to(guild=guild)
-       	await bot.tree.sync(guild=guild)
+        await bot.tree.sync(guild=guild)
         logger.info("Synced to guild %s", GUILD_ID)
     else:
         await bot.tree.sync()
@@ -248,7 +276,7 @@ async def spawn(interaction: discord.Interaction):
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     meta = await generate_creature_meta(rarity)
-    name = meta.get("name")
+    name = meta["name"]
     descriptors = meta.get("descriptors", [])
     stats = allocate_stats(rarity, descriptors)
     async with (await db_pool()).acquire() as conn:
@@ -293,15 +321,17 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
     )
     if not row:
         return await interaction.response.send_message("You don't own a creature with that name.", ephemeral=True)
+
+    # Setup user and opponent
     user_stats = row['stats'] if isinstance(row['stats'], dict) else json.loads(row['stats'])
     user_creature = {"name": row['name'], "stats": user_stats}
-    roll = roll_d100()
-    rarity = rarity_from_roll(roll)
-    meta = await generate_creature_meta(rarity)
-    opp_name = meta.get("name")
-    opp_desc = meta.get("descriptors", [])
-    opp_stats = allocate_stats(rarity, opp_desc, random.randint(*TIER_EXTRAS[tier]))
-    opp_creature = {"name": opp_name, "stats": opp_stats}
+    opp_roll = roll_d100()
+    opp_rarity = rarity_from_roll(opp_roll)
+    opp_meta = await generate_creature_meta(opp_rarity)
+    opp_stats = allocate_stats(opp_rarity, opp_meta.get("descriptors", []), random.randint(*TIER_EXTRAS[tier]))
+    opp_creature = {"name": opp_meta['name'], "stats": opp_stats}
+
+    # Initialize battle state
     state = BattleState(
         user_id=uid,
         user_creature=user_creature,
@@ -313,19 +343,34 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         logs=[]
     )
     active_battles[uid] = state
+
+    # Header
+    state.logs.append("Battle Start")
+    state.logs.append(f"Tier {tier}")
+    state.logs.append(f"{user_creature['name']} vs {opp_creature['name']}")
+    user_line = f"HP:{state.user_max_hp}, AR:{user_stats['AR']}, PATK:{user_stats['PATK']}," + 
+                 f" SATK:{user_stats['SATK']}, SPD:{user_stats['SPD']}"
+    opp_line = f"HP:{state.opp_max_hp}, AR:{opp_stats['AR']}, PATK:{opp_stats['PATK']}," + 
+               f" SATK:{opp_stats['SATK']}, SPD:{opp_stats['SPD']}"
+    state.logs.append(f"{user_line} | {opp_line}")
+
+    # Simulate up to 10 rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
         simulate_round(state)
-    out = state.logs.copy()
-    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
-        winner = 'you' if state.opp_current_hp <= 0 else 'opponent'
-        out.append(f"Battle over! {winner.capitalize()} won.")
+
+    # Determine winner
+    if state.user_current_hp > 0 and state.opp_current_hp <= 0:
+        state.logs.append(f"{user_creature['name']} wins!")
+        active_battles.pop(uid, None)
+    elif state.opp_current_hp > 0 and state.user_current_hp <= 0:
+        state.logs.append(f"{opp_creature['name']} wins!")
         active_battles.pop(uid, None)
     else:
-        out.append("Type /continue to proceed to the next 10 rounds.")
-    message = "\n".join(out)
-    await send_chunks(interaction, message)
+        state.logs.append("Type /continue to proceed to the next 10 rounds.")
+
+    await send_chunks(interaction, "\n".join(state.logs))
 
 @bot.tree.command(name="continue", description="Continue your ongoing battle")
 async def continue_battle(interaction: discord.Interaction):
@@ -333,23 +378,26 @@ async def continue_battle(interaction: discord.Interaction):
     state = active_battles.get(uid)
     if not state:
         return await interaction.response.send_message("You have no ongoing battle.", ephemeral=True)
-    # Defer initial response before sending followups
+
     await interaction.response.defer()
-    # Simulate next rounds
+    # Continue next 10 rounds
+    state.logs = []
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
         simulate_round(state)
-    out = state.logs[state.next_log_idx:]
-    state.next_log_idx = len(state.logs)
-    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
-        winner = 'you' if state.opp_current_hp <= 0 else 'opponent'
-        out.append(f"Battle over! {winner.capitalize()} won.")
+
+    # Determine winner or prompt
+    if state.user_current_hp > 0 and state.opp_current_hp <= 0:
+        state.logs.append(f"{state.user_creature['name']} wins!")
+        active_battles.pop(uid, None)
+    elif state.opp_current_hp > 0 and state.user_current_hp <= 0:
+        state.logs.append(f"{state.opp_creature['name']} wins!")
         active_battles.pop(uid, None)
     else:
-        out.append("Type /continue to proceed to the next 10 rounds.")
-    message = "\n".join(out)
-    await send_chunks(interaction, message, use_followup_first=True)
+        state.logs.append("Type /continue to proceed to the next 10 rounds.")
+
+    await send_chunks(interaction, "\n".join(state.logs), use_followup_first=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN)

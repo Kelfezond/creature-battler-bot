@@ -165,7 +165,7 @@ Reply ONLY with JSON:
             continue
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
-# ─── Battle Simulation ─────────────────────────────────────
+# ─── Battle Simulation ─────────────────────────────────
 def simulate_round(state: BattleState):
     u, o = state.user_creature, state.opp_creature
     u_spd, o_spd = u["stats"]["SPD"], o["stats"]["SPD"]
@@ -332,6 +332,9 @@ async def continue_battle(interaction: discord.Interaction):
     state = active_battles.get(uid)
     if not state:
         return await interaction.response.send_message("You have no ongoing battle.", ephemeral=True)
+    # Defer initial response before sending followups
+    await interaction.response.defer()
+    # Simulate next rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break

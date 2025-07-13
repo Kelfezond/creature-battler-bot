@@ -6,12 +6,12 @@ import os
 import random
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple, Optional
 
 import asyncpg
 import discord
 from discord.ext import commands
-
+import openai  # pre-1.0 SDK
 # ─── Configuration & Logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,10 +19,12 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 GUILD_ID = os.getenv("GUILD_ID")  # empty string => global
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 for name, val in {
     "DISCORD_TOKEN": TOKEN,
     "DATABASE_URL": DB_URL,
+    "OPENAI_API_KEY": openai.api_key,
 }.items():
     if not val:
         raise RuntimeError(f"Missing environment variable: {name}")
@@ -56,21 +58,21 @@ async def db_pool() -> asyncpg.Pool:
     return bot._pool
 
 # ─── Game Constants ──────────────────────────────────────────
-RARITY_TABLE = [
+RARITY_TABLE: List[Tuple[int, int, str]] = [
     (1, 75, "Common"),
     (76, 88, "Uncommon"),
     (89, 95, "Rare"),
     (96, 98, "Epic"),
     (99, 100, "Legendary"),
 ]
-POINT_POOLS = {
+POINT_POOLS: Dict[str, Tuple[int,int]] = {
     "Common":    (25, 50),
     "Uncommon":  (50, 100),
     "Rare":      (100, 200),
     "Epic":      (200, 400),
     "Legendary": (400, 800),
 }
-TIER_EXTRAS = {
+TIER_EXTRAS: Dict[int, Tuple[int,int]] = {
     1: (0, 10),
     2: (10, 30),
     3: (30, 60),
@@ -82,11 +84,6 @@ TIER_EXTRAS = {
     9: (200, 300),
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
-BIAS_MAP = {
-    "Rocky":          {"AR": +0.2, "SPD": -0.2},
-    "Lightning-fast": {"SPD": +0.2, "AR": -0.2},
-    "Giant":          {"HP": +0.2, "SPD": -0.2},
-}
 
 # ─── In-Memory Battle Store ──────────────────────────────────
 @dataclass
@@ -120,50 +117,83 @@ def allocate_stats(rarity: str, descriptors: List[str], extra: int = 0) -> Dict[
     pool = random.randint(*POINT_POOLS[rarity]) + extra
     stats = {s: 1 for s in PRIMARY_STATS}
     pool -= len(PRIMARY_STATS)
-    weights = {s: 1.0 for s in PRIMARY_STATS}
-    for d in descriptors:
-        for stat, delta in BIAS_MAP.get(d, {}).items():
-            weights[stat] = max(0.1, weights[stat] + delta)
-    total = sum(weights.values())
+    # descriptors bias removed for simplicity, can re-add if desired
     for _ in range(pool):
-        r = random.uniform(0, total)
-        acc = 0.0
-        for stat, w in weights.items():
-            acc += w
-            if r <= acc:
-                stats[stat] += 1
-                break
+        stat = random.choice(PRIMARY_STATS)
+        stats[stat] += 1
     return stats
+
+async def fetch_used_lists() -> Tuple[List[str], List[str]]:
+    pool = await db_pool()
+    rows = await pool.fetch("SELECT name, descriptors FROM creatures")
+    names = [r["name"].lower() for r in rows]
+    words = {w.lower() for r in rows for w in r["descriptors"]}
+    return names, list(words)
+
+async def ask_openai(prompt: str, max_tokens: int = 100) -> Optional[str]:
+    resp = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=1.0,
+            max_tokens=max_tokens,
+        )
+    )
+    choice = resp.choices[0]
+    return choice.message.content.strip()
+
+async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
+    names_used, words_used = await fetch_used_lists()
+    avoid_names = ", ".join(names_used)
+    avoid_words = ", ".join(words_used)
+    prompt = f"""
+You are inventing a creature name and descriptors for a {rarity} creature.
+Reply ONLY with JSON:
+{{
+  "name": "string (1-3 words)",
+  "descriptors": ["word1","word2","word3"]
+}}
+• Exactly 3 descriptors.
+• Avoid names: {avoid_names}
+• Avoid descriptors: {avoid_words}
+"""
+    for _ in range(3):
+        text = await ask_openai(prompt)
+        try:
+            data = json.loads(text)
+            if "name" in data and len(data.get("descriptors", [])) == 3:
+                return data
+        except json.JSONDecodeError:
+            continue
+    # fallback name
+    return {"name": f"Creature{random.randint(1000,9999)}", "descriptors": []}
 
 # ─── Battle Simulation ─────────────────────────────────────
 def simulate_round(state: BattleState):
-    # determine turn order based on SPD
-    u_spd = state.user_creature["stats"]["SPD"]
-    o_spd = state.opp_creature["stats"]["SPD"]
+    u = state.user_creature
+    o = state.opp_creature
+    u_spd = u["stats"]["SPD"]
+    o_spd = o["stats"]["SPD"]
     if u_spd > o_spd or (u_spd == o_spd and random.choice([True, False])):
-        order = [("user", state.user_creature, state.opp_creature)]
+        order = [("user", u, o)]
     else:
-        order = [("opp", state.opp_creature, state.user_creature)]
-
-    for actor, creature, target in order:
-        # number of attacks: double-speed grants two attacks
-        attacks = 2 if creature["stats"]["SPD"] >= 2 * target["stats"]["SPD"] else 1
+        order = [("opp", o, u)]
+    for actor, attacker, defender in order:
+        attacks = 2 if attacker["stats"]["SPD"] >= 2 * defender["stats"]["SPD"] else 1
         for _ in range(attacks):
             if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
-                break
-            # choose best attack stat
-            S = creature["stats"]["PATK"] if creature["stats"]["PATK"] >= creature["stats"]["SATK"] else creature["stats"]["SATK"]
+                return
+            S = max(attacker["stats"]["PATK"], attacker["stats"]["SATK"])
             N = math.ceil(S / 10)
             roll_sum = sum(random.randint(1, 6) for _ in range(N))
-            # apply defense
-            defense = target["stats"].get("AR", 0)
+            defense = defender["stats"].get("AR", 0)
             damage = max(1, roll_sum - defense)
-            # apply damage
             if actor == "user":
                 state.opp_current_hp -= damage
             else:
                 state.user_current_hp -= damage
-            state.logs.append(f"{creature['name']} attacked and dealt {damage} damage.")
+            state.logs.append(f"{attacker['name']} attacked and dealt {damage} damage.")
     state.rounds += 1
 
 # ─── Bot Lifecycle Events ────────────────────────────────────
@@ -189,7 +219,9 @@ async def on_ready():
 @bot.tree.command(description="Register yourself as a trainer")
 async def register(interaction: discord.Interaction):
     async with (await db_pool()).acquire() as conn:
-        await conn.execute("INSERT INTO trainers(user_id) VALUES($1) ON CONFLICT DO NOTHING", interaction.user.id)
+        await conn.execute(
+            "INSERT INTO trainers(user_id) VALUES($1) ON CONFLICT DO NOTHING", interaction.user.id
+        )
     await interaction.response.send_message("Trainer profile created!", ephemeral=True)
 
 @bot.tree.command(description="Spawn a brand-new creature egg")
@@ -202,32 +234,41 @@ async def spawn(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
-    # basic creature: no abilities
-    stats = allocate_stats(rarity, [])
+    meta = await generate_creature_meta(rarity)
+    name = meta.get("name", f"Creature{roll}{random.randint(1000,9999)}")
+    descriptors = meta.get("descriptors", [])
+    stats = allocate_stats(rarity, descriptors)
     async with (await db_pool()).acquire() as conn:
         await conn.execute(
             "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats)"
             " VALUES($1,$2,$3,$4,$5)",
-            uid, f"Creature{roll}{random.randint(1000,9999)}", rarity, [], json.dumps(stats)
+            uid, name, rarity, descriptors, json.dumps(stats)
         )
-    embed = discord.Embed(title=f"Creature (Evolved) - {rarity}", color=0x8B0000)
-    for s in PRIMARY_STATS:
-        # show effective HP
-        val = stats[s] * 5 if s == "HP" else stats[s]
-        embed.add_field(name=s, value=str(val), inline=True)
+    embed = discord.Embed(title=f"{name} ({rarity})", color=0x8B0000)
+    hp_display = stats["HP"] * 5
+    embed.add_field(name="HP", value=str(hp_display), inline=True)
+    embed.add_field(name="AR", value=str(stats["AR"]), inline=True)
+    embed.add_field(name="PATK", value=str(stats["PATK"]), inline=True)
+    embed.add_field(name="SATK", value=str(stats["SATK"]), inline=True)
+    embed.add_field(name="SPD", value=str(stats["SPD"]), inline=True)
+    embed.add_field(name="Descriptors", value=", ".join(descriptors) or "None", inline=False)
     embed.set_footer(text=f"d100 roll: {roll}")
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(description="List your creatures")
 async def creatures(interaction: discord.Interaction):
-    rows = await (await db_pool()).fetch("SELECT name,rarity,stats FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id)
+    rows = await (await db_pool()).fetch(
+        "SELECT name,rarity,stats,descriptors FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id
+    )
     if not rows:
         return await interaction.response.send_message("You own no creatures yet.", ephemeral=True)
     lines: List[str] = []
     for i, r in enumerate(rows, 1):
         stats = r['stats'] if isinstance(r['stats'], dict) else json.loads(r['stats'])
-        stat_str = ", ".join(f"{k}:{(v*5 if k=='HP' else v)}" for k, v in stats.items())
-        lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {stat_str}")
+        hp = stats['HP'] * 5
+        stat_str = f"HP:{hp}, AR:{stats['AR']}, PATK:{stats['PATK']}, SATK:{stats['SATK']}, SPD:{stats['SPD']}"
+        desc_str = ", ".join(r['descriptors']) if r.get('descriptors') else 'None'
+        lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {stat_str} – [{desc_str}]")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(description="Battle your creature against a tiered opponent")
@@ -242,13 +283,11 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         return await interaction.response.send_message("You don't own a creature with that name.", ephemeral=True)
     user_stats = row['stats'] if isinstance(row['stats'], dict) else json.loads(row['stats'])
     user_creature = {"name": row['name'], "stats": user_stats}
-    # spawn opponent
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     extra = random.randint(*TIER_EXTRAS[tier])
     opp_stats = allocate_stats(rarity, [], extra)
     opp_creature = {"name": f"Wild{roll}{random.randint(1000,9999)}", "stats": opp_stats}
-    # init battle state
     state = BattleState(
         user_id=uid,
         user_creature=user_creature,
@@ -260,12 +299,10 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         logs=[]
     )
     active_battles[uid] = state
-    # simulate first rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
         simulate_round(state)
-    # send logs
     out = state.logs.copy()
     if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
         winner = 'you' if state.opp_current_hp <= 0 else 'opponent'

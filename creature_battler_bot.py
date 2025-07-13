@@ -1,319 +1,299 @@
 from __future__ import annotations
-
-"""Creature Battler Discord bot (v3 – no abilities)
-----------------------------------------------------
-Battle system simplified:
-• No ability system; database column removed.
-• Battle HP = HP * 5.
-• Turn order by SPD; if a creature’s SPD ≥ 2× opponent’s, it attacks twice.
-• Damage each attack = d(ATK) – DEF, floored to 1.
-"""
-
+import asyncio
+import json
 import logging
 import os
 import random
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
 import asyncpg
 import discord
-import dotenv
-from discord import app_commands
 from discord.ext import commands
 
-###############################################################################
-# Configuration & startup helpers
-###############################################################################
-
-dotenv.load_dotenv()
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-GUILD_ID = os.getenv("GUILD_ID")  # optional for faster dev sync
-
-missing = [name for val, name in ((DISCORD_TOKEN, "DISCORD_TOKEN"), (DATABASE_URL, "DATABASE_URL")) if val is None]
-if missing:
-    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-
+# ─── Configuration & Logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("creature_battler")
+logger = logging.getLogger(__name__)
 
-###############################################################################
-# Data classes & helpers
-###############################################################################
+TOKEN = os.getenv("DISCORD_TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
+GUILD_ID = os.getenv("GUILD_ID")  # empty string => global
 
-STAT_NAMES = ("HP", "ATK", "DEF", "SPD")
+for name, val in {
+    "DISCORD_TOKEN": TOKEN,
+    "DATABASE_URL": DB_URL,
+}.items():
+    if not val:
+        raise RuntimeError(f"Missing environment variable: {name}")
 
+# ─── Discord Client Setup ─────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
+
+# ─── Database Schema & Helpers ────────────────────────────────
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS trainers (
+  user_id BIGINT PRIMARY KEY,
+  joined_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS creatures (
+  id SERIAL PRIMARY KEY,
+  owner_id BIGINT NOT NULL,
+  name TEXT,
+  rarity TEXT,
+  descriptors TEXT[],
+  stats JSONB,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+"""
+
+async def db_pool() -> asyncpg.Pool:
+    if not hasattr(bot, "_pool"):
+        bot._pool = await asyncpg.create_pool(DB_URL)
+    return bot._pool
+
+# ─── Game Constants ──────────────────────────────────────────
+RARITY_TABLE = [
+    (1, 75, "Common"),
+    (76, 88, "Uncommon"),
+    (89, 95, "Rare"),
+    (96, 98, "Epic"),
+    (99, 100, "Legendary"),
+]
+POINT_POOLS = {
+    "Common":    (25, 50),
+    "Uncommon":  (50, 100),
+    "Rare":      (100, 200),
+    "Epic":      (200, 400),
+    "Legendary": (400, 800),
+}
+TIER_EXTRAS = {
+    1: (0, 10),
+    2: (10, 30),
+    3: (30, 60),
+    4: (60, 100),
+    5: (100, 140),
+    6: (140, 180),
+    7: (180, 220),
+    8: (220, 260),
+    9: (200, 300),
+}
+PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
+BIAS_MAP = {
+    "Rocky":          {"AR": +0.2, "SPD": -0.2},
+    "Lightning-fast": {"SPD": +0.2, "AR": -0.2},
+    "Giant":          {"HP": +0.2, "SPD": -0.2},
+}
+
+# ─── In-Memory Battle Store ──────────────────────────────────
 @dataclass
-class Creature:
-    owner_id: int
-    name: str
-    tier: str
-    stats: Dict[str, int]
-    current_hp: int = field(init=False)
-    current_def: int = field(init=False)
-    current_spd: int = field(init=False)
+class BattleState:
+    user_id: int
+    user_creature: Dict[str, Any]
+    user_current_hp: int
+    user_max_hp: int
+    opp_creature: Dict[str, Any]
+    opp_current_hp: int
+    opp_max_hp: int
+    logs: List[str]
+    next_log_idx: int = 0
+    rounds: int = 0
 
-    def __post_init__(self):
-        self.current_hp = self.stats["HP"] * 5  # battle HP
-        self.current_def = self.stats["DEF"]
-        self.current_spd = self.stats["SPD"]
+active_battles: Dict[int, BattleState] = {}
 
-    @classmethod
-    def from_record(cls, rec: asyncpg.Record) -> "Creature":
-        stats = {"HP": rec["hp"], "ATK": rec["atk"], "DEF": rec["def"], "SPD": rec["spd"]}
-        return cls(rec["owner_id"], rec["name"], rec["tier"], stats)
+# ─── Utility Functions ───────────────────────────────────────
+def roll_d100() -> int:
+    return random.randint(1, 100)
 
-###############################################################################
-# Discord bot setup
-###############################################################################
 
-class CreatureBattlerBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
-        self.db_pool: asyncpg.Pool | None = None
-        self.active_battles: Dict[int, Tuple[Creature, Creature]] = {}
+def rarity_from_roll(r: int) -> str:
+    for low, high, name in RARITY_TABLE:
+        if low <= r <= high:
+            return name
+    return "Common"
 
-    async def setup_hook(self):
-        self.db_pool = await asyncpg.create_pool(DATABASE_URL)
-        await self._ensure_schema()
 
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            logger.info("Commands synced to guild %s", GUILD_ID)
-        else:
-            await self.tree.sync()
-            logger.info("Commands synced globally (may take up to an hour)")
-
-        logger.info("Creature Battler Bot ready!")
-
-    async def close(self):
-        if self.db_pool:
-            await self.db_pool.close()
-        await super().close()
-
-    async def _ensure_schema(self):
-        ddl = """
-        CREATE TABLE IF NOT EXISTS users (
-            id BIGINT PRIMARY KEY,
-            username TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS creatures (
-            id SERIAL PRIMARY KEY,
-            owner_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            tier TEXT NOT NULL,
-            hp INT NOT NULL,
-            atk INT NOT NULL,
-            def INT NOT NULL,
-            spd INT NOT NULL
-        );
-        """
-        async with self.db_pool.acquire() as conn:
-            await conn.execute(ddl)
-
-bot = CreatureBattlerBot()
-
-###############################################################################
-# Utility functions
-###############################################################################
-
-def allocate_stats(tier: str) -> Dict[str, int]:
-    base = {"bronze": 40, "silver": 55, "gold": 70}.get(tier, 40)
-    hp = random.randint(10, 20)
-    atk = random.randint(5, 15)
-    defense = random.randint(5, 15)
-    spd = random.randint(5, 15)
-    remaining = base - (hp + atk + defense + spd)
-    for _ in range(remaining):
-        random.choice(["HP", "ATK", "DEF", "SPD"])
-        if _ == 0:  # just to suppress lint, nothing special
-            pass
-    # Simple redistribution for remaining points
-    while remaining > 0:
-        choice = random.choice(["HP", "ATK", "DEF", "SPD"])
-        if choice == "HP":
-            hp += 1
-        elif choice == "ATK":
-            atk += 1
-        elif choice == "DEF":
-            defense += 1
-        else:
-            spd += 1
-        remaining -= 1
-    return {"HP": hp, "ATK": atk, "DEF": defense, "SPD": spd}
-
-###############################################################################
-# Battle simulation
-###############################################################################
-
-def _single_attack(attacker: Creature, defender: Creature) -> str:
-    raw_roll = random.randint(1, attacker.stats["ATK"])
-    damage = max(1, raw_roll - defender.current_def)
-    defender.current_hp = max(0, defender.current_hp - damage)
-    return f"{attacker.name} rolls {raw_roll} ATK ⇒ {defender.name} takes {damage} (HP {defender.current_hp})"
-
-def simulate_round(a: Creature, b: Creature) -> str:
-    log: List[str] = []
-    first, second = (a, b) if a.current_spd >= b.current_spd else (b, a)
-
-    for attacker, defender in ((first, second), (second, first)):
-        if defender.current_hp <= 0:
-            break
-        attacks = 2 if attacker.current_spd >= defender.current_spd * 2 else 1
-        for _ in range(attacks):
-            if defender.current_hp <= 0:
+def allocate_stats(rarity: str, descriptors: List[str], extra: int = 0) -> Dict[str, int]:
+    pool = random.randint(*POINT_POOLS[rarity]) + extra
+    stats = {s: 1 for s in PRIMARY_STATS}
+    pool -= len(PRIMARY_STATS)
+    weights = {s: 1.0 for s in PRIMARY_STATS}
+    for d in descriptors:
+        for stat, delta in BIAS_MAP.get(d, {}).items():
+            weights[stat] = max(0.1, weights[stat] + delta)
+    total = sum(weights.values())
+    for _ in range(pool):
+        r = random.uniform(0, total)
+        acc = 0.0
+        for stat, w in weights.items():
+            acc += w
+            if r <= acc:
+                stats[stat] += 1
                 break
-            log.append(_single_attack(attacker, defender))
-        if defender.current_hp <= 0:
-            log.append(f"{defender.name} is knocked out!")
-            break
-    return "\n".join(log)
+    return stats
 
-###############################################################################
-# Slash commands
-###############################################################################
+# ─── Battle Simulation ─────────────────────────────────────
+def simulate_round(state: BattleState):
+    # determine turn order based on SPD
+    u_spd = state.user_creature["stats"]["SPD"]
+    o_spd = state.opp_creature["stats"]["SPD"]
+    if u_spd > o_spd or (u_spd == o_spd and random.choice([True, False])):
+        order = [("user", state.user_creature, state.opp_creature)]
+    else:
+        order = [("opp", state.opp_creature, state.user_creature)]
 
-@bot.tree.command(description="Register as a Creature Battler trainer")
+    for actor, creature, target in order:
+        # number of attacks: double-speed grants two attacks
+        attacks = 2 if creature["stats"]["SPD"] >= 2 * target["stats"]["SPD"] else 1
+        for _ in range(attacks):
+            if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+                break
+            # choose best attack stat
+            S = creature["stats"]["PATK"] if creature["stats"]["PATK"] >= creature["stats"]["SATK"] else creature["stats"]["SATK"]
+            N = math.ceil(S / 10)
+            roll_sum = sum(random.randint(1, 6) for _ in range(N))
+            # apply defense
+            defense = target["stats"].get("AR", 0)
+            damage = max(1, roll_sum - defense)
+            # apply damage
+            if actor == "user":
+                state.opp_current_hp -= damage
+            else:
+                state.user_current_hp -= damage
+            state.logs.append(f"{creature['name']} attacked and dealt {damage} damage.")
+    state.rounds += 1
+
+# ─── Bot Lifecycle Events ────────────────────────────────────
+@bot.event
+async def setup_hook():
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(SCHEMA_SQL)
+    if GUILD_ID:
+        guild = discord.Object(id=int(GUILD_ID))
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        logger.info("Synced to guild %s", GUILD_ID)
+    else:
+        await bot.tree.sync()
+        logger.info("Synced globally")
+
+@bot.event
+async def on_ready():
+    logger.info("Logged in as %s", bot.user)
+
+# ─── Slash Commands ─────────────────────────────────────────
+@bot.tree.command(description="Register yourself as a trainer")
 async def register(interaction: discord.Interaction):
-    uid, username = interaction.user.id, interaction.user.name
-    async with bot.db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (id, username) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
-            uid,
-            username,
-        )
-    await interaction.response.send_message("Registration complete! Use /spawn to create a creature.")
+    async with (await db_pool()).acquire() as conn:
+        await conn.execute("INSERT INTO trainers(user_id) VALUES($1) ON CONFLICT DO NOTHING", interaction.user.id)
+    await interaction.response.send_message("Trainer profile created!", ephemeral=True)
 
-
-@bot.tree.command(description="Spawn a new creature")
-@app_commands.describe(name="Creature name", tier="Tier (bronze/silver/gold)")
-async def spawn(interaction: discord.Interaction, name: str, tier: str):
+@bot.tree.command(description="Spawn a brand-new creature egg")
+async def spawn(interaction: discord.Interaction):
     uid = interaction.user.id
-    tier_value = tier.lower()
-
-    # Verify user registered
-    async with bot.db_pool.acquire() as conn:
-        if not await conn.fetchrow("SELECT 1 FROM users WHERE id=$1", uid):
-            await interaction.response.send_message("Please /register first!", ephemeral=True)
-            return
-
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    stats = allocate_stats(tier_value)
-
-    async with bot.db_pool.acquire() as conn:
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_id=$1", uid):
+            return await interaction.response.send_message("Use /register first.", ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    roll = roll_d100()
+    rarity = rarity_from_roll(roll)
+    # basic creature: no abilities
+    stats = allocate_stats(rarity, [])
+    async with (await db_pool()).acquire() as conn:
         await conn.execute(
-            """INSERT INTO creatures (owner_id, name, tier, hp, atk, def, spd)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-            uid, name, tier_value, stats["HP"], stats["ATK"], stats["DEF"], stats["SPD"],
+            "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats)"
+            " VALUES($1,$2,$3,$4,$5)",
+            uid, f"Creature{roll}{random.randint(1000,9999)}", rarity, [], json.dumps(stats)
         )
-
-    await interaction.followup.send(
-        f"Spawned {name}! (HP:{stats['HP']} ATK:{stats['ATK']} DEF:{stats['DEF']} SPD:{stats['SPD']})"
-    )
-
-
-@spawn.autocomplete("tier")
-async def tier_autocomplete(_: discord.Interaction, current: str):
-    return [app_commands.Choice(name=t.title(), value=t) for t in ("bronze", "silver", "gold") if current.lower() in t]
-
+    embed = discord.Embed(title=f"Creature (Evolved) - {rarity}", color=0x8B0000)
+    for s in PRIMARY_STATS:
+        # show effective HP
+        val = stats[s] * 5 if s == "HP" else stats[s]
+        embed.add_field(name=s, value=str(val), inline=True)
+    embed.set_footer(text=f"d100 roll: {roll}")
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(description="List your creatures")
 async def creatures(interaction: discord.Interaction):
-    uid = interaction.user.id
-    async with bot.db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT name, tier, hp, atk, def, spd FROM creatures WHERE owner_id=$1",
-            uid,
-        )
+    rows = await (await db_pool()).fetch("SELECT name,rarity,stats FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id)
     if not rows:
-        await interaction.response.send_message("You have no creatures. Use /spawn!")
-        return
-    lines = [
-        f"• {r['name']} ({r['tier']}) HP:{r['hp']} ATK:{r['atk']} DEF:{r['def']} SPD:{r['spd']}"
-        for r in rows
-    ]
-    await interaction.response.send_message("Your creatures:\n" + "\n".join(lines))
+        return await interaction.response.send_message("You own no creatures yet.", ephemeral=True)
+    lines: List[str] = []
+    for i, r in enumerate(rows, 1):
+        stats = r['stats'] if isinstance(r['stats'], dict) else json.loads(r['stats'])
+        stat_str = ", ".join(f"{k}:{(v*5 if k=='HP' else v)}" for k, v in stats.items())
+        lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {stat_str}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-
-@bot.tree.command(description="Challenge a wild opponent")
-@app_commands.describe(creature="Your creature's name", tier="Opponent tier (bronze/silver/gold)")
-async def battle(interaction: discord.Interaction, creature: str, tier: str):
+@bot.tree.command(description="Battle your creature against a tiered opponent")
+async def battle(interaction: discord.Interaction, creature_name: str, tier: int):
     uid = interaction.user.id
-    tier_value = tier.lower()
-
-    if uid in bot.active_battles:
-        await interaction.response.send_message("Finish your current battle with /continue first.", ephemeral=True)
-        return
-
-    await interaction.response.defer(thinking=True)
-
-    # Fetch player's creature
-    async with bot.db_pool.acquire() as conn:
-        rec = await conn.fetchrow(
-            "SELECT * FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-            uid,
-            creature,
-        )
-    if not rec:
-        await interaction.followup.send("Creature not found.")
-        return
-    player_creature = Creature.from_record(rec)
-
-    # Generate opponent creature
-    opponent_name = random.choice(["Gobblin", "Shadow Drake", "Crystal Lynx", "Thunder Imp"])
-    opp_stats = allocate_stats(tier_value)
-    opponent_creature = Creature(owner_id=0, name=opponent_name, tier=tier_value, stats=opp_stats)
-
-    bot.active_battles[uid] = (player_creature, opponent_creature)
-    await interaction.followup.send(
-        f"A wild {opponent_name} appears! (HP:{opp_stats['HP']} ATK:{opp_stats['ATK']} DEF:{opp_stats['DEF']} SPD:{opp_stats['SPD']})
-Use /continue to fight."
+    if tier not in TIER_EXTRAS:
+        return await interaction.response.send_message("Invalid tier.", ephemeral=True)
+    row = await (await db_pool()).fetchrow(
+        "SELECT name,rarity,stats FROM creatures WHERE owner_id=$1 AND name ILIKE $2", uid, creature_name
     )
+    if not row:
+        return await interaction.response.send_message("You don't own a creature with that name.", ephemeral=True)
+    user_stats = row['stats'] if isinstance(row['stats'], dict) else json.loads(row['stats'])
+    user_creature = {"name": row['name'], "stats": user_stats}
+    # spawn opponent
+    roll = roll_d100()
+    rarity = rarity_from_roll(roll)
+    extra = random.randint(*TIER_EXTRAS[tier])
+    opp_stats = allocate_stats(rarity, [], extra)
+    opp_creature = {"name": f"Wild{roll}{random.randint(1000,9999)}", "stats": opp_stats}
+    # init battle state
+    state = BattleState(
+        user_id=uid,
+        user_creature=user_creature,
+        user_current_hp=user_stats['HP'] * 5,
+        user_max_hp=user_stats['HP'] * 5,
+        opp_creature=opp_creature,
+        opp_current_hp=opp_stats['HP'] * 5,
+        opp_max_hp=opp_stats['HP'] * 5,
+        logs=[]
+    )
+    active_battles[uid] = state
+    # simulate first rounds
+    for _ in range(10):
+        if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+            break
+        simulate_round(state)
+    # send logs
+    out = state.logs.copy()
+    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+        winner = 'you' if state.opp_current_hp <= 0 else 'opponent'
+        out.append(f"Battle over! {winner.capitalize()} won.")
+        active_battles.pop(uid, None)
+    else:
+        out.append("Type /continue to proceed to the next 10 rounds.")
+    await interaction.response.send_message("\n".join(out))
 
-
-@battle.autocomplete("tier")
-async def tier_autocomplete_battle(_: discord.Interaction, current: str):
-    return [app_commands.Choice(name=t.title(), value=t) for t in ("bronze", "silver", "gold") if current.lower() in t]
-
-
-@bot.tree.command(name="continue", description="Continue your active battle")
+@bot.tree.command(name="continue", description="Continue your ongoing battle")
 async def continue_battle(interaction: discord.Interaction):
     uid = interaction.user.id
-    battle_pair = bot.active_battles.get(uid)
-    if not battle_pair:
-        await interaction.response.send_message("No active battle. Use /battle to start one.")
-        return
-
-    player, opponent = battle_pair
-    battle_log: List[str] = []
-
-    # Up to five rounds or until knockout
-    for _ in range(5):
-        battle_log.append(simulate_round(player, opponent))
-        if player.current_hp <= 0 or opponent.current_hp <= 0:
+    state = active_battles.get(uid)
+    if not state:
+        return await interaction.response.send_message("You have no ongoing battle.", ephemeral=True)
+    for _ in range(10):
+        if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
-
-    if player.current_hp <= 0 and opponent.current_hp <= 0:
-        result = "It's a draw! Both creatures are down."
-    elif opponent.current_hp <= 0:
-        result = f"{player.name} wins!"
+        simulate_round(state)
+    out = state.logs[state.next_log_idx:]
+    state.next_log_idx = len(state.logs)
+    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+        winner = 'you' if state.opp_current_hp <= 0 else 'opponent'
+        out.append(f"Battle over! {winner.capitalize()} won.")
+        active_battles.pop(uid, None)
     else:
-        result = f"{opponent.name} wins!"
-
-    battle_log.append(result)
-    await interaction.response.send_message("
-".join(battle_log))
-
-    bot.active_battles.pop(uid, None)
-
-###############################################################################
-# Entry point
-###############################################################################
+        out.append("Type /continue to proceed to the next 10 rounds.")
+    await interaction.response.send_message("\n".join(out))
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    bot.run(TOKEN)

@@ -182,14 +182,15 @@ def simulate_round(state: BattleState):
             N = math.ceil(S / 10)
             rolls = [random.randint(1, 6) for _ in range(N)]
             roll_sum = sum(rolls)
-            defense = defender["stats"].get("AR", 0)
-            damage = max(1, math.ceil((roll_sum ** 2) / (roll_sum + defense)))
+            defender_AR = defender["stats"].get("AR", 0)
+            # Updated damage formula
+            damage = max(1, math.ceil(6 * (roll_sum ** 2) / (roll_sum + defender_AR)))
             if actor == "user":
                 state.opp_current_hp -= damage
             else:
                 state.user_current_hp -= damage
             state.logs.append(
-                f"{attacker['name']} rolled {rolls} (sum {roll_sum}), defender AR {defense} -> dealt {damage}"
+                f"{attacker['name']} rolled {rolls} (sum {roll_sum}), defender AR {defender_AR} -> dealt {damage}"
             )
     state.rounds += 1
     state.logs.append(
@@ -206,7 +207,7 @@ async def setup_hook():
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
         bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
+       	await bot.tree.sync(guild=guild)
         logger.info("Synced to guild %s", GUILD_ID)
     else:
         await bot.tree.sync()

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import asyncpg
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import openai  # pre-1.0 SDK
 
 # ─── Configuration & Logging ──────────────────────────────────
@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS trainers (
   user_id BIGINT PRIMARY KEY,
   joined_at TIMESTAMPTZ DEFAULT now()
 );
+ALTER TABLE trainers ADD COLUMN IF NOT EXISTS cash BIGINT DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS creatures (
   id SERIAL PRIMARY KEY,
@@ -86,7 +87,7 @@ TIER_EXTRAS: Dict[int, Tuple[int, int]] = {
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 
-# ─── In-Memory Battle Store ──────────────────────────────────
+# ─── In-Memory Battle Store ─────────────────────────────────
 @dataclass
 class BattleState:
     user_id: int
@@ -101,6 +102,14 @@ class BattleState:
     rounds: int = 0
 
 active_battles: Dict[int, BattleState] = {}
+
+# ─── Cash Distribution Task ─────────────────────────────────
+@tasks.loop(hours=1)
+async def distribute_cash():
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE trainers SET cash = cash + 400")
+    logger.info("Distributed 400 cash to all trainers")
 
 # ─── Utility Functions ───────────────────────────────────────
 def roll_d100() -> int:
@@ -160,14 +169,13 @@ Reply ONLY with JSON:
         try:
             data = json.loads(text)
             if "name" in data and len(data.get("descriptors", [])) == 3:
-                # Ensure each word in the name is capitalized
                 data["name"] = data["name"].title()
                 return data
         except json.JSONDecodeError:
             continue
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
-# ─── Battle Simulation ─────────────────────────────────
+# ─── Battle Simulation ─────────────────────────────────────
 def simulate_round(state: BattleState):
     state.rounds += 1
     state.logs.append(f"Round {state.rounds}")
@@ -229,6 +237,9 @@ async def setup_hook():
         await bot.tree.sync()
         logger.info("Synced globally")
 
+    if not distribute_cash.is_running():
+        distribute_cash.start()
+
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
@@ -287,7 +298,7 @@ async def spawn(interaction: discord.Interaction):
 @bot.tree.command(description="List your creatures")
 async def creatures(interaction: discord.Interaction):
     rows = await (await db_pool()).fetch(
-        "SELECT name,rarity,stats,descriptors FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id
+        "SELECT name,rarity,stats,descriptors,stats FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id
     )
     if not rows:
         return await interaction.response.send_message("You own no creatures yet.", ephemeral=True)
@@ -389,6 +400,15 @@ async def continue_battle(interaction: discord.Interaction):
         new_logs.append("Type /continue to proceed to the next 10 rounds.")
 
     await send_chunks(interaction, "\n".join(new_logs), use_followup_first=True)
+
+@bot.tree.command(description="Check your cash balance")
+async def cash(interaction: discord.Interaction):
+    uid = interaction.user.id
+    row = await (await db_pool()).fetchrow("SELECT cash FROM trainers WHERE user_id=$1", uid)
+    if not row:
+        return await interaction.response.send_message("Use /register first.", ephemeral=True)
+    balance = row['cash']
+    await interaction.response.send_message(f"You have {balance} cash.", ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN)

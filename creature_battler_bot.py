@@ -74,9 +74,15 @@ POINT_POOLS: Dict[str, Tuple[int, int]] = {
     "Legendary": (400, 800),
 }
 TIER_EXTRAS: Dict[int, Tuple[int, int]] = {
-    1: (0, 10), 2: (10, 30), 3: (30, 60), 4: (60, 100),
-    5: (100, 140), 6: (140, 180), 7: (180, 220),
-    8: (220, 260), 9: (200, 300),
+    1: (0, 10),
+    2: (10, 30),
+    3: (30, 60),
+    4: (60, 100),
+    5: (100, 140),
+    6: (140, 180),
+    7: (180, 220),
+    8: (220, 260),
+    9: (200, 300),
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 
@@ -161,36 +167,60 @@ Reply ONLY with JSON:
 
 # ─── Battle Simulation ─────────────────────────────────
 def simulate_round(state: BattleState):
-    state.logs.append(f"Round {state.rounds + 1}")
+    # Start new round
+    state.rounds += 1
+    state.logs.append(f"Round {state.rounds}")
+
     u, o = state.user_creature, state.opp_creature
     u_spd, o_spd = u["stats"]["SPD"], o["stats"]["SPD"]
     if u_spd > o_spd or (u_spd == o_spd and random.choice([True, False])):
         order = [("user", u, o), ("opp", o, u)]
     else:
         order = [("opp", o, u), ("user", u, o)]
+
     for actor, attacker, defender in order:
         attacks = 2 if attacker["stats"]["SPD"] >= 2 * defender["stats"]["SPD"] else 1
         for _ in range(attacks):
+            # Check if battle already ended
             if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
                 return
+
+            # Determine pre-attack HP values
+            if actor == "user":
+                attacker_hp = state.user_current_hp
+                defender_hp = state.opp_current_hp
+                defender_max = state.opp_max_hp
+            else:
+                attacker_hp = state.opp_current_hp
+                defender_hp = state.user_current_hp
+                defender_max = state.user_max_hp
+
+            # Roll damage
             S = max(attacker["stats"]["PATK"], attacker["stats"]["SATK"])
             N = math.ceil(S / 10)
             rolls = [random.randint(1, 6) for _ in range(N)]
             roll_sum = sum(rolls)
             defense = defender["stats"].get("AR", 0)
-            raw_calc = (roll_sum ** 2) / (roll_sum + defense)
-            damage = max(1, math.ceil(raw_calc))
-            current_hp = state.user_current_hp if actor != "user" else state.opp_current_hp
+            damage = max(1, math.ceil((roll_sum ** 2) / (roll_sum + defense)))
+
+            # Apply damage
             if actor == "user":
                 state.opp_current_hp -= damage
             else:
                 state.user_current_hp -= damage
-            attacker_name = attacker["name"]
+
+            # Log attack with detailed breakdown
             state.logs.append(
-                f"{attacker_name} [HP {current_hp}] attacked for {damage} "
-                f"(rolled {rolls} = {roll_sum}; {roll_sum}²/({roll_sum}+{defense}) = {raw_calc:.2f} → {damage})"
+                f"{attacker['name']} [HP {attacker_hp}/{state.user_max_hp if actor=='user' else state.opp_max_hp}] "
+                f"attacked for {damage} "
+                f"(rolls {rolls} sum {roll_sum}, formula ceil({roll_sum}²/({roll_sum}+{defense})) = {damage})"
             )
-    state.rounds += 1
+
+            # Check for KO
+            if (actor == "user" and state.opp_current_hp <= 0) or (actor == "opp" and state.user_current_hp <= 0):
+                fallen = defender["name"]
+                state.logs.append(f"{fallen} is down!")
+                return
 
 # ─── Bot Lifecycle Events ────────────────────────────────────
 @bot.event
@@ -261,6 +291,22 @@ async def spawn(interaction: discord.Interaction):
     embed.set_footer(text=f"d100 roll: {roll}")
     await interaction.followup.send(embed=embed)
 
+@bot.tree.command(description="List your creatures")
+async def creatures(interaction: discord.Interaction):
+    rows = await (await db_pool()).fetch(
+        "SELECT name,rarity,stats,descriptors FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id
+    )
+    if not rows:
+        return await interaction.response.send_message("You own no creatures yet.", ephemeral=True)
+    lines: List[str] = []
+    for i, r in enumerate(rows, 1):
+        stats = r['stats'] if isinstance(r['stats'], dict) else json.loads(r['stats'])
+        hp = stats['HP']*5
+        stat_str = f"HP:{hp}, AR:{stats['AR']}, PATK:{stats['PATK']}, SATK:{stats['SATK']}, SPD:{stats['SPD']}"
+        desc_str = ", ".join(r['descriptors']) if r.get('descriptors') else 'None'
+        lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {stat_str} – [{desc_str}]")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
 @bot.tree.command(description="Battle your creature against a tiered opponent")
 async def battle(interaction: discord.Interaction, creature_name: str, tier: int):
     uid = interaction.user.id
@@ -280,6 +326,8 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
     opp_desc = meta.get("descriptors", [])
     opp_stats = allocate_stats(rarity, opp_desc, random.randint(*TIER_EXTRAS[tier]))
     opp_creature = {"name": opp_name, "stats": opp_stats}
+
+    # Initialize battle state with header logs
     state = BattleState(
         user_id=uid,
         user_creature=user_creature,
@@ -291,36 +339,31 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         logs=[]
     )
     active_battles[uid] = state
+
     # Header
-    header_lines = [
-        "Battle Start",
-        f"Tier {tier}",
-        f"{state.user_creature['name']} vs {state.opp_creature['name']}",
-        f"Stats: {state.user_creature['name']} HP {state.user_current_hp}/{state.user_max_hp}, "
-        f"AR {state.user_creature['stats']['AR']}, PATK {state.user_creature['stats']['PATK']}, "
-        f"SATK {state.user_creature['stats']['SATK']}, SPD {state.user_creature['stats']['SPD']} | "
-        f"{state.opp_creature['name']} HP {state.opp_current_hp}/{state.opp_max_hp}, "
-        f"AR {state.opp_creature['stats']['AR']}, PATK {state.opp_creature['stats']['PATK']}, "
-        f"SATK {state.opp_creature['stats']['SATK']}, SPD {state.opp_creature['stats']['SPD']}"
-    ]
+    state.logs.append("Battle Start")
+    state.logs.append(f"Tier {tier}")
+    state.logs.append(f"{user_creature['name']} vs {opp_creature['name']}")
+    state.logs.append(
+        f"{user_creature['name']} Stats: HP {state.user_max_hp}, AR {user_stats['AR']}, PATK {user_stats['PATK']}, SATK {user_stats['SATK']}, SPD {user_stats['SPD']} "
+        f"| {opp_creature['name']} Stats: HP {state.opp_max_hp}, AR {opp_stats['AR']}, PATK {opp_stats['PATK']}, SATK {opp_stats['SATK']}, SPD {opp_stats['SPD']}"
+    )
+
     # Simulate up to 10 rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
         simulate_round(state)
-    out = header_lines + [""] + state.logs.copy()
-    if state.user_current_hp <= 0:
-        out.append(f"{state.user_creature['name']} is down!")
-        out.append(f"{state.opp_creature['name']} wins!")
-        active_battles.pop(uid, None)
-    elif state.opp_current_hp <= 0:
-        out.append(f"{state.opp_creature['name']} is down!")
-        out.append(f"{state.user_creature['name']} wins!")
+
+    # Determine outcome
+    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+        winner = 'you' if state.opp_current_hp <= 0 else 'opponent'
+        state.logs.append(f"{user_creature['name'] if winner=='you' else opp_creature['name']} wins!")
         active_battles.pop(uid, None)
     else:
-        out.append("Type /continue to proceed to the next 10 rounds.")
-    message = "\n".join(out)
-    await send_chunks(interaction, message)
+        state.logs.append("Type /continue to proceed to the next 10 rounds.")
+
+    await send_chunks(interaction, "\n".join(state.logs))
 
 @bot.tree.command(name="continue", description="Continue your ongoing battle")
 async def continue_battle(interaction: discord.Interaction):
@@ -328,25 +371,27 @@ async def continue_battle(interaction: discord.Interaction):
     state = active_battles.get(uid)
     if not state:
         return await interaction.response.send_message("You have no ongoing battle.", ephemeral=True)
+
     await interaction.response.defer()
+    # Simulate next up to 10 rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
         simulate_round(state)
+
+    # Collect new logs
     out = state.logs[state.next_log_idx:]
     state.next_log_idx = len(state.logs)
-    if state.user_current_hp <= 0:
-        out.append(f"{state.user_creature['name']} is down!")
-        out.append(f"{state.opp_creature['name']} wins!")
-        active_battles.pop(uid, None)
-    elif state.opp_current_hp <= 0:
-        out.append(f"{state.opp_creature['name']} is down!")
-        out.append(f"{state.user_creature['name']} wins!")
+
+    # Determine outcome
+    if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
+        winner = 'you' if state.opp_current_hp <= 0 else 'opponent'
+        out.append(f"{state.user_creature['name'] if winner=='you' else state.opp_creature['name']} wins!")
         active_battles.pop(uid, None)
     else:
         out.append("Type /continue to proceed to the next 10 rounds.")
-    message = "\n".join(out)
-    await send_chunks(interaction, message, use_followup_first=True)
+
+    await send_chunks(interaction, "\n".join(out), use_followup_first=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN)

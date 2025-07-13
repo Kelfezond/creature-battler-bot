@@ -105,13 +105,11 @@ active_battles: Dict[int, BattleState] = {}
 def roll_d100() -> int:
     return random.randint(1, 100)
 
-
 def rarity_from_roll(r: int) -> str:
     for low, high, name in RARITY_TABLE:
         if low <= r <= high:
             return name
     return "Common"
-
 
 def allocate_stats(rarity: str, descriptors: List[str], extra: int = 0) -> Dict[str, int]:
     pool = random.randint(*POINT_POOLS[rarity]) + extra
@@ -168,13 +166,15 @@ Reply ONLY with JSON:
 
 # ─── Battle Simulation ─────────────────────────────────────
 def simulate_round(state: BattleState):
-    u = state.user_creature
-    o = state.opp_creature
-    u_spd = u["stats"]["SPD"]
-    o_spd = o["stats"]["SPD"]
-    first, second = (u, o) if (u_spd > o_spd or (u_spd == o_spd and random.choice([True, False]))) else (o, u)
-    actors = [("user", first, second)]
-    for actor, attacker, defender in actors:
+    u, o = state.user_creature, state.opp_creature
+    u_spd, o_spd = u["stats"]["SPD"], o["stats"]["SPD"]
+    # determine order
+    if u_spd > o_spd or (u_spd == o_spd and random.choice([True, False])):
+        order = [("user", u, o), ("opp", o, u)]
+    else:
+        order = [("opp", o, u), ("user", u, o)]
+    # each actor attacks
+    for actor, attacker, defender in order:
         attacks = 2 if attacker["stats"]["SPD"] >= 2 * defender["stats"]["SPD"] else 1
         for _ in range(attacks):
             if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
@@ -190,10 +190,14 @@ def simulate_round(state: BattleState):
             else:
                 state.user_current_hp -= damage
             state.logs.append(
-                f"{attacker['name']} rolled {rolls} (sum {roll_sum}), "
-                f"defender AR {defense} -> dealt {damage} damage"
+                f"{attacker['name']} rolled {rolls} (sum {roll_sum}), defender AR {defense} -> dealt {damage}"
             )
     state.rounds += 1
+    # log health after round
+    state.logs.append(
+        f"After round {state.rounds}: {state.user_creature['name']} HP {state.user_current_hp}/{state.user_max_hp}, "
+        f"{state.opp_creature['name']} HP {state.opp_current_hp}/{state.opp_max_hp}"
+    )
 
 # ─── Bot Lifecycle Events ────────────────────────────────────
 @bot.event
@@ -228,7 +232,7 @@ async def spawn(interaction: discord.Interaction):
     uid = interaction.user.id
     pool = await db_pool()
     async with pool.acquire() as conn:
-        if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_id=$1", uid):
+        if not await conn.fetchrow("SELECT 1 FROM trainers WHERE user_user_id=$1", uid):
             return await interaction.response.send_message("Use /register first.", ephemeral=True)
     await interaction.response.defer(thinking=True)
     roll = roll_d100()
@@ -285,10 +289,10 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     meta = await generate_creature_meta(rarity)
-    name = meta.get("name")
-    descriptors = meta.get("descriptors", [])
-    opp_stats = allocate_stats(rarity, descriptors, random.randint(*TIER_EXTRAS[tier]))
-    opp_creature = {"name": name, "stats": opp_stats}
+    opp_name = meta.get("name")
+    opp_desc = meta.get("descriptors", [])
+    opp_stats = allocate_stats(rarity, opp_desc, random.randint(*TIER_EXTRAS[tier]))
+    opp_creature = {"name": opp_name, "stats": opp_stats}
     state = BattleState(
         user_id=uid,
         user_creature=user_creature,
@@ -300,6 +304,7 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         logs=[]
     )
     active_battles[uid] = state
+    # simulate 10 full rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break

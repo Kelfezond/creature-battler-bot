@@ -183,7 +183,7 @@ def simulate_round(state: BattleState):
             rolls = [random.randint(1, 6) for _ in range(N)]
             roll_sum = sum(rolls)
             defense = defender["stats"].get("AR", 0)
-            damage = max(1, roll_sum - defense)
+            damage = max(1, math.ceil((roll_sum ** 2) / (roll_sum + defense)))
             if actor == "user":
                 state.opp_current_hp -= damage
             else:
@@ -218,13 +218,11 @@ async def on_ready():
 
 # ─── Helper for chunked messages ─────────────────────────────
 async def send_chunks(interaction: discord.Interaction, content: str, use_followup_first: bool = False):
-    # Discord max content ~2000; use 1900 to be safe
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
     if use_followup_first:
         for chunk in chunks:
             await interaction.followup.send(chunk)
     else:
-        # first chunk as initial response
         await interaction.response.send_message(chunks[0])
         for chunk in chunks[1:]:
             await interaction.followup.send(chunk)
@@ -251,7 +249,7 @@ async def spawn(interaction: discord.Interaction):
     meta = await generate_creature_meta(rarity)
     name = meta.get("name")
     descriptors = meta.get("descriptors", [])
-    stats =_allocate_stats(rarity, descriptors)
+    stats = allocate_stats(rarity, descriptors)
     async with (await db_pool()).acquire() as conn:
         await conn.execute(
             "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats)"
@@ -268,6 +266,22 @@ async def spawn(interaction: discord.Interaction):
     embed.set_footer(text=f"d100 roll: {roll}")
     await interaction.followup.send(embed=embed)
 
+@bot.tree.command(description="List your creatures")
+async def creatures(interaction: discord.Interaction):
+    rows = await (await db_pool()).fetch(
+        "SELECT name,rarity,stats,descriptors FROM creatures WHERE owner_id=$1 ORDER BY id", interaction.user.id
+    )
+    if not rows:
+        return await interaction.response.send_message("You own no creatures yet.", ephemeral=True)
+    lines: List[str] = []
+    for i, r in enumerate(rows, 1):
+        stats = r['stats'] if isinstance(r['stats'], dict) else json.loads(r['stats'])
+        hp = stats['HP']*5
+        stat_str = f"HP:{hp}, AR:{stats['AR']}, PATK:{stats['PATK']}, SATK:{stats['SATK']}, SPD:{stats['SPD']}"
+        desc_str = ", ".join(r['descriptors']) if r.get('descriptors') else 'None'
+        lines.append(f"{i}. **{r['name']}** ({r['rarity']}) – {stat_str} – [{desc_str}]")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
 @bot.tree.command(description="Battle your creature against a tiered opponent")
 async def battle(interaction: discord.Interaction, creature_name: str, tier: int):
     uid = interaction.user.id
@@ -280,8 +294,6 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         return await interaction.response.send_message("You don't own a creature with that name.", ephemeral=True)
     user_stats = row['stats'] if isinstance(row['stats'], dict) else json.loads(row['stats'])
     user_creature = {"name": row['name'], "stats": user_stats}
-
-    # generate opponent
     roll = roll_d100()
     rarity = rarity_from_roll(roll)
     meta = await generate_creature_meta(rarity)
@@ -289,8 +301,6 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
     opp_desc = meta.get("descriptors", [])
     opp_stats = allocate_stats(rarity, opp_desc, random.randint(*TIER_EXTRAS[tier]))
     opp_creature = {"name": opp_name, "stats": opp_stats}
-
-    # initialize battle state
     state = BattleState(
         user_id=uid,
         user_creature=user_creature,
@@ -302,14 +312,10 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         logs=[]
     )
     active_battles[uid] = state
-
-    # simulate up to 10 rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
         simulate_round(state)
-
-    # prepare output
     out = state.logs.copy()
     if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
         winner = 'you' if state.opp_current_hp <= 0 else 'opponent'
@@ -317,8 +323,6 @@ async def battle(interaction: discord.Interaction, creature_name: str, tier: int
         active_battles.pop(uid, None)
     else:
         out.append("Type /continue to proceed to the next 10 rounds.")
-
-    # send in chunks to avoid exceeding Discord limits
     message = "\n".join(out)
     await send_chunks(interaction, message)
 
@@ -328,14 +332,10 @@ async def continue_battle(interaction: discord.Interaction):
     state = active_battles.get(uid)
     if not state:
         return await interaction.response.send_message("You have no ongoing battle.", ephemeral=True)
-
-    # simulate next up to 10 rounds
     for _ in range(10):
         if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
             break
         simulate_round(state)
-
-    # gather new logs
     out = state.logs[state.next_log_idx:]
     state.next_log_idx = len(state.logs)
     if state.user_current_hp <= 0 or state.opp_current_hp <= 0:
@@ -344,9 +344,7 @@ async def continue_battle(interaction: discord.Interaction):
         active_battles.pop(uid, None)
     else:
         out.append("Type /continue to proceed to the next 10 rounds.")
-
     message = "\n".join(out)
-    # first call is followup since initial interaction already responded
     await send_chunks(interaction, message, use_followup_first=True)
 
 if __name__ == "__main__":

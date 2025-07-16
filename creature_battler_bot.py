@@ -96,8 +96,8 @@ async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    await (await db_pool()).execute("UPDATE trainers SET cash = cash + 400")
-    logger.info("Distributed 400 cash to all trainers")
+    await (await db_pool()).execute("UPDATE trainers SET cash = cash + 100")
+    logger.info("Distributed 100 cash to all trainers")
 
 @tasks.loop(hours=24)
 async def distribute_points():

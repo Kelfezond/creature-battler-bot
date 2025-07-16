@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import discord
 from discord.ext import commands, tasks
-import openai              # pre‑1.0 SDK
+import openai                      # pre‑1.0 SDK
 
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -66,9 +66,13 @@ POINT_POOLS = {
 TIER_EXTRAS = {
     1: (0, 10),  2: (10, 30), 3: (30, 60), 4: (60, 100),
     5: (100, 140), 6: (140, 180), 7: (180, 220),
-    8: (220, 260), 9: (260, 300)          # fixed overlap with tier 8
+    8: (220, 260), 9: (260, 300)
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
+
+# New tactical action table
+ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
+ACTION_WEIGHTS = [36, 18, 16, 30]   # sum = 100
 
 # ─── Battle state ────────────────────────────────────────────
 @dataclass
@@ -127,6 +131,9 @@ def stat_block(cre: Dict[str, Any], max_hp: int) -> str:
         f"AR:{s['AR']} PATK:{s['PATK']} SATK:{s['SATK']} SPD:{s['SPD']}"
     )
 
+def choose_action() -> str:
+    return random.choices(ACTIONS, weights=ACTION_WEIGHTS, k=1)[0]
+
 async def fetch_used_lists() -> Tuple[List[str], List[str]]:
     rows = await (await db_pool()).fetch("SELECT name, descriptors FROM creatures")
     names = [r["name"].lower() for r in rows]
@@ -172,35 +179,75 @@ def simulate_round(st: BattleState):
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
 
-    # Current HP summary (before attacks)
+    # Actions for this round
+    user_act = choose_action()
+    opp_act  = choose_action()
+    st.logs.append(
+        f"{st.user_creature['name']} chooses **{user_act}** | "
+        f"{st.opp_creature['name']} chooses **{opp_act}**"
+    )
+
+    # HP summary before attacks
     st.logs.append(
         f"{st.user_creature['name']} HP {st.user_current_hp}/{st.user_max_hp} | "
         f"{st.opp_creature['name']} HP {st.opp_current_hp}/{st.opp_max_hp}"
     )
 
     uc, oc = st.user_creature, st.opp_creature
-    order = [("user", uc, oc), ("opp", oc, uc)]
+    order = [("user", uc, oc, user_act, opp_act), ("opp", oc, uc, opp_act, user_act)]
     if uc["stats"]["SPD"] < oc["stats"]["SPD"] or (
         uc["stats"]["SPD"] == oc["stats"]["SPD"] and random.choice([0, 1])
     ):
         order.reverse()
 
-    for side, atk, dfn in order:
-        attacks = 2 if atk["stats"]["SPD"] >= 2 * dfn["stats"]["SPD"] else 1
-        for _ in range(attacks):
+    for side, atk, dfn, act, dfn_act in order:
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
+
+        if act == "Defend":
+            st.logs.append(f"{atk['name']} is defending.")
+            continue
+
+        # Number of swings (SPD rule)
+        swings = 2 if atk["stats"]["SPD"] >= 2 * dfn["stats"]["SPD"] else 1
+        for _ in range(swings):
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-                return
+                break
+
             S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+            # Special bypasses AR
+            AR_val = 0 if act == "Special" else dfn["stats"]["AR"]
             rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
-            dmg = max(1, math.ceil(sum(rolls) ** 2 / (sum(rolls) + dfn["stats"]["AR"])))
+            dmg = max(1, math.ceil(sum(rolls) ** 2 / (sum(rolls) + AR_val)))
+
+            # Aggressive adds 10 %
+            if act == "Aggressive":
+                dmg = math.ceil(dmg * 1.1)
+
+            # Defender halves damage if defending
+            if dfn_act == "Defend":
+                dmg = max(1, math.ceil(dmg * 0.5))
+
+            # Apply damage
             if side == "user":
                 st.opp_current_hp -= dmg
             else:
                 st.user_current_hp -= dmg
-            st.logs.append(f"{atk['name']} hits for {dmg} (rolls {rolls})")
+
+            act_word = {
+                "Attack": "hits",
+                "Aggressive": "aggressively hits",
+                "Special": "unleashes a special attack on"
+            }[act]
+            note = " (defended)" if dfn_act == "Defend" else ""
+            st.logs.append(
+                f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg"
+                f"{' (rolls '+str(rolls)+')' if act!='Special' else ''}{note}"
+            )
+
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
                 st.logs.append(f"{dfn['name']} is down!")
-                return
+                break
 
     # HP summary after attacks
     st.logs.append(
@@ -342,7 +389,6 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         logs=[]
     )
     active_battles[inter.user.id] = st
-    # Battle header + stat comparison
     st.logs += [
         f"Battle start! Tier {tier} (+{extra} pts)",
         f"{user_cre['name']} vs {opp_cre['name']}",

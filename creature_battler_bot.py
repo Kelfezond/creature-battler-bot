@@ -66,7 +66,7 @@ POINT_POOLS = {
 TIER_EXTRAS = {
     1: (0, 10),  2: (10, 30), 3: (30, 60), 4: (60, 100),
     5: (100, 140), 6: (140, 180), 7: (180, 220),
-    8: (220, 260), 9: (260, 300)  # fixed overlap with tier 8
+    8: (220, 260), 9: (260, 300)          # fixed overlap with tier 8
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 
@@ -92,9 +92,7 @@ async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE trainers SET cash = cash + 400")
+    await (await db_pool()).execute("UPDATE trainers SET cash = cash + 400")
     logger.info("Distributed 400 cash to all trainers")
 
 @tasks.loop(hours=24)
@@ -102,14 +100,11 @@ async def distribute_points():
     if distribute_points.current_loop == 0:
         logger.info("Skipping first daily trainer‑point distribution after restart")
         return
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE trainers SET trainer_points = trainer_points + 5")
+    await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + 5")
     logger.info("Distributed 5 trainer points to all trainers")
 
 # ─── Utility functions ───────────────────────────────────────
-def roll_d100() -> int:
-    return random.randint(1, 100)
+def roll_d100() -> int: return random.randint(1, 100)
 
 def rarity_from_roll(r: int) -> str:
     for low, high, name in RARITY_TABLE:
@@ -124,6 +119,13 @@ def allocate_stats(rarity: str, extra: int = 0) -> Dict[str, int]:
     for _ in range(pool):
         stats[random.choice(PRIMARY_STATS)] += 1
     return stats
+
+def stat_block(cre: Dict[str, Any], max_hp: int) -> str:
+    s = cre["stats"]
+    return (
+        f"{cre['name']} – HP:{max_hp} "
+        f"AR:{s['AR']} PATK:{s['PATK']} SATK:{s['SATK']} SPD:{s['SPD']}"
+    )
 
 async def fetch_used_lists() -> Tuple[List[str], List[str]]:
     rows = await (await db_pool()).fetch("SELECT name, descriptors FROM creatures")
@@ -144,10 +146,7 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     names_used, words_used = await fetch_used_lists()
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
-{{
- "name": "1‑3 words",
- "descriptors": ["word1","word2","word3"]
-}}
+{{"name":"1‑3 words","descriptors":["w1","w2","w3"]}}
 Avoid names: {', '.join(names_used)}
 Avoid words: {', '.join(words_used)}
 """
@@ -167,18 +166,25 @@ Avoid words: {', '.join(words_used)}
                 return data
         except Exception as e:
             logger.error("OpenAI error: %s", e)
-    # fallback
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
 def simulate_round(st: BattleState):
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
+
+    # Current HP summary (before attacks)
+    st.logs.append(
+        f"{st.user_creature['name']} HP {st.user_current_hp}/{st.user_max_hp} | "
+        f"{st.opp_creature['name']} HP {st.opp_current_hp}/{st.opp_max_hp}"
+    )
+
     uc, oc = st.user_creature, st.opp_creature
     order = [("user", uc, oc), ("opp", oc, uc)]
     if uc["stats"]["SPD"] < oc["stats"]["SPD"] or (
         uc["stats"]["SPD"] == oc["stats"]["SPD"] and random.choice([0, 1])
     ):
         order.reverse()
+
     for side, atk, dfn in order:
         attacks = 2 if atk["stats"]["SPD"] >= 2 * dfn["stats"]["SPD"] else 1
         for _ in range(attacks):
@@ -195,6 +201,12 @@ def simulate_round(st: BattleState):
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
                 st.logs.append(f"{dfn['name']} is down!")
                 return
+
+    # HP summary after attacks
+    st.logs.append(
+        f"{st.user_creature['name']} HP {max(st.user_current_hp,0)}/{st.user_max_hp} | "
+        f"{st.opp_creature['name']} HP {max(st.opp_current_hp,0)}/{st.opp_max_hp}"
+    )
     st.logs.append("")
 
 async def send_chunks(inter: discord.Interaction, content: str):
@@ -248,9 +260,7 @@ async def register(inter: discord.Interaction):
 @bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
 async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)
-    if not row:
-        return
-    if row["cash"] < 10_000:
+    if not row or row["cash"] < 10_000:
         return await inter.response.send_message("Not enough cash.", ephemeral=True)
 
     await (await db_pool()).execute(
@@ -258,7 +268,7 @@ async def spawn(inter: discord.Interaction):
     )
     await inter.response.defer(thinking=True)
 
-    roll   = roll_d100()
+    roll, rarity = roll_d100(), None
     rarity = rarity_from_roll(roll)
     meta   = await generate_creature_meta(rarity)
     stats  = allocate_stats(rarity)
@@ -332,10 +342,17 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         logs=[]
     )
     active_battles[inter.user.id] = st
+    # Battle header + stat comparison
     st.logs += [
         f"Battle start! Tier {tier} (+{extra} pts)",
         f"{user_cre['name']} vs {opp_cre['name']}",
-        f"Opponent roll {roll} → {rarity}", ""
+        f"Opponent roll {roll} → {rarity}",
+        "",
+        "Your creature:",
+        stat_block(user_cre, st.user_max_hp),
+        "Opponent:",
+        stat_block(opp_cre, st.opp_max_hp),
+        ""
     ]
     for _ in range(10):
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0:

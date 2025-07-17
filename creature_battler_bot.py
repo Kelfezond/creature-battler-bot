@@ -46,9 +46,11 @@ CREATE TABLE IF NOT EXISTS creatures (
   rarity TEXT,
   descriptors TEXT[],
   stats JSONB,
-  current_hp BIGINT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+ALTER TABLE creatures
+  ADD COLUMN IF NOT EXISTS current_hp BIGINT;
 """
 
 async def db_pool() -> asyncpg.Pool:
@@ -92,7 +94,7 @@ class BattleState:
 
 active_battles: Dict[int, BattleState] = {}
 
-# ─── Scheduled rewards & regen (skip first run) ──────────────
+# ─── Scheduled rewards & regen ───────────────────────────────
 @tasks.loop(hours=1)
 async def distribute_cash():
     if distribute_cash.current_loop == 0:
@@ -114,16 +116,13 @@ async def regenerate_hp():
     """
     Heal every creature by 10 % of its max HP (ceil), up to its max.
     """
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        # Use SQL to do it in one pass
-        await conn.execute("""
-            UPDATE creatures
-            SET current_hp = LEAST(
-                COALESCE(current_hp, (stats->>'HP')::int * 5) + CEIL((stats->>'HP')::int * 0.5),
-                (stats->>'HP')::int * 5
-            )
-        """)
+    await (await db_pool()).execute("""
+        UPDATE creatures
+        SET current_hp = LEAST(
+            COALESCE(current_hp, (stats->>'HP')::int * 5) + CEIL((stats->>'HP')::numeric * 0.5),
+            (stats->>'HP')::int * 5
+        )
+    """)
     logger.info("Regenerated 10%% HP for all creatures")
 
 # ─── Utility functions ───────────────────────────────────────
@@ -194,8 +193,7 @@ def simulate_round(st: BattleState):
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
 
-    user_act = choose_action()
-    opp_act  = choose_action()
+    user_act, opp_act = choose_action(), choose_action()
     st.logs.append(
         f"{st.user_creature['name']} chooses **{user_act}** | "
         f"{st.opp_creature['name']} chooses **{opp_act}**"
@@ -416,7 +414,6 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             break
         simulate_round(st)
 
-    # After rounds, persist current HP
     await (await db_pool()).execute(
         "UPDATE creatures SET current_hp=$1 WHERE id=$2",
         max(st.user_current_hp, 0), st.creature_id
@@ -443,7 +440,6 @@ async def continue_battle(inter: discord.Interaction):
             break
         simulate_round(st)
 
-    # Persist HP after each `/continue`
     await (await db_pool()).execute(
         "UPDATE creatures SET current_hp=$1 WHERE id=$2",
         max(st.user_current_hp, 0), st.creature_id
@@ -508,7 +504,7 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
     new_max_hp = stats["HP"] * 5
     new_cur_hp = c["current_hp"]
     if stat == "HP":
-        new_cur_hp += increase * 5  # heal by the same amount (like Pokémon)
+        new_cur_hp += increase * 5
         new_cur_hp = min(new_cur_hp, new_max_hp)
 
     await (await db_pool()).execute(

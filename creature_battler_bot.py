@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import discord
 from discord.ext import commands, tasks
-import openai                      # pre‑1.0 SDK
+import openai
 
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -17,13 +17,13 @@ DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-for name, val in {
+for env_name, env_val in {
     "DISCORD_TOKEN": TOKEN,
     "DATABASE_URL": DB_URL,
     "OPENAI_API_KEY": openai.api_key,
 }.items():
-    if not val:
-        raise RuntimeError(f"Missing environment variable: {name}")
+    if not env_val:
+        raise RuntimeError(f"Missing environment variable: {env_name}")
 
 # ─── Discord client ──────────────────────────────────────────
 intents = discord.Intents.default()
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS trainers (
   cash BIGINT DEFAULT 0,
   trainer_points BIGINT DEFAULT 0
 );
+
 CREATE TABLE IF NOT EXISTS creatures (
   id SERIAL PRIMARY KEY,
   owner_id BIGINT NOT NULL,
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS creatures (
   rarity TEXT,
   descriptors TEXT[],
   stats JSONB,
+  current_hp BIGINT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 """
@@ -55,9 +57,9 @@ async def db_pool() -> asyncpg.Pool:
     return bot._pool
 
 # ─── Game constants ──────────────────────────────────────────
-RARITY_TABLE: List[Tuple[int, int, str]] = [
+RARITY_TABLE = [
     (1, 75, "Common"), (76, 88, "Uncommon"), (89, 95, "Rare"),
-    (96, 98, "Epic"),  (99, 100, "Legendary"),
+    (96, 98, "Epic"), (99, 100, "Legendary"),
 ]
 POINT_POOLS = {
     "Common": (25, 50), "Uncommon": (50, 100), "Rare": (100, 200),
@@ -70,7 +72,6 @@ TIER_EXTRAS = {
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 
-# New tactical action table
 ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
 ACTION_WEIGHTS = [36, 18, 16, 30]   # sum = 100
 
@@ -78,6 +79,7 @@ ACTION_WEIGHTS = [36, 18, 16, 30]   # sum = 100
 @dataclass
 class BattleState:
     user_id: int
+    creature_id: int
     user_creature: Dict[str, Any]
     user_current_hp: int
     user_max_hp: int
@@ -90,14 +92,14 @@ class BattleState:
 
 active_battles: Dict[int, BattleState] = {}
 
-# ─── Scheduled rewards (skip first run) ──────────────────────
+# ─── Scheduled rewards & regen (skip first run) ──────────────
 @tasks.loop(hours=1)
 async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    await (await db_pool()).execute("UPDATE trainers SET cash = cash + 100")
-    logger.info("Distributed 100 cash to all trainers")
+    await (await db_pool()).execute("UPDATE trainers SET cash = cash + 400")
+    logger.info("Distributed 400 cash to all trainers")
 
 @tasks.loop(hours=24)
 async def distribute_points():
@@ -106,6 +108,23 @@ async def distribute_points():
         return
     await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + 5")
     logger.info("Distributed 5 trainer points to all trainers")
+
+@tasks.loop(hours=12)
+async def regenerate_hp():
+    """
+    Heal every creature by 10 % of its max HP (ceil), up to its max.
+    """
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        # Use SQL to do it in one pass
+        await conn.execute("""
+            UPDATE creatures
+            SET current_hp = LEAST(
+                COALESCE(current_hp, (stats->>'HP')::int * 5) + CEIL((stats->>'HP')::int * 0.5),
+                (stats->>'HP')::int * 5
+            )
+        """)
+    logger.info("Regenerated 10%% HP for all creatures")
 
 # ─── Utility functions ───────────────────────────────────────
 def roll_d100() -> int: return random.randint(1, 100)
@@ -124,21 +143,14 @@ def allocate_stats(rarity: str, extra: int = 0) -> Dict[str, int]:
         stats[random.choice(PRIMARY_STATS)] += 1
     return stats
 
-def stat_block(cre: Dict[str, Any], max_hp: int) -> str:
-    s = cre["stats"]
+def stat_block(name: str, cur_hp: int, max_hp: int, s: Dict[str, int]) -> str:
     return (
-        f"{cre['name']} – HP:{max_hp} "
+        f"{name} – HP:{cur_hp}/{max_hp} "
         f"AR:{s['AR']} PATK:{s['PATK']} SATK:{s['SATK']} SPD:{s['SPD']}"
     )
 
 def choose_action() -> str:
     return random.choices(ACTIONS, weights=ACTION_WEIGHTS, k=1)[0]
-
-async def fetch_used_lists() -> Tuple[List[str], List[str]]:
-    rows = await (await db_pool()).fetch("SELECT name, descriptors FROM creatures")
-    names = [r["name"].lower() for r in rows]
-    words = {w.lower() for r in rows for w in r["descriptors"]}
-    return names, list(words)
 
 async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Record]:
     row = await (await db_pool()).fetchrow(
@@ -150,12 +162,15 @@ async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Reco
     return row
 
 async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
-    names_used, words_used = await fetch_used_lists()
+    pool = await db_pool()
+    rows = await pool.fetch("SELECT name, descriptors FROM creatures")
+    used_names = [r["name"].lower() for r in rows]
+    used_words = {w.lower() for r in rows for w in r["descriptors"]}
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
 {{"name":"1‑3 words","descriptors":["w1","w2","w3"]}}
-Avoid names: {', '.join(names_used)}
-Avoid words: {', '.join(words_used)}
+Avoid names: {', '.join(used_names)}
+Avoid words: {', '.join(used_words)}
 """
     for _ in range(3):
         try:
@@ -179,15 +194,12 @@ def simulate_round(st: BattleState):
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
 
-    # Actions for this round
     user_act = choose_action()
     opp_act  = choose_action()
     st.logs.append(
         f"{st.user_creature['name']} chooses **{user_act}** | "
         f"{st.opp_creature['name']} chooses **{opp_act}**"
     )
-
-    # HP summary before attacks
     st.logs.append(
         f"{st.user_creature['name']} HP {st.user_current_hp}/{st.user_max_hp} | "
         f"{st.opp_creature['name']} HP {st.opp_current_hp}/{st.opp_max_hp}"
@@ -203,32 +215,24 @@ def simulate_round(st: BattleState):
     for side, atk, dfn, act, dfn_act in order:
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
             break
-
         if act == "Defend":
             st.logs.append(f"{atk['name']} is defending.")
             continue
 
-        # Number of swings (SPD rule)
         swings = 2 if atk["stats"]["SPD"] >= 2 * dfn["stats"]["SPD"] else 1
         for _ in range(swings):
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
                 break
 
             S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
-            # Special bypasses AR
             AR_val = 0 if act == "Special" else dfn["stats"]["AR"]
             rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
             dmg = max(1, math.ceil(sum(rolls) ** 2 / (sum(rolls) + AR_val)))
-
-            # Aggressive adds 10 %
             if act == "Aggressive":
                 dmg = math.ceil(dmg * 1.1)
-
-            # Defender halves damage if defending
             if dfn_act == "Defend":
                 dmg = max(1, math.ceil(dmg * 0.5))
 
-            # Apply damage
             if side == "user":
                 st.opp_current_hp -= dmg
             else:
@@ -249,7 +253,6 @@ def simulate_round(st: BattleState):
                 st.logs.append(f"{dfn['name']} is down!")
                 break
 
-    # HP summary after attacks
     st.logs.append(
         f"{st.user_creature['name']} HP {max(st.user_current_hp,0)}/{st.user_max_hp} | "
         f"{st.opp_creature['name']} HP {max(st.opp_current_hp,0)}/{st.opp_max_hp}"
@@ -258,10 +261,8 @@ def simulate_round(st: BattleState):
 
 async def send_chunks(inter: discord.Interaction, content: str):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
-    first_sender = (
-        inter.followup.send if inter.response.is_done() else inter.response.send_message
-    )
-    await first_sender(chunks[0])
+    sender = inter.followup.send if inter.response.is_done() else inter.response.send_message
+    await sender(chunks[0])
     for chunk in chunks[1:]:
         await inter.followup.send(chunk)
 
@@ -280,10 +281,9 @@ async def setup_hook():
         await bot.tree.sync()
         logger.info("Synced globally")
 
-    if not distribute_cash.is_running():
-        distribute_cash.start()
-    if not distribute_points.is_running():
-        distribute_points.start()
+    for loop in (distribute_cash, distribute_points, regenerate_hp):
+        if not loop.is_running():
+            loop.start()
 
 @bot.event
 async def on_ready():
@@ -315,22 +315,23 @@ async def spawn(inter: discord.Interaction):
     )
     await inter.response.defer(thinking=True)
 
-    roll, rarity = roll_d100(), None
+    roll = roll_d100()
     rarity = rarity_from_roll(roll)
-    meta   = await generate_creature_meta(rarity)
-    stats  = allocate_stats(rarity)
+    meta = await generate_creature_meta(rarity)
+    stats = allocate_stats(rarity)
+    max_hp = stats["HP"] * 5
 
     await (await db_pool()).execute(
-        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats)"
-        "VALUES($1,$2,$3,$4,$5)",
-        inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats)
+        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp)"
+        "VALUES($1,$2,$3,$4,$5,$6)",
+        inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp
     )
     embed = discord.Embed(
         title=f"{meta['name']} ({rarity})",
         description="Descriptors: " + ", ".join(meta["descriptors"])
     )
-    for s,v in stats.items():
-        embed.add_field(name=s, value=str(v*5 if s=="HP" else v))
+    for s, v in stats.items():
+        embed.add_field(name=s, value=str(v*5 if s == "HP" else v))
     embed.set_footer(text=f"d100 roll: {roll}")
     await inter.followup.send(embed=embed)
 
@@ -339,7 +340,7 @@ async def creatures(inter: discord.Interaction):
     if not await ensure_registered(inter):
         return
     rows = await (await db_pool()).fetch(
-        "SELECT name,rarity,descriptors,stats FROM creatures "
+        "SELECT id,name,rarity,descriptors,stats,current_hp FROM creatures "
         "WHERE owner_id=$1 ORDER BY id", inter.user.id
     )
     if not rows:
@@ -348,9 +349,11 @@ async def creatures(inter: discord.Interaction):
     for idx, r in enumerate(rows, 1):
         st = json.loads(r["stats"])
         desc = ", ".join(r["descriptors"]) or "None"
+        max_hp = st["HP"] * 5
         lines.append(
             f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
-            f"HP:{st['HP']*5} AR:{st['AR']} PATK:{st['PATK']} SATK:{st['SATK']} SPD:{st['SPD']}"
+            f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
+            f"SATK:{st['SATK']} SPD:{st['SPD']}"
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -362,30 +365,37 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         return await inter.response.send_message(
             "You already have an active battle – use /continue.", ephemeral=True
         )
-    row = await ensure_registered(inter)
-    if not row:
+    if not await ensure_registered(inter):
         return
 
     c_row = await (await db_pool()).fetchrow(
-        "SELECT name,stats FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
+        "SELECT id,name,stats,current_hp FROM creatures "
+        "WHERE owner_id=$1 AND name ILIKE $2", inter.user.id, creature_name
     )
     if not c_row:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
+    stats = json.loads(c_row["stats"])
+    max_hp = stats["HP"] * 5
+    if c_row["current_hp"] <= 0:
+        return await inter.response.send_message(
+            f"{c_row['name']} has fainted and needs healing.", ephemeral=True
+        )
+
     await inter.response.defer(thinking=True)
 
-    user_cre = {"name": c_row["name"], "stats": json.loads(c_row["stats"])}
-    roll     = roll_d100()
-    rarity   = rarity_from_roll(roll)
-    meta     = await generate_creature_meta(rarity)
-    extra    = random.randint(*TIER_EXTRAS[tier])
-    opp_cre  = {"name": meta["name"], "stats": allocate_stats(rarity, extra)}
+    user_cre = {"name": c_row["name"], "stats": stats}
+    roll = roll_d100()
+    rarity = rarity_from_roll(roll)
+    meta = await generate_creature_meta(rarity)
+    extra = random.randint(*TIER_EXTRAS[tier])
+    opp_stats = allocate_stats(rarity, extra)
+    opp_cre = {"name": meta["name"], "stats": opp_stats}
 
     st = BattleState(
-        inter.user.id,
-        user_cre, user_cre["stats"]["HP"]*5, user_cre["stats"]["HP"]*5,
-        opp_cre, opp_cre["stats"]["HP"]*5,  opp_cre["stats"]["HP"]*5,
+        inter.user.id, c_row["id"],
+        user_cre, c_row["current_hp"], max_hp,
+        opp_cre, opp_stats["HP"] * 5, opp_stats["HP"] * 5,
         logs=[]
     )
     active_battles[inter.user.id] = st
@@ -395,15 +405,22 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         f"Opponent roll {roll} → {rarity}",
         "",
         "Your creature:",
-        stat_block(user_cre, st.user_max_hp),
+        stat_block(user_cre["name"], st.user_current_hp, st.user_max_hp, stats),
         "Opponent:",
-        stat_block(opp_cre, st.opp_max_hp),
+        stat_block(opp_cre["name"], st.opp_max_hp, st.opp_max_hp, opp_stats),
         ""
     ]
+
     for _ in range(10):
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
             break
         simulate_round(st)
+
+    # After rounds, persist current HP
+    await (await db_pool()).execute(
+        "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+        max(st.user_current_hp, 0), st.creature_id
+    )
 
     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
         winner = user_cre["name"] if st.opp_current_hp <= 0 else opp_cre["name"]
@@ -426,15 +443,21 @@ async def continue_battle(inter: discord.Interaction):
             break
         simulate_round(st)
 
-    new = st.logs[st.next_log_idx:]
+    # Persist HP after each `/continue`
+    await (await db_pool()).execute(
+        "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+        max(st.user_current_hp, 0), st.creature_id
+    )
+
+    new_logs = st.logs[st.next_log_idx:]
     st.next_log_idx = len(st.logs)
     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
         winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
-        new.append(f"Winner: {winner}")
+        new_logs.append(f"Winner: {winner}")
         active_battles.pop(inter.user.id, None)
     else:
-        new.append("Use /continue to proceed.")
-    await send_chunks(inter, "\n".join(new))
+        new_logs.append("Use /continue to proceed.")
+    await send_chunks(inter, "\n".join(new_logs))
 
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):
@@ -446,8 +469,7 @@ async def cash(inter: discord.Interaction):
 async def cashadd(inter: discord.Interaction, amount: int):
     if amount <= 0:
         return await inter.response.send_message("Positive amounts only.", ephemeral=True)
-    row = await ensure_registered(inter)
-    if not row:
+    if not await ensure_registered(inter):
         return
     await (await db_pool()).execute(
         "UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, inter.user.id
@@ -461,9 +483,7 @@ async def trainerpoints(inter: discord.Interaction):
         await inter.response.send_message(f"You have {row['trainer_points']} points.", ephemeral=True)
 
 @bot.tree.command(description="Train a creature stat")
-async def train(
-    inter: discord.Interaction, creature_name: str, stat: str, increase: int
-):
+async def train(inter: discord.Interaction, creature_name: str, stat: str, increase: int):
     stat = stat.upper()
     if stat not in PRIMARY_STATS:
         return await inter.response.send_message(
@@ -477,24 +497,31 @@ async def train(
         return await inter.response.send_message("Not enough trainer points.", ephemeral=True)
 
     c = await (await db_pool()).fetchrow(
-        "SELECT id,stats FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        "SELECT id,stats,current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
         inter.user.id, creature_name
     )
     if not c:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
-    st = json.loads(c["stats"])
-    st[stat] += increase
+    stats = json.loads(c["stats"])
+    stats[stat] += increase
+    new_max_hp = stats["HP"] * 5
+    new_cur_hp = c["current_hp"]
+    if stat == "HP":
+        new_cur_hp += increase * 5  # heal by the same amount (like Pokémon)
+        new_cur_hp = min(new_cur_hp, new_max_hp)
+
     await (await db_pool()).execute(
-        "UPDATE creatures SET stats=$1 WHERE id=$2", json.dumps(st), c["id"]
+        "UPDATE creatures SET stats=$1,current_hp=$2 WHERE id=$3",
+        json.dumps(stats), new_cur_hp, c["id"]
     )
     await (await db_pool()).execute(
         "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id=$2",
         increase, inter.user.id
     )
-    disp = increase*5 if stat=="HP" else increase
+    display_inc = increase * 5 if stat == "HP" else increase
     await inter.response.send_message(
-        f"{c['id']} – {creature_name.title()} trained: +{disp} {stat}.",
+        f"{c['id']} – {creature_name.title()} trained: +{display_inc} {stat}.",
         ephemeral=True
     )
 

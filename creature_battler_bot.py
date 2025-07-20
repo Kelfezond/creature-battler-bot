@@ -115,7 +115,7 @@ async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    # Changed from +100 to +60 (target ~10,000 per 7 days using integer hourly payout)
+    # Passive income: 60 cash per hour (≈10,080 per 7 days; accepted slight overage)
     await (await db_pool()).execute("UPDATE trainers SET cash = cash + 60")
     logger.info("Distributed 60 cash to all trainers")
 
@@ -130,9 +130,8 @@ async def distribute_points():
 @tasks.loop(hours=12)
 async def regenerate_hp():
     """
-    Heal every creature by 10 % of its max HP (ceil), up to its max.
-    (Note: The SQL actually uses 0.5 of base HP stat, since HP stat * 5 = max HP.
-    Adjust if you intended a different percentage.)
+    Heal every creature by 10% of its max HP (ceil), up to its max.
+    (Currently: +0.5 * base HP stat, since max = HP*5.)
     """
     await (await db_pool()).execute("""
         UPDATE creatures
@@ -185,7 +184,7 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     used_words = {w.lower() for r in rows for w in r["descriptors"]}
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
-{{"name":"1‑3 words","descriptors":["w1","w2","w3"]}}
+{{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
 Avoid names: {', '.join(used_names)}
 Avoid words: {', '.join(used_words)}
 """
@@ -296,11 +295,17 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     st.logs.append(f"You {result_word} the Tier {st.tier} battle: +{payout} cash awarded.")
     # 50% death chance if player lost
     if not player_won:
-        if random.random() < 0.5:
+        death_roll = random.random()
+        pct = int(death_roll * 100)
+        if death_roll < 0.5:
             await pool.execute("DELETE FROM creatures WHERE id=$1", st.creature_id)
-            st.logs.append(f"💀 Your creature **{st.user_creature['name']}** has died and was removed from your collection.")
+            st.logs.append(
+                f"💀 Death roll {pct} (<50): Your creature **{st.user_creature['name']}** died and was removed."
+            )
         else:
-            st.logs.append(f"Your creature **{st.user_creature['name']}** survived the defeat (no death).")
+            st.logs.append(
+                f"🛡️ Death roll {pct} (≥50): Your creature **{st.user_creature['name']}** survived the defeat."
+            )
 
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
@@ -458,7 +463,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     )
 
     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-        winner = user_cre["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
+        winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
         st.logs.append(f"Winner: {winner}")
         await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)
@@ -474,25 +479,34 @@ async def continue_battle(inter: discord.Interaction):
         return await inter.response.send_message("No active battle.", ephemeral=True)
 
     await inter.response.defer(thinking=True)
+    # Simulate up to 10 more rounds or until someone faints
     for _ in range(10):
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
             break
         simulate_round(st)
 
+    # Persist HP (unless the creature will die & be deleted later; harmless to update first)
     await (await db_pool()).execute(
         "UPDATE creatures SET current_hp=$1 WHERE id=$2",
         max(st.user_current_hp, 0), st.creature_id
     )
 
-    new_logs = st.logs[st.next_log_idx:]
-    st.next_log_idx = len(st.logs)
-    if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+    battle_ended = st.user_current_hp <= 0 or st.opp_current_hp <= 0
+    if battle_ended:
         winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
-        new_logs.append(f"Winner: {winner}")
+        st.logs.append(f"Winner: {winner}")
         await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)
-    else:
-        new_logs.append("Use /continue to proceed.")
+        # Re-slice AFTER finalize to include payout/death messages
+        new_logs = st.logs[st.next_log_idx:]
+        st.next_log_idx = len(st.logs)
+        await send_chunks(inter, "\n".join(new_logs))
+        return
+
+    # Not ended: just show the incremental rounds
+    st.logs.append("Use /continue to proceed.")
+    new_logs = st.logs[st.next_log_idx:]
+    st.next_log_idx = len(st.logs)
     await send_chunks(inter, "\n".join(new_logs))
 
 @bot.tree.command(description="Check your cash")

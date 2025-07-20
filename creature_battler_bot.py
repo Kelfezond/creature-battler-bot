@@ -77,11 +77,26 @@ PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
 ACTION_WEIGHTS = [36, 18, 16, 30]   # sum = 100
 
+# ─── Tier Payouts (Approach A: independently rounded to nearest 10) ───────────
+# Structure: tier: (win_cash, loss_cash)
+TIER_PAYOUTS: Dict[int, Tuple[int, int]] = {
+    1: (1000, 500),
+    2: (7130, 3560),
+    3: (13250, 6630),
+    4: (19380, 9690),
+    5: (25500, 12750),
+    6: (31630, 15810),
+    7: (37750, 18880),
+    8: (43880, 21940),
+    9: (50000, 25000),
+}
+
 # ─── Battle state ────────────────────────────────────────────
 @dataclass
 class BattleState:
     user_id: int
     creature_id: int
+    tier: int
     user_creature: Dict[str, Any]
     user_current_hp: int
     user_max_hp: int
@@ -100,8 +115,9 @@ async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    await (await db_pool()).execute("UPDATE trainers SET cash = cash + 100")
-    logger.info("Distributed 100 cash to all trainers")
+    # Changed from +100 to +60 (target ~10,000 per 7 days using integer hourly payout)
+    await (await db_pool()).execute("UPDATE trainers SET cash = cash + 60")
+    logger.info("Distributed 60 cash to all trainers")
 
 @tasks.loop(hours=24)
 async def distribute_points():
@@ -115,6 +131,8 @@ async def distribute_points():
 async def regenerate_hp():
     """
     Heal every creature by 10 % of its max HP (ceil), up to its max.
+    (Note: The SQL actually uses 0.5 of base HP stat, since HP stat * 5 = max HP.
+    Adjust if you intended a different percentage.)
     """
     await (await db_pool()).execute("""
         UPDATE creatures
@@ -264,6 +282,18 @@ async def send_chunks(inter: discord.Interaction, content: str):
     for chunk in chunks[1:]:
         await inter.followup.send(chunk)
 
+async def finalize_battle(inter: discord.Interaction, st: BattleState):
+    """Handle end-of-battle rewards and logging."""
+    player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
+    win_cash, loss_cash = TIER_PAYOUTS[st.tier]
+    payout = win_cash if player_won else loss_cash
+    await (await db_pool()).execute(
+        "UPDATE trainers SET cash = cash + $1 WHERE user_id=$2",
+        payout, st.user_id
+    )
+    result_word = "won" if player_won else "lost"
+    st.logs.append(f"You {result_word} the Tier {st.tier} battle: +{payout} cash (now awarded).")
+
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
 async def setup_hook():
@@ -391,7 +421,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     opp_cre = {"name": meta["name"], "stats": opp_stats}
 
     st = BattleState(
-        inter.user.id, c_row["id"],
+        inter.user.id, c_row["id"], tier,
         user_cre, c_row["current_hp"], max_hp,
         opp_cre, opp_stats["HP"] * 5, opp_stats["HP"] * 5,
         logs=[]
@@ -422,6 +452,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
         winner = user_cre["name"] if st.opp_current_hp <= 0 else opp_cre["name"]
         st.logs.append(f"Winner: {winner}")
+        await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)
     else:
         st.logs.append("Use /continue to proceed.")
@@ -450,6 +481,7 @@ async def continue_battle(inter: discord.Interaction):
     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
         winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
         new_logs.append(f"Winner: {winner}")
+        await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)
     else:
         new_logs.append("Use /continue to proceed.")

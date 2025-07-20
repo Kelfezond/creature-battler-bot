@@ -283,16 +283,24 @@ async def send_chunks(inter: discord.Interaction, content: str):
         await inter.followup.send(chunk)
 
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
-    """Handle end-of-battle rewards and logging."""
+    """Handle end-of-battle rewards, death chance, and logging."""
     player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
     win_cash, loss_cash = TIER_PAYOUTS[st.tier]
     payout = win_cash if player_won else loss_cash
-    await (await db_pool()).execute(
+    pool = await db_pool()
+    await pool.execute(
         "UPDATE trainers SET cash = cash + $1 WHERE user_id=$2",
         payout, st.user_id
     )
     result_word = "won" if player_won else "lost"
-    st.logs.append(f"You {result_word} the Tier {st.tier} battle: +{payout} cash (now awarded).")
+    st.logs.append(f"You {result_word} the Tier {st.tier} battle: +{payout} cash awarded.")
+    # 50% death chance if player lost
+    if not player_won:
+        if random.random() < 0.5:
+            await pool.execute("DELETE FROM creatures WHERE id=$1", st.creature_id)
+            st.logs.append(f"💀 Your creature **{st.user_creature['name']}** has died and was removed from your collection.")
+        else:
+            st.logs.append(f"Your creature **{st.user_creature['name']}** survived the defeat (no death).")
 
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
@@ -450,7 +458,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     )
 
     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-        winner = user_cre["name"] if st.opp_current_hp <= 0 else opp_cre["name"]
+        winner = user_cre["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
         st.logs.append(f"Winner: {winner}")
         await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)

@@ -115,7 +115,7 @@ async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    # Passive income: 60 cash per hour (≈10,080 per 7 days; accepted slight overage)
+    # Passive income: 60 cash per hour (≈10,080 per 7 days; slight over target for simplicity)
     await (await db_pool()).execute("UPDATE trainers SET cash = cash + 60")
     logger.info("Distributed 60 cash to all trainers")
 
@@ -485,7 +485,7 @@ async def continue_battle(inter: discord.Interaction):
             break
         simulate_round(st)
 
-    # Persist HP (unless the creature will die & be deleted later; harmless to update first)
+    # Persist HP (safe even if potential deletion after finalize)
     await (await db_pool()).execute(
         "UPDATE creatures SET current_hp=$1 WHERE id=$2",
         max(st.user_current_hp, 0), st.creature_id
@@ -497,13 +497,12 @@ async def continue_battle(inter: discord.Interaction):
         st.logs.append(f"Winner: {winner}")
         await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)
-        # Re-slice AFTER finalize to include payout/death messages
         new_logs = st.logs[st.next_log_idx:]
         st.next_log_idx = len(st.logs)
         await send_chunks(inter, "\n".join(new_logs))
         return
 
-    # Not ended: just show the incremental rounds
+    # Not ended: just show incremental rounds
     st.logs.append("Use /continue to proceed.")
     new_logs = st.logs[st.next_log_idx:]
     st.next_log_idx = len(st.logs)
@@ -574,6 +573,39 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         f"{c['id']} – {creature_name.title()} trained: +{display_inc} {stat}.",
         ephemeral=True
     )
+
+# NEW: /info command
+@bot.tree.command(description="Show game overview and command list")
+async def info(inter: discord.Interaction):
+    overview = (
+        "**Game Overview**\n"
+        "Collect creatures, train their stats, and battle tiered opponents.\n"
+        "• Passive income: 60 cash/hour (≈10k per week target).\n"
+        "• Spawn eggs (cost 10,000) to acquire random creatures with rarity-based stat pools.\n"
+        "• Battles occur in rounds; continue long fights with `/continue`.\n"
+        "• Tier payouts scale from 1k/500 (T1 W/L) up to 50k/25k (T9 W/L).\n"
+        "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
+        "• Trainer points (daily +5) are spent to increase stats. HP increases also raise current HP.\n"
+        "\n"
+        "**Commands**\n"
+        "/register – Create your trainer profile (one-time).\n"
+        "/spawn – Spend 10,000 cash to hatch a new creature egg.\n"
+        "/creatures – List your creatures and their stats.\n"
+        "/battle <creature_name> <tier> – Start a battle (tiers 1–9).\n"
+        "/continue – Continue your current battle (up to 10 more rounds per use).\n"
+        "/cash – Show your current cash.\n"
+        "/cashadd <amount> – (Dev) Add test cash to your account.\n"
+        "/trainerpoints – Show your remaining trainer points.\n"
+        "/train <creature_name> <stat> <increase> – Spend trainer points to raise a stat.\n"
+        "/info – Show this help & overview.\n"
+        "\n"
+        "**Stats**: HP (health pool*5), AR (defense), PATK, SATK, SPD (initiative; may grant extra swing).\n"
+        "**Actions**: Attack, Aggressive (+10% dmg, risk more variance), Special (ignores AR), Defend (halve incoming dmg).\n"
+        "**Death**: On a loss, 50% chance (random < 0.5) your creature is deleted. Victory is the only sure protection.\n"
+        "\n"
+        "Good luck, Trainer!"
+    )
+    await inter.response.send_message(overview, ephemeral=True)
 
 # ─── Launch ──────────────────────────────────────────────────
 if __name__ == "__main__":

@@ -130,17 +130,19 @@ async def distribute_points():
 @tasks.loop(hours=12)
 async def regenerate_hp():
     """
-    Heal every creature by 10% of its max HP (ceil), up to its max.
-    (Currently: +0.5 * base HP stat, since max = HP*5.)
+    Heal every creature by 20 % of its max HP (ceil), up to its max.
+    (Now: +1.0 × base HP stat, since max = HP * 5.)
     """
     await (await db_pool()).execute("""
         UPDATE creatures
         SET current_hp = LEAST(
-            COALESCE(current_hp, (stats->>'HP')::int * 5) + CEIL((stats->>'HP')::numeric * 0.5),
-            (stats->>'HP')::int * 5
+            -- If current_hp is NULL, treat it as max HP (stats->>'HP' * 5)
+            COALESCE(current_hp, (stats->>'HP')::int * 5)
+            + CEIL((stats->>'HP')::numeric * 1.0),   -- 1.0 × base HP  = 20 % of max
+            (stats->>'HP')::int * 5                  -- clamp at max HP
         )
     """)
-    logger.info("Regenerated 10%% HP for all creatures")
+    logger.info("Regenerated 20%% HP for all creatures")
 
 # ─── Utility functions ───────────────────────────────────────
 def roll_d100() -> int: return random.randint(1, 100)

@@ -59,6 +59,8 @@ async def db_pool() -> asyncpg.Pool:
     return bot._pool
 
 # ─── Game constants ──────────────────────────────────────────
+MAX_CREATURES = 5  # <<── NEW: hard cap per player
+
 RARITY_TABLE = [
     (1, 75, "Common"), (76, 88, "Uncommon"), (89, 95, "Rare"),
     (96, 98, "Epic"), (99, 100, "Legendary"),
@@ -178,6 +180,28 @@ async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Reco
         await inter.response.send_message("Use /register first.", ephemeral=True)
         return None
     return row
+
+# NEW: creature-cap helpers
+async def get_creature_count(user_id: int) -> int:
+    """Return how many creatures the given user currently owns."""
+    return await (await db_pool()).fetchval(
+        "SELECT COUNT(*) FROM creatures WHERE owner_id=$1", user_id
+    )
+
+async def enforce_creature_cap(inter: discord.Interaction) -> bool:
+    """
+    Ensure the invoking user hasn't exceeded MAX_CREATURES.
+    Returns True if they are allowed to create/spawn another creature, False otherwise.
+    """
+    count = await get_creature_count(inter.user.id)
+    if count >= MAX_CREATURES:
+        await inter.response.send_message(
+            f"You already own the maximum of {MAX_CREATURES} creatures. "
+            "Release one before spawning a new egg.",
+            ephemeral=True
+        )
+        return False
+    return True
 
 async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
@@ -350,7 +374,13 @@ async def register(inter: discord.Interaction):
 @bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
 async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)
-    if not row or row["cash"] < 10_000:
+    if not row:
+        return
+    # Enforce cap BEFORE taking their money
+    can_spawn = await enforce_creature_cap(inter)
+    if not can_spawn:
+        return
+    if row["cash"] < 10_000:
         return await inter.response.send_message("Not enough cash.", ephemeral=True)
 
     await (await db_pool()).execute(
@@ -583,6 +613,7 @@ async def info(inter: discord.Interaction):
         "**Game Overview**\n"
         "Collect creatures, train their stats, and battle tiered opponents.\n"
         "• Passive income: 60 cash/hour (≈10k per week target).\n"
+        "• Creature cap: You can own at most **5 creatures**. Extra spawns are blocked.\n"
         "• Spawn eggs (cost 10,000) to acquire random creatures with rarity-based stat pools.\n"
         "• Battles occur in rounds; continue long fights with `/continue`.\n"
         "• Tier payouts scale from 1k/500 (T1 W/L) up to 50k/25k (T9 W/L).\n"
@@ -591,7 +622,7 @@ async def info(inter: discord.Interaction):
         "\n"
         "**Commands**\n"
         "/register – Create your trainer profile (one-time).\n"
-        "/spawn – Spend 10,000 cash to hatch a new creature egg.\n"
+        "/spawn – Spend 10,000 cash to hatch a new creature egg (blocked if you already have 5 creatures).\n"
         "/creatures – List your creatures and their stats.\n"
         "/battle <creature_name> <tier> – Start a battle (tiers 1–9).\n"
         "/continue – Continue your current battle (up to 10 more rounds per use).\n"

@@ -59,12 +59,28 @@ async def db_pool() -> asyncpg.Pool:
     return bot._pool
 
 # ─── Game constants ──────────────────────────────────────────
-MAX_CREATURES = 5  # <<── NEW: hard cap per player
+MAX_CREATURES = 5  # hard cap per player
 
+# Used for /spawn eggs (unchanged)
 RARITY_TABLE = [
     (1, 75, "Common"), (76, 88, "Uncommon"), (89, 95, "Rare"),
     (96, 98, "Epic"), (99, 100, "Legendary"),
 ]
+
+# NEW: Per-tier rarity weights for *battle opponents*
+# odds don't need to sum to 100; random.choices just needs relative weights
+TIER_RARITY_WEIGHTS: Dict[int, Tuple[List[str], List[int]]] = {
+    1: (["Common"], [100]),
+    2: (["Common"], [100]),
+    3: (["Common", "Uncommon"], [75, 25]),
+    4: (["Common", "Uncommon"], [75, 25]),
+    5: (["Common", "Uncommon", "Rare"], [50, 33, 16]),
+    6: (["Common", "Uncommon", "Rare"], [50, 33, 16]),
+    7: (["Common", "Uncommon", "Rare", "Epic"], [40, 30, 20, 10]),
+    8: (["Common", "Uncommon", "Rare", "Epic"], [40, 30, 20, 10]),
+    9: (["Common", "Uncommon", "Rare", "Epic", "Legendary"], [33, 26, 20, 13, 6]),
+}
+
 POINT_POOLS = {
     "Common": (25, 50), "Uncommon": (50, 100), "Rare": (100, 200),
     "Epic": (200, 400), "Legendary": (400, 800),
@@ -138,10 +154,9 @@ async def regenerate_hp():
     await (await db_pool()).execute("""
         UPDATE creatures
         SET current_hp = LEAST(
-            -- If current_hp is NULL, treat it as max HP (stats->>'HP' * 5)
             COALESCE(current_hp, (stats->>'HP')::int * 5)
-            + CEIL((stats->>'HP')::numeric * 1.0),   -- 1.0 × base HP  = 20 % of max
-            (stats->>'HP')::int * 5                  -- clamp at max HP
+            + CEIL((stats->>'HP')::numeric * 1.0),
+            (stats->>'HP')::int * 5
         )
     """)
     logger.info("Regenerated 20%% HP for all creatures")
@@ -150,10 +165,15 @@ async def regenerate_hp():
 def roll_d100() -> int: return random.randint(1, 100)
 
 def rarity_from_roll(r: int) -> str:
+    # Used only for egg spawns
     for low, high, name in RARITY_TABLE:
         if low <= r <= high:
             return name
     return "Common"
+
+def rarity_for_tier(tier: int) -> str:
+    rarities, weights = TIER_RARITY_WEIGHTS[tier]
+    return random.choices(rarities, weights=weights, k=1)[0]
 
 def allocate_stats(rarity: str, extra: int = 0) -> Dict[str, int]:
     pool = random.randint(*POINT_POOLS[rarity]) + extra
@@ -181,18 +201,13 @@ async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Reco
         return None
     return row
 
-# NEW: creature-cap helpers
+# Creature-cap helpers
 async def get_creature_count(user_id: int) -> int:
-    """Return how many creatures the given user currently owns."""
     return await (await db_pool()).fetchval(
         "SELECT COUNT(*) FROM creatures WHERE owner_id=$1", user_id
     )
 
 async def enforce_creature_cap(inter: discord.Interaction) -> bool:
-    """
-    Ensure the invoking user hasn't exceeded MAX_CREATURES.
-    Returns True if they are allowed to create/spawn another creature, False otherwise.
-    """
     count = await get_creature_count(inter.user.id)
     if count >= MAX_CREATURES:
         await inter.response.send_message(
@@ -458,8 +473,10 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     await inter.response.defer(thinking=True)
 
     user_cre = {"name": c_row["name"], "stats": stats}
-    roll = roll_d100()
-    rarity = rarity_from_roll(roll)
+
+    # NEW: rarity determined by tier-specific weights
+    rarity = rarity_for_tier(tier)
+
     meta = await generate_creature_meta(rarity)
     extra = random.randint(*TIER_EXTRAS[tier])
     opp_stats = allocate_stats(rarity, extra)
@@ -475,7 +492,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     st.logs += [
         f"Battle start! Tier {tier} (+{extra} pts)",
         f"{user_cre['name']} vs {opp_cre['name']}",
-        f"Opponent roll {roll} → {rarity}",
+        f"Opponent rarity (tier table) → {rarity}",
         "",
         "Your creature:",
         stat_block(user_cre["name"], st.user_current_hp, st.user_max_hp, stats),
@@ -606,7 +623,7 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         ephemeral=True
     )
 
-# NEW: /info command
+# /info command
 @bot.tree.command(description="Show game overview and command list")
 async def info(inter: discord.Interaction):
     overview = (
@@ -614,7 +631,13 @@ async def info(inter: discord.Interaction):
         "Collect creatures, train their stats, and battle tiered opponents.\n"
         "• Passive income: 60 cash/hour (≈10k per week target).\n"
         "• Creature cap: You can own at most **5 creatures**. Extra spawns are blocked.\n"
-        "• Spawn eggs (cost 10,000) to acquire random creatures with rarity-based stat pools.\n"
+        "• **Battle opponent rarity by tier**:\n"
+        "  - T1–2: Common only\n"
+        "  - T3–4: Common/Uncommon (75/25)\n"
+        "  - T5–6: Common/Uncommon/Rare (50/33/16)\n"
+        "  - T7–8: Common/Uncommon/Rare/Epic (40/30/20/10)\n"
+        "  - T9: Common/Uncommon/Rare/Epic/Legendary (33/26/20/13/6)\n"
+        "• Spawn eggs (cost 10,000) use their own rarity table.\n"
         "• Battles occur in rounds; continue long fights with `/continue`.\n"
         "• Tier payouts scale from 1k/500 (T1 W/L) up to 50k/25k (T9 W/L).\n"
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
@@ -633,8 +656,8 @@ async def info(inter: discord.Interaction):
         "/info – Show this help & overview.\n"
         "\n"
         "**Stats**: HP (health pool*5), AR (defense), PATK, SATK, SPD (initiative; may grant extra swing).\n"
-        "**Actions**: Attack, Aggressive (+10% dmg, risk more variance), Special (ignores AR), Defend (halve incoming dmg).\n"
-        "**Death**: On a loss, 50% chance (random < 0.5) your creature is deleted. Victory is the only sure protection.\n"
+        "**Actions**: Attack, Aggressive (+10% dmg), Special (ignores AR), Defend (halve incoming dmg).\n"
+        "**Death**: On a loss, 50% chance (random < 0.5) your creature is deleted.\n"
         "\n"
         "Good luck, Trainer!"
     )

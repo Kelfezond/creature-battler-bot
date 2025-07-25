@@ -61,14 +61,29 @@ async def db_pool() -> asyncpg.Pool:
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5  # hard cap per player
 
-# Used for /spawn eggs (unchanged)
+# Legacy table (still around if you want to reference it), but /spawn no longer uses it.
 RARITY_TABLE = [
     (1, 75, "Common"), (76, 88, "Uncommon"), (89, 95, "Rare"),
     (96, 98, "Epic"), (99, 100, "Legendary"),
 ]
 
-# NEW: Per-tier rarity weights for *battle opponents*
-# odds don't need to sum to 100; random.choices just needs relative weights
+# NEW: /spawn rarity distribution with Legendary at **0.5%**
+# We'll keep the rest roughly the same and push the freed 1.5% into Epic.
+# Common 75%, Uncommon 13%, Rare 7%, Epic 4.5%, Legendary 0.5%  → totals 100%.
+def spawn_rarity() -> str:
+    r = random.random() * 100.0
+    if r < 75.0:
+        return "Common"
+    elif r < 88.0:
+        return "Uncommon"
+    elif r < 95.0:
+        return "Rare"
+    elif r < 99.5:
+        return "Epic"
+    else:
+        return "Legendary"
+
+# Per-tier rarity weights for *battle opponents*
 TIER_RARITY_WEIGHTS: Dict[int, Tuple[List[str], List[int]]] = {
     1: (["Common"], [100]),
     2: (["Common"], [100]),
@@ -165,7 +180,7 @@ async def regenerate_hp():
 def roll_d100() -> int: return random.randint(1, 100)
 
 def rarity_from_roll(r: int) -> str:
-    # Used only for egg spawns
+    # kept for backwards compatibility, but not used in /spawn anymore
     for low, high, name in RARITY_TABLE:
         if low <= r <= high:
             return name
@@ -251,7 +266,12 @@ def simulate_round(st: BattleState):
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
 
-    user_act, opp_act = choose_action(), choose_action()
+    # NEW: if both pick Defend, silently re-roll until at least one doesn't
+    while True:
+        user_act, opp_act = choose_action(), choose_action()
+        if not (user_act == "Defend" and opp_act == "Defend"):
+            break
+
     st.logs.append(
         f"{st.user_creature['name']} chooses **{user_act}** | "
         f"{st.opp_creature['name']} chooses **{opp_act}**"
@@ -403,8 +423,7 @@ async def spawn(inter: discord.Interaction):
     )
     await inter.response.defer(thinking=True)
 
-    roll = roll_d100()
-    rarity = rarity_from_roll(roll)
+    rarity = spawn_rarity()  # uses new 0.5% legendary table
     meta = await generate_creature_meta(rarity)
     stats = allocate_stats(rarity)
     max_hp = stats["HP"] * 5
@@ -420,7 +439,7 @@ async def spawn(inter: discord.Interaction):
     )
     for s, v in stats.items():
         embed.add_field(name=s, value=str(v*5 if s == "HP" else v))
-    embed.set_footer(text=f"d100 roll: {roll}")
+    embed.set_footer(text="Legendary spawn chance: 0.5%")
     await inter.followup.send(embed=embed)
 
 @bot.tree.command(description="List your creatures")
@@ -474,7 +493,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
 
     user_cre = {"name": c_row["name"], "stats": stats}
 
-    # NEW: rarity determined by tier-specific weights
+    # Use tier-based rarity weights
     rarity = rarity_for_tier(tier)
 
     meta = await generate_creature_meta(rarity)
@@ -631,13 +650,14 @@ async def info(inter: discord.Interaction):
         "Collect creatures, train their stats, and battle tiered opponents.\n"
         "• Passive income: 60 cash/hour (≈10k per week target).\n"
         "• Creature cap: You can own at most **5 creatures**. Extra spawns are blocked.\n"
+        "• **Spawn eggs Legendary chance: 0.5%** (others adjusted accordingly).\n"
         "• **Battle opponent rarity by tier**:\n"
         "  - T1–2: Common only\n"
         "  - T3–4: Common/Uncommon (75/25)\n"
         "  - T5–6: Common/Uncommon/Rare (50/33/16)\n"
         "  - T7–8: Common/Uncommon/Rare/Epic (40/30/20/10)\n"
         "  - T9: Common/Uncommon/Rare/Epic/Legendary (33/26/20/13/6)\n"
-        "• Spawn eggs (cost 10,000) use their own rarity table.\n"
+        "• If both creatures pick **Defend** in a round, it is silently re‑rolled until at least one doesn't defend.\n"
         "• Battles occur in rounds; continue long fights with `/continue`.\n"
         "• Tier payouts scale from 1k/500 (T1 W/L) up to 50k/25k (T9 W/L).\n"
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
@@ -656,7 +676,7 @@ async def info(inter: discord.Interaction):
         "/info – Show this help & overview.\n"
         "\n"
         "**Stats**: HP (health pool*5), AR (defense), PATK, SATK, SPD (initiative; may grant extra swing).\n"
-        "**Actions**: Attack, Aggressive (+10% dmg), Special (ignores AR), Defend (halve incoming dmg).\n"
+        "**Actions**: Attack, Aggressive (+10% dmg), Special (ignores AR), Defend (halve incoming dmg; double-defend rerolled).\n"
         "**Death**: On a loss, 50% chance (random < 0.5) your creature is deleted.\n"
         "\n"
         "Good luck, Trainer!"

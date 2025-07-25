@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS trainers (
   user_id BIGINT PRIMARY KEY,
   joined_at TIMESTAMPTZ DEFAULT now(),
   cash BIGINT DEFAULT 0,
-  trainer_points BIGINT DEFAULT 0
+  trainer_points BIGINT DEFAULT 0,
+  facility_level INT DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS creatures (
@@ -51,6 +52,9 @@ CREATE TABLE IF NOT EXISTS creatures (
 
 ALTER TABLE creatures
   ADD COLUMN IF NOT EXISTS current_hp BIGINT;
+
+ALTER TABLE trainers
+  ADD COLUMN IF NOT EXISTS facility_level INT DEFAULT 1;
 """
 
 async def db_pool() -> asyncpg.Pool:
@@ -61,15 +65,14 @@ async def db_pool() -> asyncpg.Pool:
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5  # hard cap per player
 
-# Legacy table (still around if you want to reference it), but /spawn no longer uses it.
+# Used for /spawn eggs – we overrode this with spawn_rarity() below to make Legendary 0.5%
 RARITY_TABLE = [
     (1, 75, "Common"), (76, 88, "Uncommon"), (89, 95, "Rare"),
     (96, 98, "Epic"), (99, 100, "Legendary"),
 ]
 
 # NEW: /spawn rarity distribution with Legendary at **0.5%**
-# We'll keep the rest roughly the same and push the freed 1.5% into Epic.
-# Common 75%, Uncommon 13%, Rare 7%, Epic 4.5%, Legendary 0.5%  → totals 100%.
+# Common 75%, Uncommon 13%, Rare 7%, Epic 4.5%, Legendary 0.5%
 def spawn_rarity() -> str:
     r = random.random() * 100.0
     if r < 75.0:
@@ -95,6 +98,55 @@ TIER_RARITY_WEIGHTS: Dict[int, Tuple[List[str], List[int]]] = {
     8: (["Common", "Uncommon", "Rare", "Epic"], [40, 30, 20, 10]),
     9: (["Common", "Uncommon", "Rare", "Epic", "Legendary"], [33, 26, 20, 13, 6]),
 }
+
+# Training Facility progression
+MAX_FACILITY_LEVEL = 6
+FACILITY_LEVELS: Dict[int, Dict[str, Any]] = {
+    1: {
+        "name": "Basic Training Yard",
+        "bonus": 0,
+        "cost": None,
+        "desc": "A patch of land with scattered targets, sand pits, and makeshift climbing posts. Rough, simple, and functional."
+    },
+    2: {
+        "name": "Reinforced Combat Pit",
+        "bonus": 1,
+        "cost": 18_000,
+        "desc": "Expanded grounds with adjustable barriers, weighted obstacles, sky hoops, and water trenches. Built to be tough and versatile."
+    },
+    3: {
+        "name": "Kinetic Optimization Center",
+        "bonus": 2,
+        "cost": 55_000,
+        "desc": "Modular platforms with reactive surfaces, telescoping tracks, and pressure pads. The environment adapts to suit each training style."
+    },
+    4: {
+        "name": "Neuro-Combat Simulator",
+        "bonus": 3,
+        "cost": 130_000,
+        "desc": "Holographic arenas simulate dynamic opponents and shifting terrain. Training is personalized and reactive in real time."
+    },
+    5: {
+        "name": "BioSync Reactor Chamber",
+        "bonus": 4,
+        "cost": 275_000,
+        "desc": "A synchronized chamber tuned to physical and mental rhythms. Terrain and resistance fields shift unpredictably to enhance reflex development."
+    },
+    6: {
+        "name": "SynapseForge Hyperlab",
+        "bonus": 5,
+        "cost": 500_000,
+        "desc": "A high-tech fusion of neural feedback, virtual training microcosms, and time-compressed simulations. Mastery is forged at the speed of thought."
+    },
+}
+
+def facility_bonus(level: int) -> int:
+    level = max(1, min(MAX_FACILITY_LEVEL, level))
+    return FACILITY_LEVELS[level]["bonus"]
+
+def daily_trainer_points_for(level: int) -> int:
+    # Base 5 + facility bonus (max +5) = max 10/day
+    return 5 + facility_bonus(level)
 
 POINT_POOLS = {
     "Common": (25, 50), "Uncommon": (50, 100), "Rare": (100, 200),
@@ -148,7 +200,7 @@ async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    # Passive income: 60 cash per hour (≈10,080 per 7 days; slight over target for simplicity)
+    # Passive income: 60 cash per hour
     await (await db_pool()).execute("UPDATE trainers SET cash = cash + 60")
     logger.info("Distributed 60 cash to all trainers")
 
@@ -157,8 +209,13 @@ async def distribute_points():
     if distribute_points.current_loop == 0:
         logger.info("Skipping first daily trainer‑point distribution after restart")
         return
-    await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + 5")
-    logger.info("Distributed 5 trainer points to all trainers")
+    # Base 5 + facility bonus (max 5) = up to 10/day.
+    await (await db_pool()).execute("""
+        UPDATE trainers
+        SET trainer_points = trainer_points
+          + (5 + LEAST(GREATEST(facility_level - 1, 0), 5))
+    """)
+    logger.info("Distributed daily trainer points with facility bonuses")
 
 @tasks.loop(hours=12)
 async def regenerate_hp():
@@ -180,7 +237,7 @@ async def regenerate_hp():
 def roll_d100() -> int: return random.randint(1, 100)
 
 def rarity_from_roll(r: int) -> str:
-    # kept for backwards compatibility, but not used in /spawn anymore
+    # kept for backwards compatibility, but /spawn uses spawn_rarity()
     for low, high, name in RARITY_TABLE:
         if low <= r <= high:
             return name
@@ -209,7 +266,7 @@ def choose_action() -> str:
 
 async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Record]:
     row = await (await db_pool()).fetchrow(
-        "SELECT cash, trainer_points FROM trainers WHERE user_id=$1", inter.user.id
+        "SELECT cash, trainer_points, facility_level FROM trainers WHERE user_id=$1", inter.user.id
     )
     if not row:
         await inter.response.send_message("Use /register first.", ephemeral=True)
@@ -266,7 +323,7 @@ def simulate_round(st: BattleState):
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
 
-    # NEW: if both pick Defend, silently re-roll until at least one doesn't
+    # If both pick Defend, silently re-roll until at least one doesn't.
     while True:
         user_act, opp_act = choose_action(), choose_action()
         if not (user_act == "Defend" and opp_act == "Defend"):
@@ -398,8 +455,8 @@ async def register(inter: discord.Interaction):
     if await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", inter.user.id):
         return await inter.response.send_message("Already registered!", ephemeral=True)
     await pool.execute(
-        "INSERT INTO trainers(user_id, cash, trainer_points) VALUES($1,$2,$3)",
-        inter.user.id, 20000, 5
+        "INSERT INTO trainers(user_id, cash, trainer_points, facility_level) VALUES($1,$2,$3,$4)",
+        inter.user.id, 20000, 5, 1
     )
     await inter.response.send_message(
         "Profile created! You received 20 000 cash and 5 trainer points.",
@@ -423,7 +480,7 @@ async def spawn(inter: discord.Interaction):
     )
     await inter.response.defer(thinking=True)
 
-    rarity = spawn_rarity()  # uses new 0.5% legendary table
+    rarity = spawn_rarity()  # 0.5% legendary table
     meta = await generate_creature_meta(rarity)
     stats = allocate_stats(rarity)
     max_hp = stats["HP"] * 5
@@ -493,9 +550,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
 
     user_cre = {"name": c_row["name"], "stats": stats}
 
-    # Use tier-based rarity weights
     rarity = rarity_for_tier(tier)
-
     meta = await generate_creature_meta(rarity)
     extra = random.randint(*TIER_EXTRAS[tier])
     opp_stats = allocate_stats(rarity, extra)
@@ -597,7 +652,15 @@ async def cashadd(inter: discord.Interaction, amount: int):
 async def trainerpoints(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if row:
-        await inter.response.send_message(f"You have {row['trainer_points']} points.", ephemeral=True)
+        level = row["facility_level"]
+        bonus = facility_bonus(level)
+        daily = 5 + bonus
+        await inter.response.send_message(
+            f"You have {row['trainer_points']} points. "
+            f"Facility Level {level} ({FACILITY_LEVELS[level]['name']}) gives +{bonus} extra per day "
+            f"(total {daily}/day).",
+            ephemeral=True
+        )
 
 @bot.tree.command(description="Train a creature stat")
 async def train(inter: discord.Interaction, creature_name: str, stat: str, increase: int):
@@ -642,13 +705,76 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         ephemeral=True
     )
 
+# ─── Training Facility Upgrade Commands ──────────────────────
+@bot.tree.command(description="Show and confirm upgrading your training facility")
+async def upgrade(inter: discord.Interaction):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    level = row["facility_level"]
+    current = FACILITY_LEVELS[level]
+    msg = [
+        f"**Your Training Facility**",
+        f"Level {level}: **{current['name']}**",
+        f"Bonus trainer points/day: +{current['bonus']} (total daily = {daily_trainer_points_for(level)})",
+        f"Description: {current['desc']}",
+        ""
+    ]
+    if level >= MAX_FACILITY_LEVEL:
+        msg.append("You're already at the **maximum level**. No further upgrades available.")
+        return await inter.response.send_message("\n".join(msg), ephemeral=True)
+
+    next_level = level + 1
+    nxt = FACILITY_LEVELS[next_level]
+    msg += [
+        f"**Next Upgrade → Level {next_level}: {nxt['name']}**",
+        f"Cost: {nxt['cost']} cash",
+        f"New bonus: +{nxt['bonus']} (daily total = {daily_trainer_points_for(next_level)})",
+        f"Description: {nxt['desc']}",
+        "",
+        "Type `/upgradeyes` to confirm the upgrade if you can afford it."
+    ]
+    await inter.response.send_message("\n".join(msg), ephemeral=True)
+
+@bot.tree.command(description="Confirm upgrading your training facility (costs cash)")
+async def upgradeyes(inter: discord.Interaction):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    level = row["facility_level"]
+    if level >= MAX_FACILITY_LEVEL:
+        return await inter.response.send_message(
+            "You're already at the maximum facility level.", ephemeral=True
+        )
+
+    next_level = level + 1
+    cost = FACILITY_LEVELS[next_level]["cost"]
+    if row["cash"] < cost:
+        return await inter.response.send_message(
+            f"Not enough cash. You need {cost} but only have {row['cash']}.",
+            ephemeral=True
+        )
+
+    pool = await db_pool()
+    await pool.execute(
+        "UPDATE trainers SET cash = cash - $1, facility_level = facility_level + 1 WHERE user_id=$2",
+        cost, inter.user.id
+    )
+    new_bonus = FACILITY_LEVELS[next_level]["bonus"]
+    await inter.response.send_message(
+        f"✅ Upgraded to **Level {next_level} – {FACILITY_LEVELS[next_level]['name']}**!\n"
+        f"Your facility now grants **+{new_bonus} trainer points/day** "
+        f"(total {daily_trainer_points_for(next_level)}/day).",
+        ephemeral=True
+    )
+
 # /info command
 @bot.tree.command(description="Show game overview and command list")
 async def info(inter: discord.Interaction):
     overview = (
         "**Game Overview**\n"
         "Collect creatures, train their stats, and battle tiered opponents.\n"
-        "• Passive income: 60 cash/hour (≈10k per week target).\n"
+        "• Passive income: 60 cash/hour.\n"
         "• Creature cap: You can own at most **5 creatures**. Extra spawns are blocked.\n"
         "• **Spawn eggs Legendary chance: 0.5%** (others adjusted accordingly).\n"
         "• **Battle opponent rarity by tier**:\n"
@@ -658,10 +784,12 @@ async def info(inter: discord.Interaction):
         "  - T7–8: Common/Uncommon/Rare/Epic (40/30/20/10)\n"
         "  - T9: Common/Uncommon/Rare/Epic/Legendary (33/26/20/13/6)\n"
         "• If both creatures pick **Defend** in a round, it is silently re‑rolled until at least one doesn't defend.\n"
+        "• **Training Facilities**: Start at Level 1 (Basic Training Yard). Each level adds +1 trainer point/day up to +5 (Level 6). Base income is 5/day → max 10/day.\n"
+        "  Use `/upgrade` to view & `/upgradeyes` to confirm if you can afford it.\n"
         "• Battles occur in rounds; continue long fights with `/continue`.\n"
         "• Tier payouts scale from 1k/500 (T1 W/L) up to 50k/25k (T9 W/L).\n"
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
-        "• Trainer points (daily +5) are spent to increase stats. HP increases also raise current HP.\n"
+        "• Trainer points (daily +5 plus facility bonus) are spent to increase stats. HP increases also raise current HP.\n"
         "\n"
         "**Commands**\n"
         "/register – Create your trainer profile (one-time).\n"
@@ -671,8 +799,10 @@ async def info(inter: discord.Interaction):
         "/continue – Continue your current battle (up to 10 more rounds per use).\n"
         "/cash – Show your current cash.\n"
         "/cashadd <amount> – (Dev) Add test cash to your account.\n"
-        "/trainerpoints – Show your remaining trainer points.\n"
+        "/trainerpoints – Show your remaining trainer points and facility bonus.\n"
         "/train <creature_name> <stat> <increase> – Spend trainer points to raise a stat.\n"
+        "/upgrade – View your facility and the cost to upgrade.\n"
+        "/upgradeyes – Confirm the upgrade and pay the cost.\n"
         "/info – Show this help & overview.\n"
         "\n"
         "**Stats**: HP (health pool*5), AR (defense), PATK, SATK, SPD (initiative; may grant extra swing).\n"

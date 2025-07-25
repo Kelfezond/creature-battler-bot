@@ -65,13 +65,7 @@ async def db_pool() -> asyncpg.Pool:
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5  # hard cap per player
 
-# Used for /spawn eggs – we overrode this with spawn_rarity() below to make Legendary 0.5%
-RARITY_TABLE = [
-    (1, 75, "Common"), (76, 88, "Uncommon"), (89, 95, "Rare"),
-    (96, 98, "Epic"), (99, 100, "Legendary"),
-]
-
-# NEW: /spawn rarity distribution with Legendary at **0.5%**
+# /spawn rarity distribution with Legendary at **0.5%**
 # Common 75%, Uncommon 13%, Rare 7%, Epic 4.5%, Legendary 0.5%
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -145,8 +139,7 @@ def facility_bonus(level: int) -> int:
     return FACILITY_LEVELS[level]["bonus"]
 
 def daily_trainer_points_for(level: int) -> int:
-    # Base 5 + facility bonus (max +5) = max 10/day
-    return 5 + facility_bonus(level)
+    return 5 + facility_bonus(level)  # base 5 + facility bonus
 
 POINT_POOLS = {
     "Common": (25, 50), "Uncommon": (50, 100), "Rare": (100, 200),
@@ -162,8 +155,7 @@ PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
 ACTION_WEIGHTS = [36, 18, 16, 30]   # sum = 100
 
-# ─── Tier Payouts (Approach A: independently rounded to nearest 10) ───────────
-# Structure: tier: (win_cash, loss_cash)
+# ─── Tier Payouts ────────────────────────────────────────────
 TIER_PAYOUTS: Dict[int, Tuple[int, int]] = {
     1: (1000, 500),
     2: (7130, 3560),
@@ -200,7 +192,6 @@ async def distribute_cash():
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
-    # Passive income: 60 cash per hour
     await (await db_pool()).execute("UPDATE trainers SET cash = cash + 60")
     logger.info("Distributed 60 cash to all trainers")
 
@@ -209,7 +200,7 @@ async def distribute_points():
     if distribute_points.current_loop == 0:
         logger.info("Skipping first daily trainer‑point distribution after restart")
         return
-    # Base 5 + facility bonus (max 5) = up to 10/day.
+    # base 5 + (facility_level - 1) but capped to +5
     await (await db_pool()).execute("""
         UPDATE trainers
         SET trainer_points = trainer_points
@@ -219,10 +210,6 @@ async def distribute_points():
 
 @tasks.loop(hours=12)
 async def regenerate_hp():
-    """
-    Heal every creature by 20 % of its max HP (ceil), up to its max.
-    (Now: +1.0 × base HP stat, since max = HP * 5.)
-    """
     await (await db_pool()).execute("""
         UPDATE creatures
         SET current_hp = LEAST(
@@ -235,13 +222,6 @@ async def regenerate_hp():
 
 # ─── Utility functions ───────────────────────────────────────
 def roll_d100() -> int: return random.randint(1, 100)
-
-def rarity_from_roll(r: int) -> str:
-    # kept for backwards compatibility, but /spawn uses spawn_rarity()
-    for low, high, name in RARITY_TABLE:
-        if low <= r <= high:
-            return name
-    return "Common"
 
 def rarity_for_tier(tier: int) -> str:
     rarities, weights = TIER_RARITY_WEIGHTS[tier]
@@ -319,6 +299,16 @@ Avoid words: {', '.join(used_words)}
             logger.error("OpenAI error: %s", e)
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
+# NEW: generic chunked sender that supports ephemeral
+async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
+    chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
+    if not inter.response.is_done():
+        await inter.response.send_message(chunks[0], ephemeral=ephemeral)
+    else:
+        await inter.followup.send(chunks[0], ephemeral=ephemeral)
+    for chunk in chunks[1:]:
+        await inter.followup.send(chunk, ephemeral=ephemeral)
+
 def simulate_round(st: BattleState):
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
@@ -392,15 +382,7 @@ def simulate_round(st: BattleState):
     )
     st.logs.append("")
 
-async def send_chunks(inter: discord.Interaction, content: str):
-    chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
-    sender = inter.followup.send if inter.response.is_done() else inter.response.send_message
-    await sender(chunks[0])
-    for chunk in chunks[1:]:
-        await inter.followup.send(chunk)
-
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
-    """Handle end-of-battle rewards, death chance, and logging."""
     player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
     win_cash, loss_cash = TIER_PAYOUTS[st.tier]
     payout = win_cash if player_won else loss_cash
@@ -411,7 +393,6 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     )
     result_word = "won" if player_won else "lost"
     st.logs.append(f"You {result_word} the Tier {st.tier} battle: +{payout} cash awarded.")
-    # 50% death chance if player lost
     if not player_won:
         death_roll = random.random()
         pct = int(death_roll * 100)
@@ -468,7 +449,6 @@ async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if not row:
         return
-    # Enforce cap BEFORE taking their money
     can_spawn = await enforce_creature_cap(inter)
     if not can_spawn:
         return
@@ -480,7 +460,7 @@ async def spawn(inter: discord.Interaction):
     )
     await inter.response.defer(thinking=True)
 
-    rarity = spawn_rarity()  # 0.5% legendary table
+    rarity = spawn_rarity()
     meta = await generate_creature_meta(rarity)
     stats = allocate_stats(rarity)
     max_hp = stats["HP"] * 5
@@ -602,13 +582,11 @@ async def continue_battle(inter: discord.Interaction):
         return await inter.response.send_message("No active battle.", ephemeral=True)
 
     await inter.response.defer(thinking=True)
-    # Simulate up to 10 more rounds or until someone faints
     for _ in range(10):
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
             break
         simulate_round(st)
 
-    # Persist HP (safe even if potential deletion after finalize)
     await (await db_pool()).execute(
         "UPDATE creatures SET current_hp=$1 WHERE id=$2",
         max(st.user_current_hp, 0), st.creature_id
@@ -625,7 +603,6 @@ async def continue_battle(inter: discord.Interaction):
         await send_chunks(inter, "\n".join(new_logs))
         return
 
-    # Not ended: just show incremental rounds
     st.logs.append("Use /continue to proceed.")
     new_logs = st.logs[st.next_log_idx:]
     st.next_log_idx = len(st.logs)
@@ -722,7 +699,7 @@ async def upgrade(inter: discord.Interaction):
     ]
     if level >= MAX_FACILITY_LEVEL:
         msg.append("You're already at the **maximum level**. No further upgrades available.")
-        return await inter.response.send_message("\n".join(msg), ephemeral=True)
+        return await send_chunks(inter, "\n".join(msg), ephemeral=True)
 
     next_level = level + 1
     nxt = FACILITY_LEVELS[next_level]
@@ -734,7 +711,7 @@ async def upgrade(inter: discord.Interaction):
         "",
         "Type `/upgradeyes` to confirm the upgrade if you can afford it."
     ]
-    await inter.response.send_message("\n".join(msg), ephemeral=True)
+    await send_chunks(inter, "\n".join(msg), ephemeral=True)
 
 @bot.tree.command(description="Confirm upgrading your training facility (costs cash)")
 async def upgradeyes(inter: discord.Interaction):
@@ -768,7 +745,7 @@ async def upgradeyes(inter: discord.Interaction):
         ephemeral=True
     )
 
-# /info command
+# /info command (now chunked)
 @bot.tree.command(description="Show game overview and command list")
 async def info(inter: discord.Interaction):
     overview = (
@@ -811,7 +788,7 @@ async def info(inter: discord.Interaction):
         "\n"
         "Good luck, Trainer!"
     )
-    await inter.response.send_message(overview, ephemeral=True)
+    await send_chunks(inter, overview, ephemeral=True)
 
 # ─── Launch ──────────────────────────────────────────────────
 if __name__ == "__main__":

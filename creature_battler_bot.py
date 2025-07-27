@@ -17,6 +17,23 @@ DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# NEW: Admin allow-list for privileged commands (e.g., /cashadd)
+def _parse_admin_ids(raw: Optional[str]) -> set[int]:
+    ids: set[int] = set()
+    if not raw:
+        return ids
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning("Ignoring non-integer ADMIN_USER_IDS entry: %r", part)
+    return ids
+
+ADMIN_USER_IDS: set[int] = _parse_admin_ids(os.getenv("ADMIN_USER_IDS"))
+
 for env_name, env_val in {
     "DISCORD_TOKEN": TOKEN,
     "DATABASE_URL": DB_URL,
@@ -24,6 +41,11 @@ for env_name, env_val in {
 }.items():
     if not env_val:
         raise RuntimeError(f"Missing environment variable: {env_name}")
+
+if ADMIN_USER_IDS:
+    logger.info("Admin allow-list loaded for privileged commands: %s", ", ".join(map(str, ADMIN_USER_IDS)))
+else:
+    logger.warning("ADMIN_USER_IDS is not set; privileged commands will be denied for all users.")
 
 # ─── Discord client ──────────────────────────────────────────
 intents = discord.Intents.default()
@@ -395,7 +417,6 @@ def simulate_round(st: BattleState):
                 "Special": "unleashes a special attack on"
             }[act]
             note = " (defended)" if dfn_act == "Defend" else ""
-            # Show rolls for non-Special (Special ignores AR but still rolls, we keep the rule consistent with prior UX)
             st.logs.append(
                 f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg"
                 f"{' (rolls '+str(rolls)+')' if act!='Special' else ''}{note}"
@@ -646,6 +667,11 @@ async def cash(inter: discord.Interaction):
 
 @bot.tree.command(description="Add cash (dev utility)")
 async def cashadd(inter: discord.Interaction, amount: int):
+    # NEW: Admin gate
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message(
+            "Not authorized to use this command.", ephemeral=True
+        )
     if amount <= 0:
         return await inter.response.send_message("Positive amounts only.", ephemeral=True)
     if not await ensure_registered(inter):
@@ -813,7 +839,7 @@ async def info(inter: discord.Interaction):
         "/battle <creature_name> <tier> – Start a battle (tiers 1–9).\n"
         "/continue – Continue your current battle (up to 10 more rounds per use).\n"
         "/cash – Show your current cash.\n"
-        "/cashadd <amount> – (Dev) Add test cash to your account.\n"
+        "/cashadd <amount> – (Admin) Add test cash to your account.\n"
         "/trainerpoints – Show your remaining trainer points and facility bonus.\n"
         "/train <creature_name> <stat> <increase> – Spend trainer points to raise a stat.\n"
         "/upgrade – View your facility and the cost to upgrade.\n"

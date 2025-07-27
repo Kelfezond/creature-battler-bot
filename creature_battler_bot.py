@@ -77,6 +77,14 @@ ALTER TABLE creatures
 
 ALTER TABLE trainers
   ADD COLUMN IF NOT EXISTS facility_level INT DEFAULT 1;
+
+-- NEW: per-creature per-day battle cap tracking (resets by Europe/London day)
+CREATE TABLE IF NOT EXISTS battle_caps (
+  creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
+  day DATE NOT NULL,
+  count INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (creature_id, day)
+);
 """
 
 async def db_pool() -> asyncpg.Pool:
@@ -332,6 +340,37 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
     for chunk in chunks[1:]:
         await inter.followup.send(chunk, ephemeral=ephemeral)
 
+# NEW: per-creature daily battle cap helper (Europe/London day)
+async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
+    """
+    Returns (allowed, new_or_existing_count).
+    Atomically checks today's count for the creature, increments if < 2.
+    Day resets at midnight Europe/London.
+    """
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+            row = await conn.fetchrow(
+                "SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE",
+                creature_id, day
+            )
+            if not row:
+                await conn.execute(
+                    "INSERT INTO battle_caps(creature_id, day, count) VALUES($1,$2,1)",
+                    creature_id, day
+                )
+                return True, 1
+            current = row["count"]
+            if current >= 2:
+                return False, current
+            new_count = current + 1
+            await conn.execute(
+                "UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2",
+                creature_id, day, new_count
+            )
+            return True, new_count
+
 def simulate_round(st: BattleState):
     # Start of round
     st.rounds += 1
@@ -576,6 +615,15 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             f"{c_row['name']} has fainted and needs healing.", ephemeral=True
         )
 
+    # NEW: battle cap check (+increment on success)
+    allowed, count = await _can_start_battle_and_increment(c_row["id"])
+    if not allowed:
+        remaining = 0
+        return await inter.response.send_message(
+            f"Daily battle cap reached for **{c_row['name']}**: {count}/2 used. "
+            "Try again after midnight Europe/London.", ephemeral=True
+        )
+
     await inter.response.defer(thinking=True)
 
     user_cre = {"name": c_row["name"], "stats": stats}
@@ -594,7 +642,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     )
     active_battles[inter.user.id] = st
     st.logs += [
-        f"Battle start! Tier {tier} (+{extra} pts)",
+        f"Battle start! Tier {tier} (+{extra} pts) — Daily battle use for {user_cre['name']}: {count}/2",
         f"{user_cre['name']} vs {opp_cre['name']}",
         f"Opponent rarity (tier table) → {rarity}",
         "",
@@ -603,7 +651,9 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         "Opponent:",
         stat_block(opp_cre["name"], st.opp_max_hp, st.opp_max_hp, opp_stats),
         "",
-        "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds."
+        "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
+        "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
+        "Daily cap: Each creature can start at most 2 battles per Europe/London day."
     ]
 
     for _ in range(10):
@@ -667,7 +717,7 @@ async def cash(inter: discord.Interaction):
 
 @bot.tree.command(description="Add cash (dev utility)")
 async def cashadd(inter: discord.Interaction, amount: int):
-    # NEW: Admin gate
+    # Admin gate
     if inter.user.id not in ADMIN_USER_IDS:
         return await inter.response.send_message(
             "Not authorized to use this command.", ephemeral=True
@@ -823,6 +873,7 @@ async def info(inter: discord.Interaction):
         "• Tier payouts scale from 1k/500 (T1 W/L) up to 50k/25k (T9 W/L).\n"
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
         "• Trainer points (daily +5 plus facility bonus) are spent to increase stats. HP increases also raise current HP.\n"
+        "• **Daily Battle Cap**: Each creature can start at most **2 battles per day** (resets at midnight Europe/London).\n"
         "\n"
         "**Combat Rules (current)**\n"
         "• **Action weights**: Attack 38%, Aggressive 22%, Special 22%, Defend 18%.\n"

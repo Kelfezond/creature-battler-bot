@@ -153,7 +153,8 @@ TIER_EXTRAS = {
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 
 ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
-ACTION_WEIGHTS = [36, 18, 16, 30]   # sum = 100
+# UPDATED: Action weights (Attack, Aggressive, Special, Defend) → 38, 22, 22, 18
+ACTION_WEIGHTS = [38, 22, 22, 18]   # sum = 100
 
 # ─── Tier Payouts ────────────────────────────────────────────
 TIER_PAYOUTS: Dict[int, Tuple[int, int]] = {
@@ -182,7 +183,7 @@ class BattleState:
     opp_max_hp: int
     logs: List[str]
     next_log_idx: int = 0
-    rounds: int = 0
+    rounds: int = 0  # rounds completed so far
 
 active_battles: Dict[int, BattleState] = {}
 
@@ -310,8 +311,14 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
         await inter.followup.send(chunk, ephemeral=ephemeral)
 
 def simulate_round(st: BattleState):
+    # Start of round
     st.rounds += 1
     st.logs.append(f"Round {st.rounds}")
+
+    # Sudden death multiplier: +10% damage every 10 rounds (10–19 → x1.1, 20–29 → x1.21, ...)
+    sudden_death_mult = 1.1 ** (st.rounds // 10)
+    if st.rounds % 10 == 0:
+        st.logs.append(f"⚡ Sudden Death intensifies! Global damage ×{sudden_death_mult:.2f}")
 
     # If both pick Defend, silently re-roll until at least one doesn't.
     while True:
@@ -342,20 +349,41 @@ def simulate_round(st: BattleState):
             st.logs.append(f"{atk['name']} is defending.")
             continue
 
-        swings = 2 if atk["stats"]["SPD"] >= 2 * dfn["stats"]["SPD"] else 1
+        # UPDATED: Extra swing when SPD ≥ 1.5× defender SPD
+        swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
+
         for _ in range(swings):
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
                 break
 
+            # Attack strength is the better of PATK/SATK
             S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
-            AR_val = 0 if act == "Special" else dfn["stats"]["AR"]
+
+            # UPDATED: Soften AR's effect by halving it (Special continues to ignore AR)
+            if act == "Special":
+                AR_val = 0
+            else:
+                AR_val = dfn["stats"]["AR"] // 2  # softened AR
+
+            # Roll ceil(S/10) d6 dice
             rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
-            dmg = max(1, math.ceil(sum(rolls) ** 2 / (sum(rolls) + AR_val)))
+            s = sum(rolls)
+            # Base damage from the current model
+            dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
+
+            # UPDATED: Aggressive buff to +25% (no AR penetration)
             if act == "Aggressive":
-                dmg = math.ceil(dmg * 1.1)
+                dmg = math.ceil(dmg * 1.25)
+
+            # Defend halves damage taken this round
             if dfn_act == "Defend":
                 dmg = max(1, math.ceil(dmg * 0.5))
 
+            # UPDATED: Sudden death global damage multiplier
+            if sudden_death_mult > 1.0:
+                dmg = max(1, math.ceil(dmg * sudden_death_mult))
+
+            # Apply damage
             if side == "user":
                 st.opp_current_hp -= dmg
             else:
@@ -367,6 +395,7 @@ def simulate_round(st: BattleState):
                 "Special": "unleashes a special attack on"
             }[act]
             note = " (defended)" if dfn_act == "Defend" else ""
+            # Show rolls for non-Special (Special ignores AR but still rolls, we keep the rule consistent with prior UX)
             st.logs.append(
                 f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg"
                 f"{' (rolls '+str(rolls)+')' if act!='Special' else ''}{note}"
@@ -552,7 +581,8 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         stat_block(user_cre["name"], st.user_current_hp, st.user_max_hp, stats),
         "Opponent:",
         stat_block(opp_cre["name"], st.opp_max_hp, st.opp_max_hp, opp_stats),
-        ""
+        "",
+        "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds."
     ]
 
     for _ in range(10):
@@ -768,6 +798,14 @@ async def info(inter: discord.Interaction):
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
         "• Trainer points (daily +5 plus facility bonus) are spent to increase stats. HP increases also raise current HP.\n"
         "\n"
+        "**Combat Rules (current)**\n"
+        "• **Action weights**: Attack 38%, Aggressive 22%, Special 22%, Defend 18%.\n"
+        "• **Aggressive**: +25% damage.\n"
+        "• **Special**: Ignores AR.\n"
+        "• **AR softened**: AR counts at half value against normal/Aggressive attacks.\n"
+        "• **Extra swing**: If attacker SPD ≥ 1.5× defender SPD, attacker swings twice.\n"
+        "• **Sudden Death**: Every 10 rounds, all damage increases by +10% globally (stacks: 10→+10%, 20→+21%, etc.).\n"
+        "\n"
         "**Commands**\n"
         "/register – Create your trainer profile (one-time).\n"
         "/spawn – Spend 10,000 cash to hatch a new creature egg (blocked if you already have 5 creatures).\n"
@@ -783,7 +821,7 @@ async def info(inter: discord.Interaction):
         "/info – Show this help & overview.\n"
         "\n"
         "**Stats**: HP (health pool*5), AR (defense), PATK, SATK, SPD (initiative; may grant extra swing).\n"
-        "**Actions**: Attack, Aggressive (+10% dmg), Special (ignores AR), Defend (halve incoming dmg; double-defend rerolled).\n"
+        "**Actions**: Attack, Aggressive (+25% dmg), Special (ignores AR), Defend (halve incoming dmg; double-defend rerolled).\n"
         "**Death**: On a loss, 50% chance (random < 0.5) your creature is deleted.\n"
         "\n"
         "Good luck, Trainer!"

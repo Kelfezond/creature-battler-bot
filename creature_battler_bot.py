@@ -17,7 +17,7 @@ DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# NEW: Admin allow-list for privileged commands (e.g., /cashadd)
+# Admin allow-list for privileged commands (e.g., /cashadd)
 def _parse_admin_ids(raw: Optional[str]) -> set[int]:
     ids: set[int] = set()
     if not raw:
@@ -43,7 +43,7 @@ for env_name, env_val in {
         raise RuntimeError(f"Missing environment variable: {env_name}")
 
 if ADMIN_USER_IDS:
-    logger.info("Admin allow-list loaded for privileged commands: %s", ", ".join(map(str, ADMIN_USER_IDS)))
+    logger.info("Admin allow-list loaded: %s", ", ".join(map(str, ADMIN_USER_IDS)))
 else:
     logger.warning("ADMIN_USER_IDS is not set; privileged commands will be denied for all users.")
 
@@ -78,12 +78,21 @@ ALTER TABLE creatures
 ALTER TABLE trainers
   ADD COLUMN IF NOT EXISTS facility_level INT DEFAULT 1;
 
--- NEW: per-creature per-day battle cap tracking (resets by Europe/London day)
+-- Per-creature/day battle cap (resets at midnight Europe/London)
 CREATE TABLE IF NOT EXISTS battle_caps (
   creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
   day DATE NOT NULL,
   count INT NOT NULL DEFAULT 0,
   PRIMARY KEY (creature_id, day)
+);
+
+-- NEW: Per-creature per-tier progress (wins & glyph unlock)
+CREATE TABLE IF NOT EXISTS creature_progress (
+  creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
+  tier INT NOT NULL,
+  wins INT NOT NULL DEFAULT 0,
+  glyph_unlocked BOOLEAN NOT NULL DEFAULT FALSE,
+  PRIMARY KEY (creature_id, tier)
 );
 """
 
@@ -126,42 +135,12 @@ TIER_RARITY_WEIGHTS: Dict[int, Tuple[List[str], List[int]]] = {
 # Training Facility progression
 MAX_FACILITY_LEVEL = 6
 FACILITY_LEVELS: Dict[int, Dict[str, Any]] = {
-    1: {
-        "name": "Basic Training Yard",
-        "bonus": 0,
-        "cost": None,
-        "desc": "A patch of land with scattered targets, sand pits, and makeshift climbing posts. Rough, simple, and functional."
-    },
-    2: {
-        "name": "Reinforced Combat Pit",
-        "bonus": 1,
-        "cost": 18_000,
-        "desc": "Expanded grounds with adjustable barriers, weighted obstacles, sky hoops, and water trenches. Built to be tough and versatile."
-    },
-    3: {
-        "name": "Kinetic Optimization Center",
-        "bonus": 2,
-        "cost": 55_000,
-        "desc": "Modular platforms with reactive surfaces, telescoping tracks, and pressure pads. The environment adapts to suit each training style."
-    },
-    4: {
-        "name": "Neuro-Combat Simulator",
-        "bonus": 3,
-        "cost": 130_000,
-        "desc": "Holographic arenas simulate dynamic opponents and shifting terrain. Training is personalized and reactive in real time."
-    },
-    5: {
-        "name": "BioSync Reactor Chamber",
-        "bonus": 4,
-        "cost": 275_000,
-        "desc": "A synchronized chamber tuned to physical and mental rhythms. Terrain and resistance fields shift unpredictably to enhance reflex development."
-    },
-    6: {
-        "name": "SynapseForge Hyperlab",
-        "bonus": 5,
-        "cost": 500_000,
-        "desc": "A high-tech fusion of neural feedback, virtual training microcosms, and time-compressed simulations. Mastery is forged at the speed of thought."
-    },
+    1: {"name": "Basic Training Yard", "bonus": 0, "cost": None, "desc": "A patch of land with scattered targets, sand pits, and makeshift climbing posts. Rough, simple, and functional."},
+    2: {"name": "Reinforced Combat Pit", "bonus": 1, "cost": 18_000, "desc": "Expanded grounds with adjustable barriers, weighted obstacles, sky hoops, and water trenches. Built to be tough and versatile."},
+    3: {"name": "Kinetic Optimization Center", "bonus": 2, "cost": 55_000, "desc": "Modular platforms with reactive surfaces, telescoping tracks, and pressure pads. The environment adapts to suit each training style."},
+    4: {"name": "Neuro-Combat Simulator", "bonus": 3, "cost": 130_000, "desc": "Holographic arenas simulate dynamic opponents and shifting terrain. Training is personalized and reactive in real time."},
+    5: {"name": "BioSync Reactor Chamber", "bonus": 4, "cost": 275_000, "desc": "A synchronized chamber tuned to physical and mental rhythms. Terrain and resistance fields shift unpredictably to enhance reflex development."},
+    6: {"name": "SynapseForge Hyperlab", "bonus": 5, "cost": 500_000, "desc": "A high-tech fusion of neural feedback, virtual training microcosms, and time-compressed simulations. Mastery is forged at the speed of thought."},
 }
 
 def facility_bonus(level: int) -> int:
@@ -183,7 +162,7 @@ TIER_EXTRAS = {
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
 
 ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
-# UPDATED: Action weights (Attack, Aggressive, Special, Defend) → 38, 22, 22, 18
+# Action weights (Attack, Aggressive, Special, Defend) → 38, 22, 22, 18
 ACTION_WEIGHTS = [38, 22, 22, 18]   # sum = 100
 
 # ─── Tier Payouts ────────────────────────────────────────────
@@ -330,7 +309,7 @@ Avoid words: {', '.join(used_words)}
             logger.error("OpenAI error: %s", e)
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
-# NEW: generic chunked sender that supports ephemeral
+# Chunked sender
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
     if not inter.response.is_done():
@@ -340,7 +319,7 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
     for chunk in chunks[1:]:
         await inter.followup.send(chunk, ephemeral=ephemeral)
 
-# NEW: per-creature daily battle cap helper (Europe/London day)
+# ─── Battle cap helper ───────────────────────────────────────
 async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
     """
     Returns (allowed, new_or_existing_count).
@@ -370,6 +349,58 @@ async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
                 creature_id, day, new_count
             )
             return True, new_count
+
+# ─── Progress / Glyphs helpers ───────────────────────────────
+async def _get_progress(conn: asyncpg.Connection, creature_id: int, tier: int) -> Optional[asyncpg.Record]:
+    return await conn.fetchrow(
+        "SELECT wins, glyph_unlocked FROM creature_progress WHERE creature_id=$1 AND tier=$2",
+        creature_id, tier
+    )
+
+async def _max_unlocked_tier(creature_id: int) -> int:
+    """
+    Gate per spec: new creature → Tier 1 only; after 5 wins at Tier 1 → Tier 2 unlocked.
+    (Tiers 3–9 currently unrestricted by gates.)
+    """
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        row = await _get_progress(conn, creature_id, 1)
+        wins_t1 = (row["wins"] if row else 0)
+        return 2 if wins_t1 >= 5 else 1
+
+async def _record_win_and_maybe_unlock(creature_id: int, tier: int) -> Tuple[int, bool]:
+    """
+    Increment wins for (creature_id, tier). If wins hit 5 the first time:
+      - Set glyph_unlocked = true for that tier.
+      - Return (wins, unlocked_now=True) when the glyph unlocks this call, else (wins, False).
+    """
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await _get_progress(conn, creature_id, tier)
+            if not row:
+                wins = 1
+                glyph = (wins >= 5)
+                await conn.execute(
+                    "INSERT INTO creature_progress(creature_id,tier,wins,glyph_unlocked) VALUES($1,$2,$3,$4)",
+                    creature_id, tier, wins, glyph
+                )
+                return wins, glyph
+            wins = row["wins"] + 1
+            glyph = row["glyph_unlocked"]
+            if not glyph and wins >= 5:
+                glyph = True
+                await conn.execute(
+                    "UPDATE creature_progress SET wins=$3, glyph_unlocked=true WHERE creature_id=$1 AND tier=$2",
+                    creature_id, tier, wins
+                )
+                return wins, True
+            else:
+                await conn.execute(
+                    "UPDATE creature_progress SET wins=$3 WHERE creature_id=$1 AND tier=$2",
+                    creature_id, tier, wins
+                )
+                return wins, False
 
 def simulate_round(st: BattleState):
     # Start of round
@@ -410,7 +441,7 @@ def simulate_round(st: BattleState):
             st.logs.append(f"{atk['name']} is defending.")
             continue
 
-        # UPDATED: Extra swing when SPD ≥ 1.5× defender SPD
+        # Extra swing when SPD ≥ 1.5× defender SPD
         swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
 
         for _ in range(swings):
@@ -420,7 +451,7 @@ def simulate_round(st: BattleState):
             # Attack strength is the better of PATK/SATK
             S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
 
-            # UPDATED: Soften AR's effect by halving it (Special continues to ignore AR)
+            # Soften AR's effect by halving it (Special ignores AR)
             if act == "Special":
                 AR_val = 0
             else:
@@ -429,10 +460,10 @@ def simulate_round(st: BattleState):
             # Roll ceil(S/10) d6 dice
             rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
             s = sum(rolls)
-            # Base damage from the current model
+            # Base damage
             dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
 
-            # UPDATED: Aggressive buff to +25% (no AR penetration)
+            # Aggressive buff +25%
             if act == "Aggressive":
                 dmg = math.ceil(dmg * 1.25)
 
@@ -440,7 +471,7 @@ def simulate_round(st: BattleState):
             if dfn_act == "Defend":
                 dmg = max(1, math.ceil(dmg * 0.5))
 
-            # UPDATED: Sudden death global damage multiplier
+            # Sudden death global damage multiplier
             if sudden_death_mult > 1.0:
                 dmg = max(1, math.ceil(dmg * sudden_death_mult))
 
@@ -482,6 +513,19 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     )
     result_word = "won" if player_won else "lost"
     st.logs.append(f"You {result_word} the Tier {st.tier} battle: +{payout} cash awarded.")
+
+    # Progress & glyphs on win
+    if player_won:
+        wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
+        if st.tier == 1 and unlocked_now:
+            st.logs.append(f"🏅 **Tier 1 Glyph unlocked!** {st.user_creature['name']} may now battle **Tier 2**.")
+        elif st.tier == 2 and unlocked_now:
+            st.logs.append(f"🏅 **Tier 2 Glyph unlocked!**")
+
+        # Always show progress for T1/T2
+        if st.tier in (1, 2):
+            st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
+
     if not player_won:
         death_roll = random.random()
         pct = int(death_roll * 100)
@@ -590,6 +634,43 @@ async def creatures(inter: discord.Interaction):
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
+# NEW: Show glyphs / tier progress
+@bot.tree.command(description="Show glyphs and tier progress for a creature")
+async def glyphs(inter: discord.Interaction, creature_name: str):
+    if not await ensure_registered(inter):
+        return
+    c_row = await (await db_pool()).fetchrow(
+        "SELECT id,name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id, creature_name
+    )
+    if not c_row:
+        return await inter.response.send_message("Creature not found.", ephemeral=True)
+
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        t1 = await _get_progress(conn, c_row["id"], 1)
+        t2 = await _get_progress(conn, c_row["id"], 2)
+
+    wins_t1 = t1["wins"] if t1 else 0
+    glyph_t1 = (t1["glyph_unlocked"] if t1 else False)
+    wins_t2 = t2["wins"] if t2 else 0
+    glyph_t2 = (t2["glyph_unlocked"] if t2 else False)
+
+    max_tier = await _max_unlocked_tier(c_row["id"])
+    lines = [
+        f"**{c_row['name']} – Glyphs & Progress**",
+        f"• Tier 1: Wins {wins_t1}/5 | Glyph: {'✅' if glyph_t1 else '❌'}",
+        f"• Tier 2: Wins {wins_t2}/5 | Glyph: {'✅' if glyph_t2 else '❌'}",
+        "",
+        f"**Unlocked Tiers:** 1..{max_tier}",
+    ]
+    if max_tier < 2:
+        lines.append("Win **5 battles at Tier 1** to unlock Tier 2 and earn the Tier 1 Glyph.")
+    else:
+        if not glyph_t2:
+            lines.append("Win **5 battles at Tier 2** to earn the Tier 2 Glyph.")
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+
 @bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
 async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if tier not in TIER_EXTRAS:
@@ -615,12 +696,27 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             f"{c_row['name']} has fainted and needs healing.", ephemeral=True
         )
 
-    # NEW: battle cap check (+increment on success)
+    # Tier gate enforcement (per spec: T1 only until 5 wins at T1; then T2 unlocked)
+    allowed_tier = await _max_unlocked_tier(c_row["id"])
+    if tier > allowed_tier and tier in (1, 2):  # gates defined for 1→2 currently
+        pool = await db_pool()
+        row = await pool.fetchrow(
+            "SELECT wins FROM creature_progress WHERE creature_id=$1 AND tier=1",
+            c_row["id"]
+        )
+        wins_t1 = row["wins"] if row else 0
+        return await inter.response.send_message(
+            f"Tier {tier} is locked for **{c_row['name']}**. "
+            f"Current unlock: 1..{allowed_tier}. "
+            f"Wins at Tier 1: {wins_t1}/5 (need 5 to unlock Tier 2).",
+            ephemeral=True
+        )
+
+    # Daily battle cap check (+increment on success)
     allowed, count = await _can_start_battle_and_increment(c_row["id"])
     if not allowed:
-        remaining = 0
         return await inter.response.send_message(
-            f"Daily battle cap reached for **{c_row['name']}**: {count}/2 used. "
+            f"Daily battle cap reached for **{c_row['name']}**: 2/2 used. "
             "Try again after midnight Europe/London.", ephemeral=True
         )
 
@@ -653,8 +749,12 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         "",
         "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
         "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
-        "Daily cap: Each creature can start at most 2 battles per Europe/London day."
+        "Daily cap: Each creature can start at most 2 battles per Europe/London day.",
     ]
+
+    # Hint current unlocks
+    max_tier = await _max_unlocked_tier(c_row["id"])
+    st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
 
     for _ in range(10):
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
@@ -717,7 +817,6 @@ async def cash(inter: discord.Interaction):
 
 @bot.tree.command(description="Add cash (dev utility)")
 async def cashadd(inter: discord.Interaction, amount: int):
-    # Admin gate
     if inter.user.id not in ADMIN_USER_IDS:
         return await inter.response.send_message(
             "Not authorized to use this command.", ephemeral=True
@@ -874,6 +973,7 @@ async def info(inter: discord.Interaction):
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
         "• Trainer points (daily +5 plus facility bonus) are spent to increase stats. HP increases also raise current HP.\n"
         "• **Daily Battle Cap**: Each creature can start at most **2 battles per day** (resets at midnight Europe/London).\n"
+        "• **Tier Gates & Glyphs**: New creatures can only fight **Tier 1**. After **5 Tier‑1 wins**, they unlock **Tier 2** and earn the **Tier 1 Glyph**. After **5 Tier‑2 wins**, they earn the **Tier 2 Glyph**. Use `/glyphs <name>` to check progress.\n"
         "\n"
         "**Combat Rules (current)**\n"
         "• **Action weights**: Attack 38%, Aggressive 22%, Special 22%, Defend 18%.\n"
@@ -887,7 +987,8 @@ async def info(inter: discord.Interaction):
         "/register – Create your trainer profile (one-time).\n"
         "/spawn – Spend 10,000 cash to hatch a new creature egg (blocked if you already have 5 creatures).\n"
         "/creatures – List your creatures and their stats.\n"
-        "/battle <creature_name> <tier> – Start a battle (tiers 1–9).\n"
+        "/glyphs <creature_name> – View glyphs and tier unlock progress.\n"
+        "/battle <creature_name> <tier> – Start a battle (tiers 1–9; gate enforces 1→2 unlocks).\n"
         "/continue – Continue your current battle (up to 10 more rounds per use).\n"
         "/cash – Show your current cash.\n"
         "/cashadd <amount> – (Admin) Add test cash to your account.\n"

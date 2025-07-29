@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS battle_caps (
   PRIMARY KEY (creature_id, day)
 );
 
--- NEW: Per-creature per-tier progress (wins & glyph unlock)
+-- Per-creature per-tier progress (wins & glyph unlock)
 CREATE TABLE IF NOT EXISTS creature_progress (
   creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
   tier INT NOT NULL,
@@ -357,16 +357,32 @@ async def _get_progress(conn: asyncpg.Connection, creature_id: int, tier: int) -
         creature_id, tier
     )
 
+async def _get_wins_for_tier(creature_id: int, tier: int) -> int:
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        row = await _get_progress(conn, creature_id, tier)
+        return (row["wins"] if row else 0)
+
 async def _max_unlocked_tier(creature_id: int) -> int:
     """
-    Gate per spec: new creature → Tier 1 only; after 5 wins at Tier 1 → Tier 2 unlocked.
-    (Tiers 3–9 currently unrestricted by gates.)
+    Tier gating (generalized):
+      - Start at Tier 1 only.
+      - To unlock Tier (t+1), get 5 wins at Tier t.
+      - This chains up to Tier 9 (i.e., you can unlock at most Tier 9; there is no Tier 10).
+    Returns the max tier number currently available to queue.
     """
     pool = await db_pool()
     async with pool.acquire() as conn:
-        row = await _get_progress(conn, creature_id, 1)
-        wins_t1 = (row["wins"] if row else 0)
-        return 2 if wins_t1 >= 5 else 1
+        unlocked = 1
+        # Check consecutively from Tier 1 upwards; stop at first tier with <5 wins
+        for t in range(1, 9):  # up to 8 to possibly unlock 9
+            row = await _get_progress(conn, creature_id, t)
+            wins_t = (row["wins"] if row else 0)
+            if wins_t >= 5:
+                unlocked = t + 1
+            else:
+                break
+        return unlocked
 
 async def _record_win_and_maybe_unlock(creature_id: int, tier: int) -> Tuple[int, bool]:
     """
@@ -449,7 +465,7 @@ def simulate_round(st: BattleState):
                 break
 
             # Attack strength is the better of PATK/SATK
-            S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+            S = max(atk["stats"]["PATK"], atk["stats"]["SATK"]])
 
             # Soften AR's effect by halving it (Special ignores AR)
             if act == "Special":
@@ -517,14 +533,17 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     # Progress & glyphs on win
     if player_won:
         wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
-        if st.tier == 1 and unlocked_now:
-            st.logs.append(f"🏅 **Tier 1 Glyph unlocked!** {st.user_creature['name']} may now battle **Tier 2**.")
-        elif st.tier == 2 and unlocked_now:
-            st.logs.append(f"🏅 **Tier 2 Glyph unlocked!**")
-
-        # Always show progress for T1/T2
-        if st.tier in (1, 2):
-            st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
+        # Always show progress for the tier just fought
+        st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
+        if unlocked_now:
+            # Glyph for this tier; if not at top tier, the next tier unlocks
+            if st.tier < 9:
+                st.logs.append(
+                    f"🏅 **Tier {st.tier} Glyph unlocked!** "
+                    f"{st.user_creature['name']} may now battle **Tier {st.tier + 1}**."
+                )
+            else:
+                st.logs.append(f"🏅 **Tier {st.tier} Glyph unlocked!**")
 
     if not player_won:
         death_roll = random.random()
@@ -634,7 +653,7 @@ async def creatures(inter: discord.Interaction):
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-# NEW: Show glyphs / tier progress
+# Show glyphs / tier progress for all tiers
 @bot.tree.command(description="Show glyphs and tier progress for a creature")
 async def glyphs(inter: discord.Interaction, creature_name: str):
     if not await ensure_registered(inter):
@@ -647,28 +666,27 @@ async def glyphs(inter: discord.Interaction, creature_name: str):
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
     pool = await db_pool()
+    progress: Dict[int, Tuple[int, bool]] = {}
     async with pool.acquire() as conn:
-        t1 = await _get_progress(conn, c_row["id"], 1)
-        t2 = await _get_progress(conn, c_row["id"], 2)
-
-    wins_t1 = t1["wins"] if t1 else 0
-    glyph_t1 = (t1["glyph_unlocked"] if t1 else False)
-    wins_t2 = t2["wins"] if t2 else 0
-    glyph_t2 = (t2["glyph_unlocked"] if t2 else False)
+        for t in range(1, 10):
+            row = await _get_progress(conn, c_row["id"], t)
+            wins = row["wins"] if row else 0
+            glyph = (row["glyph_unlocked"] if row else False)
+            progress[t] = (wins, glyph)
 
     max_tier = await _max_unlocked_tier(c_row["id"])
-    lines = [
-        f"**{c_row['name']} – Glyphs & Progress**",
-        f"• Tier 1: Wins {wins_t1}/5 | Glyph: {'✅' if glyph_t1 else '❌'}",
-        f"• Tier 2: Wins {wins_t2}/5 | Glyph: {'✅' if glyph_t2 else '❌'}",
-        "",
-        f"**Unlocked Tiers:** 1..{max_tier}",
-    ]
-    if max_tier < 2:
-        lines.append("Win **5 battles at Tier 1** to unlock Tier 2 and earn the Tier 1 Glyph.")
-    else:
-        if not glyph_t2:
-            lines.append("Win **5 battles at Tier 2** to earn the Tier 2 Glyph.")
+    lines = [f"**{c_row['name']} – Glyphs & Progress**"]
+    for t in range(1, 10):
+        wins, glyph = progress[t]
+        lines.append(f"• Tier {t}: Wins {wins}/5 | Glyph: {'✅' if glyph else '❌'}")
+    lines += ["", f"**Unlocked Tiers:** 1..{max_tier}"]
+    if max_tier < 9:
+        need_prev = max_tier  # you need 5 wins at this tier to unlock next
+        wins_prev, _ = progress[need_prev]
+        lines.append(
+            f"Win **5 battles at Tier {need_prev}** to unlock **Tier {need_prev+1}** "
+            f"(current: {wins_prev}/5)."
+        )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
@@ -696,19 +714,16 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             f"{c_row['name']} has fainted and needs healing.", ephemeral=True
         )
 
-    # Tier gate enforcement (per spec: T1 only until 5 wins at T1; then T2 unlocked)
+    # ─── Tier gate enforcement (generalized 1→9) ────────────
     allowed_tier = await _max_unlocked_tier(c_row["id"])
-    if tier > allowed_tier and tier in (1, 2):  # gates defined for 1→2 currently
-        pool = await db_pool()
-        row = await pool.fetchrow(
-            "SELECT wins FROM creature_progress WHERE creature_id=$1 AND tier=1",
-            c_row["id"]
-        )
-        wins_t1 = row["wins"] if row else 0
+    if tier > allowed_tier:
+        need_prev = tier - 1
+        wins_prev = await _get_wins_for_tier(c_row["id"], need_prev)
         return await inter.response.send_message(
             f"Tier {tier} is locked for **{c_row['name']}**. "
-            f"Current unlock: 1..{allowed_tier}. "
-            f"Wins at Tier 1: {wins_t1}/5 (need 5 to unlock Tier 2).",
+            f"Current unlock: **1..{allowed_tier}**. "
+            f"You need **5 wins at Tier {need_prev}** to unlock Tier {tier} "
+            f"(current: {wins_prev}/5).",
             ephemeral=True
         )
 
@@ -950,7 +965,7 @@ async def upgradeyes(inter: discord.Interaction):
         ephemeral=True
     )
 
-# /info command (now chunked)
+# /info command (now generalized for full gating 1→9)
 @bot.tree.command(description="Show game overview and command list")
 async def info(inter: discord.Interaction):
     overview = (
@@ -973,7 +988,7 @@ async def info(inter: discord.Interaction):
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
         "• Trainer points (daily +5 plus facility bonus) are spent to increase stats. HP increases also raise current HP.\n"
         "• **Daily Battle Cap**: Each creature can start at most **2 battles per day** (resets at midnight Europe/London).\n"
-        "• **Tier Gates & Glyphs**: New creatures can only fight **Tier 1**. After **5 Tier‑1 wins**, they unlock **Tier 2** and earn the **Tier 1 Glyph**. After **5 Tier‑2 wins**, they earn the **Tier 2 Glyph**. Use `/glyphs <name>` to check progress.\n"
+        "• **Tier Gates & Glyphs**: New creatures can only fight **Tier 1**. After **5 Tier‑1 wins** you unlock **Tier 2** and earn the **Tier 1 Glyph**. After **5 wins at Tier t**, you earn the **Tier t Glyph** and unlock **Tier t+1** (up to Tier 9).\n"
         "\n"
         "**Combat Rules (current)**\n"
         "• **Action weights**: Attack 38%, Aggressive 22%, Special 22%, Defend 18%.\n"
@@ -987,8 +1002,8 @@ async def info(inter: discord.Interaction):
         "/register – Create your trainer profile (one-time).\n"
         "/spawn – Spend 10,000 cash to hatch a new creature egg (blocked if you already have 5 creatures).\n"
         "/creatures – List your creatures and their stats.\n"
-        "/glyphs <creature_name> – View glyphs and tier unlock progress.\n"
-        "/battle <creature_name> <tier> – Start a battle (tiers 1–9; gate enforces 1→2 unlocks).\n"
+        "/glyphs <creature_name> – View glyphs and tier unlock progress across T1–T9.\n"
+        "/battle <creature_name> <tier> – Start a battle (tiers 1–9; gates enforced: need 5 wins at previous tier).\n"
         "/continue – Continue your current battle (up to 10 more rounds per use).\n"
         "/cash – Show your current cash.\n"
         "/cashadd <amount> – (Admin) Add test cash to your account.\n"

@@ -284,7 +284,7 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
     used_names = [r["name"].lower() for r in rows]
-    used_words = {w.lower() for r in rows for w in r["descriptors"]}
+    used_words = {w.lower() for r in rows for w in (r["descriptors"] or [])}
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
 {{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
@@ -368,14 +368,13 @@ async def _max_unlocked_tier(creature_id: int) -> int:
     Tier gating (generalized):
       - Start at Tier 1 only.
       - To unlock Tier (t+1), get 5 wins at Tier t.
-      - This chains up to Tier 9 (i.e., you can unlock at most Tier 9; there is no Tier 10).
+      - This chains up to Tier 9.
     Returns the max tier number currently available to queue.
     """
     pool = await db_pool()
     async with pool.acquire() as conn:
         unlocked = 1
-        # Check consecutively from Tier 1 upwards; stop at first tier with <5 wins
-        for t in range(1, 9):  # up to 8 to possibly unlock 9
+        for t in range(1, 9):  # check t=1..8 for unlocking t+1 up to 9
             row = await _get_progress(conn, creature_id, t)
             wins_t = (row["wins"] if row else 0)
             if wins_t >= 5:
@@ -405,7 +404,6 @@ async def _record_win_and_maybe_unlock(creature_id: int, tier: int) -> Tuple[int
             wins = row["wins"] + 1
             glyph = row["glyph_unlocked"]
             if not glyph and wins >= 5:
-                glyph = True
                 await conn.execute(
                     "UPDATE creature_progress SET wins=$3, glyph_unlocked=true WHERE creature_id=$1 AND tier=$2",
                     creature_id, tier, wins
@@ -465,7 +463,7 @@ def simulate_round(st: BattleState):
                 break
 
             # Attack strength is the better of PATK/SATK
-            S = max(atk["stats"]["PATK"], atk["stats"]["SATK"]])
+            S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
 
             # Soften AR's effect by halving it (Special ignores AR)
             if act == "Special":
@@ -533,10 +531,8 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     # Progress & glyphs on win
     if player_won:
         wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
-        # Always show progress for the tier just fought
         st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
         if unlocked_now:
-            # Glyph for this tier; if not at top tier, the next tier unlocks
             if st.tier < 9:
                 st.logs.append(
                     f"🏅 **Tier {st.tier} Glyph unlocked!** "
@@ -644,7 +640,7 @@ async def creatures(inter: discord.Interaction):
     lines = []
     for idx, r in enumerate(rows, 1):
         st = json.loads(r["stats"])
-        desc = ", ".join(r["descriptors"]) or "None"
+        desc = ", ".join(r["descriptors"] or []) or "None"
         max_hp = st["HP"] * 5
         lines.append(
             f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
@@ -681,7 +677,7 @@ async def glyphs(inter: discord.Interaction, creature_name: str):
         lines.append(f"• Tier {t}: Wins {wins}/5 | Glyph: {'✅' if glyph else '❌'}")
     lines += ["", f"**Unlocked Tiers:** 1..{max_tier}"]
     if max_tier < 9:
-        need_prev = max_tier  # you need 5 wins at this tier to unlock next
+        need_prev = max_tier  # need 5 wins here to unlock next
         wins_prev, _ = progress[need_prev]
         lines.append(
             f"Win **5 battles at Tier {need_prev}** to unlock **Tier {need_prev+1}** "
@@ -965,7 +961,7 @@ async def upgradeyes(inter: discord.Interaction):
         ephemeral=True
     )
 
-# /info command (now generalized for full gating 1→9)
+# /info command (generalized for full gating 1→9)
 @bot.tree.command(description="Show game overview and command list")
 async def info(inter: discord.Interaction):
     overview = (

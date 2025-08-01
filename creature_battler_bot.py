@@ -104,6 +104,15 @@ async def db_pool() -> asyncpg.Pool:
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5  # hard cap per player
 
+# NEW: Sell prices by rarity
+SELL_PRICES: Dict[str, int] = {
+    "Common": 1_000,
+    "Uncommon": 2_000,
+    "Rare": 10_000,
+    "Epic": 20_000,
+    "Legendary": 50_000,
+}
+
 # /spawn rarity distribution with Legendary at **0.5%**
 # Common 75%, Uncommon 13%, Rare 7%, Epic 4.5%, Legendary 0.5%
 def spawn_rarity() -> str:
@@ -208,7 +217,7 @@ async def distribute_cash():
 @tasks.loop(hours=24)
 async def distribute_points():
     if distribute_points.current_loop == 0:
-        logger.info("Skipping first daily trainer‑point distribution after restart")
+        logger.info("Skipping first daily trainer-point distribution after restart")
         return
     # base 5 + (facility_level - 1) but capped to +5
     await (await db_pool()).execute("""
@@ -274,7 +283,7 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
     if count >= MAX_CREATURES:
         await inter.response.send_message(
             f"You already own the maximum of {MAX_CREATURES} creatures. "
-            "Release one before spawning a new egg.",
+            "Sell one before spawning a new egg.",
             ephemeral=True
         )
         return False
@@ -588,11 +597,11 @@ async def register(inter: discord.Interaction):
         inter.user.id, 20000, 5, 1
     )
     await inter.response.send_message(
-        "Profile created! You received 20 000 cash and 5 trainer points.",
+        "Profile created! You received 20 000 cash and 5 trainer points.",
         ephemeral=True
     )
 
-@bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
+@bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
 async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if not row:
@@ -649,6 +658,40 @@ async def creatures(inter: discord.Interaction):
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
+# NEW: /sell command
+@bot.tree.command(description="Sell one of your creatures for cash (price depends on rarity)")
+async def sell(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+
+    c_row = await (await db_pool()).fetchrow(
+        "SELECT id, name, rarity FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id, creature_name
+    )
+    if not c_row:
+        return await inter.response.send_message("Creature not found.", ephemeral=True)
+
+    # Prevent selling the creature currently in an active battle
+    st = active_battles.get(inter.user.id)
+    if st and st.creature_id == c_row["id"]:
+        return await inter.response.send_message(
+            f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before selling.",
+            ephemeral=True
+        )
+
+    rarity = c_row["rarity"]
+    price = SELL_PRICES.get(rarity, 0)
+
+    async with (await db_pool()).acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM creatures WHERE id=$1", c_row["id"])
+            await conn.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", price, inter.user.id)
+
+    await inter.response.send_message(
+        f"Sold **{c_row['name']}** ({rarity}) for **{price}** cash.", ephemeral=True
+    )
+
 # Show glyphs / tier progress for all tiers
 @bot.tree.command(description="Show glyphs and tier progress for a creature")
 async def glyphs(inter: discord.Interaction, creature_name: str):
@@ -688,7 +731,7 @@ async def glyphs(inter: discord.Interaction, creature_name: str):
 @bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
 async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if tier not in TIER_EXTRAS:
-        return await inter.response.send_message("Invalid tier (1‑9).", ephemeral=True)
+        return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
     if inter.user.id in active_battles:
         return await inter.response.send_message(
             "You already have an active battle – use /continue.", ephemeral=True
@@ -968,7 +1011,8 @@ async def info(inter: discord.Interaction):
         "**Game Overview**\n"
         "Collect creatures, train their stats, and battle tiered opponents.\n"
         "• Passive income: 60 cash/hour.\n"
-        "• Creature cap: You can own at most **5 creatures**. Extra spawns are blocked.\n"
+        "• Creature cap: You can own at most **5 creatures**. Extra spawns are blocked; "
+        "sell one with `/sell <creature_name>` to free a slot.\n"
         "• **Spawn eggs Legendary chance: 0.5%** (others adjusted accordingly).\n"
         "• **Battle opponent rarity by tier**:\n"
         "  - T1–2: Common only\n"
@@ -976,7 +1020,7 @@ async def info(inter: discord.Interaction):
         "  - T5–6: Common/Uncommon/Rare (50/33/16)\n"
         "  - T7–8: Common/Uncommon/Rare/Epic (40/30/20/10)\n"
         "  - T9: Common/Uncommon/Rare/Epic/Legendary (33/26/20/13/6)\n"
-        "• If both creatures pick **Defend** in a round, it is silently re‑rolled until at least one doesn't defend.\n"
+        "• If both creatures pick **Defend** in a round, it is silently re-rolled until at least one doesn't defend.\n"
         "• **Training Facilities**: Start at Level 1 (Basic Training Yard). Each level adds +1 trainer point/day up to +5 (Level 6). Base income is 5/day → max 10/day.\n"
         "  Use `/upgrade` to view & `/upgradeyes` to confirm if you can afford it.\n"
         "• Battles occur in rounds; continue long fights with `/continue`.\n"
@@ -984,7 +1028,11 @@ async def info(inter: discord.Interaction):
         "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
         "• Trainer points (daily +5 plus facility bonus) are spent to increase stats. HP increases also raise current HP.\n"
         "• **Daily Battle Cap**: Each creature can start at most **2 battles per day** (resets at midnight Europe/London).\n"
-        "• **Tier Gates & Glyphs**: New creatures can only fight **Tier 1**. After **5 Tier‑1 wins** you unlock **Tier 2** and earn the **Tier 1 Glyph**. After **5 wins at Tier t**, you earn the **Tier t Glyph** and unlock **Tier t+1** (up to Tier 9).\n"
+        "• **Tier Gates & Glyphs**: New creatures can only fight **Tier 1**. After **5 Tier-1 wins** you unlock **Tier 2** and earn the **Tier 1 Glyph**. After **5 wins at Tier t**, you earn the **Tier t Glyph** and unlock **Tier t+1** (up to Tier 9).\n"
+        "\n"
+        "**Selling Creatures**\n"
+        "• Use `/sell <creature_name>` to sell a creature and free a slot.\n"
+        "• Prices by rarity → Common: 1,000 | Uncommon: 2,000 | Rare: 10,000 | Epic: 20,000 | Legendary: 50,000.\n"
         "\n"
         "**Combat Rules (current)**\n"
         "• **Action weights**: Attack 38%, Aggressive 22%, Special 22%, Defend 18%.\n"
@@ -997,6 +1045,7 @@ async def info(inter: discord.Interaction):
         "**Commands**\n"
         "/register – Create your trainer profile (one-time).\n"
         "/spawn – Spend 10,000 cash to hatch a new creature egg (blocked if you already have 5 creatures).\n"
+        "/sell <creature_name> – Sell a creature for cash (Common 1,000 • Uncommon 2,000 • Rare 10,000 • Epic 20,000 • Legendary 50,000).\n"
         "/creatures – List your creatures and their stats.\n"
         "/glyphs <creature_name> – View glyphs and tier unlock progress across T1–T9.\n"
         "/battle <creature_name> <tier> – Start a battle (tiers 1–9; gates enforced: need 5 wins at previous tier).\n"

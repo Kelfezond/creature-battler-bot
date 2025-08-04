@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, logging, math, os, random
+import asyncio, json, logging, math, os, random, time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,7 +17,11 @@ DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Admin allow-list for privileged commands (e.g., /cashadd)
+# Optional: channel where the live leaderboard is posted/updated.
+# You can also set this via /setleaderboardchannel (admin-only).
+LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
+
+# Admin allow-list for privileged commands (e.g., /cashadd, /setleaderboardchannel)
 def _parse_admin_ids(raw: Optional[str]) -> set[int]:
     ids: set[int] = set()
     if not raw:
@@ -93,6 +97,27 @@ CREATE TABLE IF NOT EXISTS creature_progress (
   wins INT NOT NULL DEFAULT 0,
   glyph_unlocked BOOLEAN NOT NULL DEFAULT FALSE,
   PRIMARY KEY (creature_id, tier)
+);
+
+-- NEW: Lifetime win/loss records that persist even after a creature dies or is sold
+CREATE TABLE IF NOT EXISTS creature_records (
+  creature_id INT,                 -- nullable after deletion
+  owner_id BIGINT NOT NULL,
+  name TEXT NOT NULL,
+  wins INT NOT NULL DEFAULT 0,
+  losses INT NOT NULL DEFAULT 0,
+  is_dead BOOLEAN NOT NULL DEFAULT FALSE,
+  died_at TIMESTAMPTZ,
+  PRIMARY KEY (owner_id, name)
+);
+
+-- Index to help rank top 20 quickly
+CREATE INDEX IF NOT EXISTS cr_rank_idx ON creature_records (wins DESC, losses ASC, name ASC);
+
+-- NEW: Store the message we keep editing for the live leaderboard
+CREATE TABLE IF NOT EXISTS leaderboard_messages (
+  channel_id BIGINT PRIMARY KEY,
+  message_id BIGINT
 );
 """
 
@@ -525,11 +550,166 @@ def simulate_round(st: BattleState):
     )
     st.logs.append("")
 
+# ─── Leaderboard helpers ─────────────────────────────────────
+async def _backfill_creature_records():
+    """
+    Ensure every current creature has a matching record row with 0-0 if missing.
+    """
+    pool = await db_pool()
+    await pool.execute("""
+        INSERT INTO creature_records (creature_id, owner_id, name)
+        SELECT c.id, c.owner_id, c.name
+        FROM creatures c
+        LEFT JOIN creature_records r
+          ON r.owner_id = c.owner_id AND LOWER(r.name) = LOWER(c.name)
+        WHERE r.owner_id IS NULL
+    """)
+    logger.info("Backfilled creature_records for existing creatures (if any missing).")
+
+async def _ensure_record(owner_id: int, creature_id: int, name: str):
+    await (await db_pool()).execute("""
+        INSERT INTO creature_records (creature_id, owner_id, name)
+        VALUES ($1,$2,$3)
+        ON CONFLICT (owner_id, name) DO NOTHING
+    """, creature_id, owner_id, name)
+
+async def _record_result(owner_id: int, name: str, won: bool):
+    if won:
+        await (await db_pool()).execute(
+            "UPDATE creature_records SET wins = wins + 1 WHERE owner_id=$1 AND LOWER(name)=LOWER($2)",
+            owner_id, name
+        )
+    else:
+        await (await db_pool()).execute(
+            "UPDATE creature_records SET losses = losses + 1 WHERE owner_id=$1 AND LOWER(name)=LOWER($2)",
+            owner_id, name
+        )
+
+async def _record_death(owner_id: int, name: str):
+    await (await db_pool()).execute(
+        "UPDATE creature_records SET is_dead=true, died_at=now() WHERE owner_id=$1 AND LOWER(name)=LOWER($2)",
+        owner_id, name
+    )
+
+async def _get_leaderboard_channel_id() -> Optional[int]:
+    """
+    Returns the leaderboard channel id, preferring DB-stored value, else env var.
+    """
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM leaderboard_messages LIMIT 1")
+    if chan:
+        return int(chan)
+    if LEADERBOARD_CHANNEL_ID_ENV:
+        try:
+            return int(LEADERBOARD_CHANNEL_ID_ENV)
+        except Exception:
+            logger.error("LEADERBOARD_CHANNEL_ID env was set but not an integer.")
+    return None
+
+async def _get_or_create_leaderboard_message(channel_id: int) -> Optional[discord.Message]:
+    """
+    Ensures there is a single message in the channel that we keep editing.
+    Returns the discord.Message (fetched or newly created).
+    """
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception as e:
+        logger.error("Failed to fetch leaderboard channel %s: %s", channel_id, e)
+        return None
+
+    pool = await db_pool()
+    msg_id = await pool.fetchval(
+        "SELECT message_id FROM leaderboard_messages WHERE channel_id=$1", channel_id
+    )
+
+    message: Optional[discord.Message] = None
+    if msg_id:
+        try:
+            message = await channel.fetch_message(int(msg_id))
+        except Exception:
+            message = None
+
+    if message is None:
+        # Send a placeholder and store it
+        try:
+            message = await channel.send("Initializing leaderboard…")
+            await pool.execute("""
+                INSERT INTO leaderboard_messages(channel_id, message_id)
+                VALUES ($1,$2)
+                ON CONFLICT (channel_id) DO UPDATE SET message_id=EXCLUDED.message_id
+            """, channel_id, message.id)
+        except Exception as e:
+            logger.error("Failed to create leaderboard message: %s", e)
+            return None
+
+    return message
+
+def _format_leaderboard_lines(rows: List[asyncpg.Record]) -> str:
+    """
+    Builds a Discord message body using a diff code block.
+    Lines prefixed with '-' render red in most clients → we use that for DEAD creatures.
+    """
+    lines = []
+    header = "  #  Name                         W    L  Status"
+    lines.append(header)
+    for idx, r in enumerate(rows, start=1):
+        name = (r["name"] or "")[:26]
+        wins = r["wins"]
+        losses = r["losses"]
+        dead = r["is_dead"]
+        status = "💀 DEAD" if dead else ""
+        base_line = f"{idx:>3}. {name:<26} {wins:>4} {losses:>4} {status}"
+        if dead:
+            lines.append(f"- {base_line}")
+        else:
+            lines.append(f"  {base_line}")
+    body = "```diff\n" + "\n".join(lines) + "\n```"
+    return body
+
+async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
+    """
+    Fetches top 20 creature_records and edits the leaderboard message.
+    """
+    channel_id = await _get_leaderboard_channel_id()
+    if not channel_id:
+        # No configured channel; nothing to do
+        return
+
+    message = await _get_or_create_leaderboard_message(channel_id)
+    if message is None:
+        return
+
+    pool = await db_pool()
+    rows = await pool.fetch("""
+        SELECT name, wins, losses, is_dead
+        FROM creature_records
+        ORDER BY wins DESC, losses ASC, name ASC
+        LIMIT 20
+    """)
+    updated_ts = int(time.time())
+    title = f"**Creature Leaderboard — Top 20 (Wins / Losses)**\nUpdated: <t:{updated_ts}:R>\n"
+    content = title + _format_leaderboard_lines(rows)
+    try:
+        await message.edit(content=content)
+        logger.info("Leaderboard updated (%s).", reason)
+    except Exception as e:
+        logger.error("Failed to edit leaderboard message: %s", e)
+
+@tasks.loop(minutes=5)
+async def update_leaderboard_periodic():
+    await update_leaderboard_now(reason="periodic")
+
+# ─── Battle finalize (augmented with record + leaderboard) ───
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
     player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
     win_cash, loss_cash = TIER_PAYOUTS[st.tier]
     payout = win_cash if player_won else loss_cash
     pool = await db_pool()
+
+    # Ensure record exists, then update result
+    await _ensure_record(st.user_id, st.creature_id, st.user_creature["name"])
+    await _record_result(st.user_id, st.user_creature["name"], player_won)
+
     await pool.execute(
         "UPDATE trainers SET cash = cash + $1 WHERE user_id=$2",
         payout, st.user_id
@@ -550,18 +730,26 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
             else:
                 st.logs.append(f"🏅 **Tier {st.tier} Glyph unlocked!**")
 
+    # Handle death on loss
     if not player_won:
         death_roll = random.random()
         pct = int(death_roll * 100)
         if death_roll < 0.5:
+            # Mark dead in records, then remove creature row (keeps creature cap unchanged),
+            # so the creature stays on the leaderboard with a red "dead" style.
+            await _record_death(st.user_id, st.user_creature["name"])
             await pool.execute("DELETE FROM creatures WHERE id=$1", st.creature_id)
             st.logs.append(
-                f"💀 Death roll {pct} (<50): Your creature **{st.user_creature['name']}** died and was removed."
+                f"💀 Death roll {pct} (<50): Your creature **{st.user_creature['name']}** died. "
+                f"It remains on the lifetime leaderboard marked as DEAD."
             )
         else:
             st.logs.append(
                 f"🛡️ Death roll {pct} (≥50): Your creature **{st.user_creature['name']}** survived the defeat."
             )
+
+    # Refresh leaderboard promptly after a result
+    asyncio.create_task(update_leaderboard_now(reason="battle_finalize"))
 
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
@@ -569,6 +757,9 @@ async def setup_hook():
     pool = await db_pool()
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
+
+    # Backfill records for existing creatures (if needed)
+    await _backfill_creature_records()
 
     if GUILD_ID:
         bot.tree.copy_global_to(guild=discord.Object(id=int(GUILD_ID)))
@@ -578,15 +769,44 @@ async def setup_hook():
         await bot.tree.sync()
         logger.info("Synced globally")
 
-    for loop in (distribute_cash, distribute_points, regenerate_hp):
+    for loop in (distribute_cash, distribute_points, regenerate_hp, update_leaderboard_periodic):
         if not loop.is_running():
             loop.start()
+
+    # If a leaderboard channel is configured, ensure the message exists and do an initial update.
+    chan_id = await _get_leaderboard_channel_id()
+    if chan_id:
+        await _get_or_create_leaderboard_message(chan_id)
+        await update_leaderboard_now(reason="startup")
+    else:
+        logger.info("No leaderboard channel configured yet. Use /setleaderboardchannel in the desired channel or set LEADERBOARD_CHANNEL_ID env var.")
 
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
 
 # ─── Slash commands ─────────────────────────────────────────
+
+# Admin: set the current channel as the leaderboard channel
+@bot.tree.command(description="(Admin) Set this channel as the live leaderboard channel")
+async def setleaderboardchannel(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute("""
+        INSERT INTO leaderboard_messages(channel_id, message_id)
+        VALUES ($1, NULL)
+        ON CONFLICT (channel_id) DO UPDATE SET message_id = leaderboard_messages.message_id
+    """, inter.channel.id)
+
+    await inter.response.send_message(f"Leaderboard channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
+    await _get_or_create_leaderboard_message(inter.channel.id)
+    await update_leaderboard_now(reason="admin_set_channel")
+
 @bot.tree.command(description="Register as a trainer")
 async def register(inter: discord.Interaction):
     pool = await db_pool()
@@ -622,11 +842,14 @@ async def spawn(inter: discord.Interaction):
     stats = allocate_stats(rarity)
     max_hp = stats["HP"] * 5
 
-    await (await db_pool()).execute(
+    rec = await (await db_pool()).fetchrow(
         "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp)"
-        "VALUES($1,$2,$3,$4,$5,$6)",
+        "VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
         inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp
     )
+    # Ensure a lifetime record row exists
+    await _ensure_record(inter.user.id, rec["id"], meta["name"])
+
     embed = discord.Embed(
         title=f"{meta['name']} ({rarity})",
         description="Descriptors: " + ", ".join(meta["descriptors"])
@@ -635,6 +858,9 @@ async def spawn(inter: discord.Interaction):
         embed.add_field(name=s, value=str(v*5 if s == "HP" else v))
     embed.set_footer(text="Legendary spawn chance: 0.5%")
     await inter.followup.send(embed=embed)
+
+    # Spawns likely won't change top 20, but a quick refresh is cheap
+    asyncio.create_task(update_leaderboard_now(reason="spawn"))
 
 @bot.tree.command(description="List your creatures")
 async def creatures(inter: discord.Interaction):
@@ -658,7 +884,31 @@ async def creatures(inter: discord.Interaction):
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-# NEW: /sell command
+# NEW: /record – personal W/L for a creature (alive or dead)
+@bot.tree.command(description="See your creature's lifetime win/loss record")
+async def record(inter: discord.Interaction, creature_name: str):
+    if not await ensure_registered(inter):
+        return
+    row = await (await db_pool()).fetchrow("""
+        SELECT name, wins, losses, is_dead, died_at
+        FROM creature_records
+        WHERE owner_id=$1 AND name ILIKE $2
+    """, inter.user.id, creature_name)
+    if not row:
+        return await inter.response.send_message("No record found for that creature name.", ephemeral=True)
+
+    total = row["wins"] + row["losses"]
+    wr = (row["wins"] / total * 100.0) if total > 0 else 0.0
+    status = "💀 DEAD" if row["is_dead"] else "ALIVE"
+    died_line = f"\nDied: {row['died_at']:%Y-%m-%d %H:%M %Z}" if row["is_dead"] and row["died_at"] else ""
+    msg = (
+        f"**{row['name']} – Lifetime Record**\n"
+        f"Wins: **{row['wins']}** | Losses: **{row['losses']}** | Winrate: **{wr:.1f}%**\n"
+        f"Status: **{status}**{died_line}"
+    )
+    await inter.response.send_message(msg, ephemeral=True)
+
+# NEW: /sell command (existing, augmented to ensure record row exists)
 @bot.tree.command(description="Sell one of your creatures for cash (price depends on rarity)")
 async def sell(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
@@ -683,6 +933,9 @@ async def sell(inter: discord.Interaction, creature_name: str):
     rarity = c_row["rarity"]
     price = SELL_PRICES.get(rarity, 0)
 
+    # Ensure record exists (keeps lifetime stats even if sold)
+    await _ensure_record(inter.user.id, c_row["id"], c_row["name"])
+
     async with (await db_pool()).acquire() as conn:
         async with conn.transaction():
             await conn.execute("DELETE FROM creatures WHERE id=$1", c_row["id"])
@@ -691,6 +944,7 @@ async def sell(inter: discord.Interaction, creature_name: str):
     await inter.response.send_message(
         f"Sold **{c_row['name']}** ({rarity}) for **{price}** cash.", ephemeral=True
     )
+    asyncio.create_task(update_leaderboard_now(reason="sell"))
 
 # Show glyphs / tier progress for all tiers
 @bot.tree.command(description="Show glyphs and tier progress for a creature")
@@ -949,6 +1203,8 @@ async def upgrade(inter: discord.Interaction):
         return
     level = row["facility_level"]
     current = FACILITY_LEVELS[level]
+    def daily_trainer_points_for(level: int) -> int:
+        return 5 + facility_bonus(level)
     msg = [
         f"**Your Training Facility**",
         f"Level {level}: **{current['name']}**",
@@ -1000,11 +1256,11 @@ async def upgradeyes(inter: discord.Interaction):
     await inter.response.send_message(
         f"✅ Upgraded to **Level {next_level} – {FACILITY_LEVELS[next_level]['name']}**!\n"
         f"Your facility now grants **+{new_bonus} trainer points/day** "
-        f"(total {daily_trainer_points_for(next_level)}/day).",
+        f"(total {5 + new_bonus}/day).",
         ephemeral=True
     )
 
-# /info command (generalized for full gating 1→9)
+# /info command (generalized for full gating 1→9) — unchanged except for notes about leaderboard
 @bot.tree.command(description="Show game overview and command list")
 async def info(inter: discord.Interaction):
     overview = (
@@ -1025,22 +1281,15 @@ async def info(inter: discord.Interaction):
         "  Use `/upgrade` to view & `/upgradeyes` to confirm if you can afford it.\n"
         "• Battles occur in rounds; continue long fights with `/continue`.\n"
         "• Tier payouts scale from 1k/500 (T1 W/L) up to 50k/25k (T9 W/L).\n"
-        "• If you *lose* a battle your creature has a 50% chance to **permanently die**.\n"
+        "• If you *lose* a battle your creature has a 50% chance to **permanently die** (it remains on the leaderboard, marked DEAD).\n"
         "• Trainer points (daily +5 plus facility bonus) are spent to increase stats. HP increases also raise current HP.\n"
         "• **Daily Battle Cap**: Each creature can start at most **2 battles per day** (resets at midnight Europe/London).\n"
         "• **Tier Gates & Glyphs**: New creatures can only fight **Tier 1**. After **5 Tier-1 wins** you unlock **Tier 2** and earn the **Tier 1 Glyph**. After **5 wins at Tier t**, you earn the **Tier t Glyph** and unlock **Tier t+1** (up to Tier 9).\n"
         "\n"
-        "**Selling Creatures**\n"
-        "• Use `/sell <creature_name>` to sell a creature and free a slot.\n"
-        "• Prices by rarity → Common: 1,000 | Uncommon: 2,000 | Rare: 10,000 | Epic: 20,000 | Legendary: 50,000.\n"
-        "\n"
-        "**Combat Rules (current)**\n"
-        "• **Action weights**: Attack 38%, Aggressive 22%, Special 22%, Defend 18%.\n"
-        "• **Aggressive**: +25% damage.\n"
-        "• **Special**: Ignores AR.\n"
-        "• **AR softened**: AR counts at half value against normal/Aggressive attacks.\n"
-        "• **Extra swing**: If attacker SPD ≥ 1.5× defender SPD, attacker swings twice.\n"
-        "• **Sudden Death**: Every 10 rounds, all damage increases by +10% globally (stacks: 10→+10%, 20→+21%, etc.).\n"
+        "**Leaderboards**\n"
+        "• A live Top 20 leaderboard (Wins/Losses) is posted in the configured channel.\n"
+        "• DEAD creatures remain on the leaderboard and are highlighted in red.\n"
+        "• Use `/record <creature_name>` to see a creature's personal lifetime record.\n"
         "\n"
         "**Commands**\n"
         "/register – Create your trainer profile (one-time).\n"
@@ -1056,11 +1305,12 @@ async def info(inter: discord.Interaction):
         "/train <creature_name> <stat> <increase> – Spend trainer points to raise a stat.\n"
         "/upgrade – View your facility and the cost to upgrade.\n"
         "/upgradeyes – Confirm the upgrade and pay the cost.\n"
-        "/info – Show this help & overview.\n"
+        "/record <creature_name> – Show that creature's lifetime W/L (alive or dead).\n"
+        "/setleaderboardchannel – (Admin) Set the current channel as the live leaderboard.\n"
         "\n"
         "**Stats**: HP (health pool*5), AR (defense), PATK, SATK, SPD (initiative; may grant extra swing).\n"
         "**Actions**: Attack, Aggressive (+25% dmg), Special (ignores AR), Defend (halve incoming dmg; double-defend rerolled).\n"
-        "**Death**: On a loss, 50% chance (random < 0.5) your creature is deleted.\n"
+        "**Death**: On a loss, 50% chance (random < 0.5) your creature is deleted (but kept in lifetime records).\n"
         "\n"
         "Good luck, Trainer!"
     )

@@ -128,6 +128,7 @@ async def db_pool() -> asyncpg.Pool:
 
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5
+DAILY_BATTLE_CAP = 2  # <— used for display of remaining battles
 
 SELL_PRICES: Dict[str, int] = {
     "Common": 1_000,
@@ -347,7 +348,7 @@ async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
                 )
                 return True, 1
             current = row["count"]
-            if current >= 2:
+            if current >= DAILY_BATTLE_CAP:
                 return False, current
             new_count = current + 1
             await conn.execute(
@@ -355,6 +356,27 @@ async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
                 creature_id, day, new_count
             )
             return True, new_count
+
+# NEW: bulk fetch remaining battles for /creatures
+async def _battles_left_map(creature_ids: List[int]) -> Dict[int, int]:
+    """
+    Returns {creature_id: remaining} for the given ids for today's Europe/London day.
+    Creatures with no row yet are assumed to have full cap remaining.
+    """
+    result: Dict[int, int] = {cid: DAILY_BATTLE_CAP for cid in creature_ids}
+    if not creature_ids:
+        return result
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+        rows = await conn.fetch(
+            "SELECT creature_id, count FROM battle_caps WHERE day=$1 AND creature_id = ANY($2::int[])",
+            day, creature_ids
+        )
+    for r in rows:
+        left = max(0, DAILY_BATTLE_CAP - int(r["count"]))
+        result[int(r["creature_id"])] = left
+    return result
 
 # ─── Progress / Glyphs helpers ───────────────────────────────
 async def _get_progress(conn: asyncpg.Connection, creature_id: int, tier: int) -> Optional[asyncpg.Record]:
@@ -771,15 +793,21 @@ async def creatures(inter: discord.Interaction):
     )
     if not rows:
         return await inter.response.send_message("You own no creatures.", ephemeral=True)
+
+    # NEW: compute remaining battles for each creature (Europe/London day)
+    ids = [int(r["id"]) for r in rows]
+    left_map = await _battles_left_map(ids)
+
     lines = []
     for idx, r in enumerate(rows, 1):
         st = json.loads(r["stats"])
         desc = ", ".join(r["descriptors"] or []) or "None"
         max_hp = st["HP"] * 5
+        left = left_map.get(int(r["id"]), DAILY_BATTLE_CAP)
         lines.append(
             f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
             f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
-            f"SATK:{st['SATK']} SPD:{st['SPD']}"
+            f"SATK:{st['SATK']} SPD:{st['SPD']} | Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -900,7 +928,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     allowed, count = await _can_start_battle_and_increment(c_row["id"])
     if not allowed:
         return await inter.response.send_message(
-            f"Daily battle cap reached for **{c_row['name']}**: 2/2 used. "
+            f"Daily battle cap reached for **{c_row['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
             "Try again after midnight Europe/London.", ephemeral=True
         )
 
@@ -921,7 +949,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     )
     active_battles[inter.user.id] = st
     st.logs += [
-        f"Battle start! Tier {tier} (+{extra} pts) — Daily battle use for {user_cre['name']}: {count}/2",
+        f"Battle start! Tier {tier} (+{extra} pts) — Daily battle use for {user_cre['name']}: {count}/{DAILY_BATTLE_CAP}",
         f"{user_cre['name']} vs {opp_cre['name']}",
         f"Opponent rarity (tier table) → {rarity}",
         "",
@@ -932,7 +960,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         "",
         "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
         "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
-        "Daily cap: Each creature can start at most 2 battles per Europe/London day.",
+        f"Daily cap: Each creature can start at most {DAILY_BATTLE_CAP} battles per Europe/London day.",
     ]
     max_tier = await _max_unlocked_tier(c_row["id"])
     st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
@@ -1135,7 +1163,7 @@ async def info(inter: discord.Interaction):
         "• Creature cap: max **5 creatures**.\n"
         "• Legendary spawn chance: **0.5%**.\n"
         "• On a loss, 50% chance the creature **dies** (remains on leaderboard as DEAD).\n"
-        "• Daily battle cap: **2 battles / creature / day** (Europe/London).\n"
+        f"• Daily battle cap: **{DAILY_BATTLE_CAP} battles / creature / day** (Europe/London).\n"
         "• Leaderboard shows **Top 20** W/L with Trainer names; DEAD rows appear red.\n"
         "• Use `/record <creature_name>` for lifetime record.\n"
     )

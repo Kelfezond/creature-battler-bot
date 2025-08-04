@@ -52,7 +52,7 @@ else:
 
 # ─── Discord client ──────────────────────────────────────────
 intents = discord.Intents.default()
-# keep message_content if you already have it enabled for your app
+# Keep message content if you already had it enabled for your app
 intents.message_content = True
 # IMPORTANT: do NOT enable members intent; we resolve trainer names via REST/cache
 bot = commands.Bot(command_prefix="/", intents=intents)
@@ -640,7 +640,10 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
         wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
         st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
         if unlocked_now:
-            st.logs.append(f"🏅 **Tier {st.tier} Glyph unlocked!**" + (f" {st.user_creature['name']} may now battle **Tier {st.tier + 1}**." if st.tier < 9 else ""))
+            st.logs.append(
+                f"🏅 **Tier {st.tier} Glyph unlocked!**" +
+                (f" {st.user_creature['name']} may now battle **Tier {st.tier + 1}**." if st.tier < 9 else "")
+            )
 
     if not player_won:
         death_roll = random.random()
@@ -722,8 +725,12 @@ async def register(inter: discord.Interaction):
 
 @bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
 async def spawn(inter: discord.Interaction):
-    row = await ensure_registered(inter);  if not row: return
-    if not await enforce_creature_cap(inter): return
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    can_spawn = await enforce_creature_cap(inter)
+    if not can_spawn:
+        return
     if row["cash"] < 10_000:
         return await inter.response.send_message("Not enough cash.", ephemeral=True)
 
@@ -744,8 +751,10 @@ async def spawn(inter: discord.Interaction):
     )
     await _ensure_record(inter.user.id, rec["id"], meta["name"])
 
-    embed = discord.Embed(title=f"{meta['name']} ({rarity})",
-                          description="Descriptors: " + ", ".join(meta["descriptors"]))
+    embed = discord.Embed(
+        title=f"{meta['name']} ({rarity})",
+        description="Descriptors: " + ", ".join(meta["descriptors"])
+    )
     for s, v in stats.items():
         embed.add_field(name=s, value=str(v*5 if s == "HP" else v))
     embed.set_footer(text="Legendary spawn chance: 0.5%")
@@ -754,7 +763,8 @@ async def spawn(inter: discord.Interaction):
 
 @bot.tree.command(description="List your creatures")
 async def creatures(inter: discord.Interaction):
-    if not await ensure_registered(inter): return
+    if not await ensure_registered(inter):
+        return
     rows = await (await db_pool()).fetch(
         "SELECT id,name,rarity,descriptors,stats,current_hp FROM creatures "
         "WHERE owner_id=$1 ORDER BY id", inter.user.id
@@ -768,13 +778,15 @@ async def creatures(inter: discord.Interaction):
         max_hp = st["HP"] * 5
         lines.append(
             f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
-            f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} SATK:{st['SATK']} SPD:{st['SPD']}"
+            f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
+            f"SATK:{st['SATK']} SPD:{st['SPD']}"
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(description="See your creature's lifetime win/loss record")
 async def record(inter: discord.Interaction, creature_name: str):
-    if not await ensure_registered(inter): return
+    if not await ensure_registered(inter):
+        return
     row = await (await db_pool()).fetchrow("""
         SELECT name, wins, losses, is_dead, died_at
         FROM creature_records
@@ -793,7 +805,9 @@ async def record(inter: discord.Interaction, creature_name: str):
 
 @bot.tree.command(description="Sell one of your creatures for cash (price depends on rarity)")
 async def sell(inter: discord.Interaction, creature_name: str):
-    row = await ensure_registered(inter);  if not row: return
+    row = await ensure_registered(inter)
+    if not row:
+        return
     c_row = await (await db_pool()).fetchrow(
         "SELECT id, name, rarity FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
         inter.user.id, creature_name
@@ -820,7 +834,8 @@ async def sell(inter: discord.Interaction, creature_name: str):
 
 @bot.tree.command(description="Show glyphs and tier progress for a creature")
 async def glyphs(inter: discord.Interaction, creature_name: str):
-    if not await ensure_registered(inter): return
+    if not await ensure_registered(inter):
+        return
     c_row = await (await db_pool()).fetchrow(
         "SELECT id,name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
         inter.user.id, creature_name
@@ -856,10 +871,12 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
     if inter.user.id in active_battles:
         return await inter.response.send_message("You already have an active battle – use /continue.", ephemeral=True)
-    if not await ensure_registered(inter): return
+    if not await ensure_registered(inter):
+        return
 
     c_row = await (await db_pool()).fetchrow(
-        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        "SELECT id,name,stats,current_hp FROM creatures "
+        "WHERE owner_id=$1 AND name ILIKE $2",
         inter.user.id, creature_name
     )
     if not c_row:
@@ -983,7 +1000,8 @@ async def cashadd(inter: discord.Interaction, amount: int):
         return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
     if amount <= 0:
         return await inter.response.send_message("Positive amounts only.", ephemeral=True)
-    if not await ensure_registered(inter): return
+    if not await ensure_registered(inter):
+        return
     await (await db_pool()).execute(
         "UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, inter.user.id
     )
@@ -1049,7 +1067,8 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
 @bot.tree.command(description="Show and confirm upgrading your training facility")
 async def upgrade(inter: discord.Interaction):
     row = await ensure_registered(inter)
-    if not row: return
+    if not row:
+        return
     level = row["facility_level"]
     current = FACILITY_LEVELS[level]
     msg = [
@@ -1078,10 +1097,13 @@ async def upgrade(inter: discord.Interaction):
 @bot.tree.command(description="Confirm upgrading your training facility (costs cash)")
 async def upgradeyes(inter: discord.Interaction):
     row = await ensure_registered(inter)
-    if not row: return
+    if not row:
+        return
     level = row["facility_level"]
     if level >= MAX_FACILITY_LEVEL:
-        return await inter.response.send_message("You're already at the maximum facility level.", ephemeral=True)
+        return await inter.response.send_message(
+            "You're already at the maximum facility level.", ephemeral=True
+        )
 
     next_level = level + 1
     cost = FACILITY_LEVELS[next_level]["cost"]

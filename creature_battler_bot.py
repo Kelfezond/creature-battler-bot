@@ -334,6 +334,20 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
         await inter.followup.send(chunks[0], ephemeral=ephemeral)
     for chunk in chunks[1:]:
         await inter.followup.send(chunk, ephemeral=ephemeral)
+        
+# ─── Helper to reply after we've already deferred ────────────
+async def _reply_ephemeral(inter: discord.Interaction, content: str, *, update: bool = False):
+    """
+    Send or edit an ephemeral follow-up after inter.response.defer().
+    If update=True we edit the original (visible) reply instead.
+    """
+    try:
+        if update and inter.response.is_done():
+            await inter.edit_original_response(content=content)
+        else:
+            await inter.followup.send(content, ephemeral=True)
+    except Exception as e:
+        logger.error("Follow-up reply failed: %s", e)
 
 # ─── Battle cap helper ───────────────────────────────────────
 async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
@@ -924,12 +938,12 @@ async def glyphs(inter: discord.Interaction, creature_name: str):
 
 @bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
 async def battle(inter: discord.Interaction, creature_name: str, tier: int):
+    # Tier check first (sub-millisecond)
     if tier not in TIER_EXTRAS:
         return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
-    if inter.user.id in active_battles:
-        return await inter.response.send_message("You already have an active battle – use /continue.", ephemeral=True)
-    if not await ensure_registered(inter):
-        return
+
+    # Defer immediately — prevents Discord 404s
+    await inter.response.defer(thinking=True)
 
     c_row = await (await db_pool()).fetchrow(
         "SELECT id,name,stats,current_hp FROM creatures "

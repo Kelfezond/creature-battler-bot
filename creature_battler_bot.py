@@ -52,7 +52,9 @@ else:
 
 # ─── Discord client ──────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True          # keep message content
+# Keep message content if you already had it enabled for your app
+intents.message_content = True
+# IMPORTANT: do NOT enable members intent; we resolve trainer names via REST/cache
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # ─── Database helpers ────────────────────────────────────────
@@ -126,7 +128,7 @@ async def db_pool() -> asyncpg.Pool:
 
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5
-DAILY_BATTLE_CAP = 2  # for display of remaining battles
+DAILY_BATTLE_CAP = 2  # <— used for display of remaining battles
 
 SELL_PRICES: Dict[str, int] = {
     "Common": 1_000,
@@ -486,9 +488,8 @@ def simulate_round(st: BattleState):
     st.logs.append("")
 
 # ─── Leaderboard helpers ─────────────────────────────────────
-NAME_W    = 22
+NAME_W = 22
 TRAINER_W = 16
-GLYPH_W   = 5   # NEW – width for highest glyph tier column
 _owner_name_cache: Dict[int, str] = {}
 
 async def _resolve_trainer_name(owner_id: int) -> str:
@@ -593,25 +594,18 @@ async def _get_or_create_leaderboard_message(channel_id: int) -> Optional[discor
 
     return message
 
-def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, int]]) -> str:
+def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str]]) -> str:
     """
-    Input rows: (name, wins, losses, is_dead, trainer_name, best_glyph)
-    Use a diff code block; prefix '-' for dead rows to render red.
+    Input rows: (name, wins, losses, is_dead, trainer_name)
+    Use a diff code block; prefix '-' for dead to render red.
     """
     lines = []
-    header = (
-        f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} "
-        f"{'W':>4} {'L':>4} {'Glyph':>{GLYPH_W}} Status"
-    )
+    header = f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4} Status"
     lines.append("  " + header)
-    for idx, (name, wins, losses, dead, trainer_name, glyph) in enumerate(rows, start=1):
-        name     = (name or "")[:NAME_W]
-        trainer  = (trainer_name or "")[:TRAINER_W]
-        glyph_s  = str(glyph) if glyph > 0 else "-"
-        base_line = (
-            f"{idx:>3}. {name:<{NAME_W}} {trainer:<{TRAINER_W}} "
-            f"{wins:>4} {losses:>4} {glyph_s:>{GLYPH_W}} {'💀 DEAD' if dead else ''}"
-        )
+    for idx, (name, wins, losses, dead, trainer_name) in enumerate(rows, start=1):
+        name = (name or "")[:NAME_W]
+        trainer = (trainer_name or "")[:TRAINER_W]
+        base_line = f"{idx:>3}. {name:<{NAME_W}} {trainer:<{TRAINER_W}} {wins:>4} {losses:>4} {'💀 DEAD' if dead else ''}"
         lines.append(("- " if dead else "  ") + base_line)
     return "```diff\n" + "\n".join(lines) + "\n```"
 
@@ -625,39 +619,21 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
 
     pool = await db_pool()
     rows = await pool.fetch("""
-        SELECT r.creature_id,
-               r.name,
-               r.wins,
-               r.losses,
-               r.is_dead,
-               r.owner_id,
-               COALESCE(MAX(CASE WHEN p.glyph_unlocked THEN p.tier END), 0) AS best_glyph
-        FROM creature_records  r
-        LEFT JOIN creature_progress p  ON p.creature_id = r.creature_id
-        GROUP BY r.creature_id, r.name, r.wins, r.losses, r.is_dead, r.owner_id
-        ORDER BY r.wins DESC, r.losses ASC, r.name ASC
+        SELECT name, wins, losses, is_dead, owner_id
+        FROM creature_records
+        ORDER BY wins DESC, losses ASC, name ASC
         LIMIT 20
     """)
     trainer_names = await asyncio.gather(*[
         _resolve_trainer_name(r["owner_id"]) for r in rows
     ])
-    formatted: List[Tuple[str, int, int, bool, str, int]] = [
-        (
-            r["name"],
-            r["wins"],
-            r["losses"],
-            r["is_dead"],
-            trainer_names[i],
-            r["best_glyph"],
-        )
+    formatted: List[Tuple[str, int, int, bool, str]] = [
+        (r["name"], r["wins"], r["losses"], r["is_dead"], trainer_names[i])
         for i, r in enumerate(rows)
     ]
 
     updated_ts = int(time.time())
-    title = (
-        "**Creature Leaderboard — Top 20 (Wins / Losses / Glyph)**\n"
-        f"Updated: <t:{updated_ts}:R>\n"
-    )
+    title = f"**Creature Leaderboard — Top 20 (Wins / Losses)**\nUpdated: <t:{updated_ts}:R>\n"
     content = title + _format_leaderboard_lines(formatted)
     try:
         await message.edit(content=content)

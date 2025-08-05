@@ -736,15 +736,6 @@ async def on_ready():
     logger.info("Logged in as %s", bot.user)
 
 # ─── Slash commands ─────────────────────────────────────────
-# (all command implementations remain unchanged from here on)
-# … (rest of file stays exactly as before) …
-
-# ─── Launch ──────────────────────────────────────────────────
-if __name__ == "__main__":
-    bot.run(TOKEN)
-
-
-# ─── Slash commands ─────────────────────────────────────────
 
 @bot.tree.command(description="(Admin) Set this channel as the live leaderboard channel")
 async def setleaderboardchannel(inter: discord.Interaction):

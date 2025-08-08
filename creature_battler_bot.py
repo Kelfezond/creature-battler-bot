@@ -617,8 +617,8 @@ def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optiona
             f"{'💀 DEAD' if dead else ''}"
         )
         lines.append(("- " if dead else "  ") + base_line)
-    return "```diff
-
+    return "```diff\n+ Encyclopedia channel set successfully.\n```"
+    
 # ─── Encyclopedia helpers ────────────────────────────────────
 async def _get_encyclopedia_channel_id() -> Optional[int]:
     pool = await db_pool()

@@ -600,12 +600,13 @@ async def _get_or_create_leaderboard_message(channel_id: int) -> Optional[discor
     return message
 
 # UPDATED: include glyph column
+
 def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optional[int]]]) -> str:
     """
     Input rows: (name, wins, losses, is_dead, trainer_name, max_glyph_tier)
     Use a diff code block; prefix '-' for dead to render red.
     """
-    lines = []
+    lines: List[str] = []
     header = f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4} {'Glyph':>5} Status"
     lines.append("  " + header)
     for idx, (name, wins, losses, dead, trainer_name, glyph_tier) in enumerate(rows, start=1):
@@ -617,9 +618,7 @@ def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optiona
             f"{'💀 DEAD' if dead else ''}"
         )
         lines.append(("- " if dead else "  ") + base_line)
-return "```diff\n+ Encyclopedia channel set successfully.\n```"
-
-    
+    return "```diff\n" + "\n".join(lines) + "\n```"
 # ─── Encyclopedia helpers ────────────────────────────────────
 async def _get_encyclopedia_channel_id() -> Optional[int]:
     pool = await db_pool()
@@ -714,7 +713,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         image_url = None
 
     return bio_text, image_url
-\n" + "\n".join(lines) + "\n```"
+
 
 async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
     channel_id = await _get_leaderboard_channel_id()
@@ -892,8 +891,7 @@ async def setleaderboardchannel(inter: discord.Interaction):
 
     await inter.response.send_message(f"Leaderboard channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
     await _get_or_create_leaderboard_message(inter.channel.id)
-    await update_leaderboard_now
-
+    await update_leaderboard_now(reason="admin_set_channel")
 @bot.tree.command(description="(Admin) Set this channel as the Encyclopedia channel")
 async def setencyclopediachannel(inter: discord.Interaction):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -909,7 +907,6 @@ async def setencyclopediachannel(inter: discord.Interaction):
     """, inter.channel.id)
 
     await inter.response.send_message(f"Encyclopedia channel set to {inter.channel.mention}.", ephemeral=True)
-(reason="admin_set_channel")
 
 @bot.tree.command(description="Register as a trainer")
 async def register(inter: discord.Interaction):

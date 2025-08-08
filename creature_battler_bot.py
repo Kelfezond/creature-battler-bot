@@ -1201,29 +1201,45 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     max_tier = await _max_unlocked_tier(c_row["id"])
     st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
 
-    for _ in range(10):
-        if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
-        simulate_round(st)
+    
+# Public start (concise)
+start_public = (
+    f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\n"
+    f"Opponent rarity: **{rarity}**"
+)
+await inter.channel.send(start_public)
 
-    await (await db_pool()).execute(
-        "UPDATE creatures SET current_hp=$1 WHERE id=$2",
-        max(st.user_current_hp, 0), st.creature_id
-    )
+# Drip-feed rounds privately
+st.next_log_idx = len(st.logs)
+for _ in range(10):
+    if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+    simulate_round(st)
+    new_logs = st.logs[st.next_log_idx:]
+    st.next_log_idx = len(st.logs)
+    if new_logs:
+        await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
+        await asyncio.sleep(0.2)
 
-    if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-        winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
-        st.logs.append(f"Winner: {winner}")
-        summary = await finalize_battle(inter, st)
-        active_battles.pop(inter.user.id, None)
-        # Post public summary
-        trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
-        # First send private battle log (ephemeral), then post the public result to avoid ordering issues.
-        await send_chunks(inter, "\n".join(st.logs), ephemeral=True)
+await (await db_pool()).execute(
+    "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+    max(st.user_current_hp, 0), st.creature_id
+)
+
+if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+    winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
+    st.logs.append(f"Winner: {winner}")
+    summary = await finalize_battle(inter, st)
+    active_battles.pop(inter.user.id, None)
+    trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
+    pending = st.logs[st.next_log_idx:]
+    st.next_log_idx = len(st.logs)
+    if pending:
+        await send_chunks(inter, "\n".join(pending), ephemeral=True)
         await asyncio.sleep(0.35)
-        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
-    else:
-        st.logs.append("Use /continue to proceed.")
-        await send_chunks(inter, "\n".join(st.logs), ephemeral=True)
+    await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
+else:
+    st.logs.append("Use /continue to proceed.")
+    await send_chunks(inter, "\n".join(st.logs[st.next_log_idx:]), ephemeral=True)
     st.next_log_idx = len(st.logs)
 
 @bot.tree.command(name="continue", description="Continue your current battle")
@@ -1233,35 +1249,41 @@ async def continue_battle(inter: discord.Interaction):
         return await inter.response.send_message("No active battle.", ephemeral=True)
 
     await inter.response.defer(thinking=True)
-    for _ in range(10):
-        if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
-        simulate_round(st)
-
-    await (await db_pool()).execute(
-        "UPDATE creatures SET current_hp=$1 WHERE id=$2",
-        max(st.user_current_hp, 0), st.creature_id
-    )
-
-    battle_ended = st.user_current_hp <= 0 or st.opp_current_hp <= 0
-    if battle_ended:
-        winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
-        st.logs.append(f"Winner: {winner}")
-        summary = await finalize_battle(inter, st)
-        active_battles.pop(inter.user.id, None)
-        # Post public summary
-        trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
-        # First send private end-of-battle log (ephemeral), then post public result to avoid race.
-        new_logs = st.logs[st.next_log_idx:]
-        st.next_log_idx = len(st.logs)
-        await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
-        await asyncio.sleep(0.35)
-        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
-        return
-
-    st.logs.append("Use /continue to proceed.")
+    
+st.next_log_idx = len(st.logs)
+for _ in range(10):
+    if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+    simulate_round(st)
     new_logs = st.logs[st.next_log_idx:]
     st.next_log_idx = len(st.logs)
-    await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
+    if new_logs:
+        await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
+        await asyncio.sleep(0.2)
+
+await (await db_pool()).execute(
+    "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+    max(st.user_current_hp, 0), st.creature_id
+)
+
+battle_ended = st.user_current_hp <= 0 or st.opp_current_hp <= 0
+if battle_ended:
+    winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
+    st.logs.append(f"Winner: {winner}")
+    summary = await finalize_battle(inter, st)
+    active_battles.pop(inter.user.id, None)
+    trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
+    pending = st.logs[st.next_log_idx:]
+    st.next_log_idx = len(st.logs)
+    if pending:
+        await send_chunks(inter, "\n".join(pending), ephemeral=True)
+        await asyncio.sleep(0.35)
+    await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
+    return
+
+st.logs.append("Use /continue to proceed.")
+new_logs = st.logs[st.next_log_idx:]
+st.next_log_idx = len(st.logs)
+await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
 
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):

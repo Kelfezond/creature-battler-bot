@@ -1217,10 +1217,10 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         active_battles.pop(inter.user.id, None)
         # Post public summary
         trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
+        # First send private battle log (ephemeral), then post the public result to avoid ordering issues.
+        await send_chunks(inter, "\n".join(st.logs), ephemeral=True)
+        await asyncio.sleep(0.35)
         await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
-    else:
-        st.logs.append("Use /continue to proceed.")
-    await send_chunks(inter, "\n".join(st.logs), ephemeral=True)
     st.next_log_idx = len(st.logs)
 
 @bot.tree.command(name="continue", description="Continue your current battle")
@@ -1247,10 +1247,12 @@ async def continue_battle(inter: discord.Interaction):
         active_battles.pop(inter.user.id, None)
         # Post public summary
         trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
-        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
+        # First send private end-of-battle log (ephemeral), then post public result to avoid race.
         new_logs = st.logs[st.next_log_idx:]
         st.next_log_idx = len(st.logs)
         await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
+        await asyncio.sleep(0.35)
+        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
         return
 
     st.logs.append("Use /continue to proceed.")

@@ -1207,7 +1207,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\n"
         f"Opponent rarity: **{rarity}**"
     )
-    await inter.channel.send(start_public)
+    await inter.followup.send(start_public, ephemeral=False)
 
     # Drip-feed rounds privately
     st.next_log_idx = len(st.logs)
@@ -1236,7 +1236,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         if pending:
             await send_chunks(inter, "\n".join(pending), ephemeral=True)
             await asyncio.sleep(0.35)
-        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
+        await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
     else:
         st.logs.append("Use /continue to proceed.")
         await send_chunks(inter, "\n".join(st.logs[st.next_log_idx:]), ephemeral=True)
@@ -1278,7 +1278,7 @@ async def continue_battle(inter: discord.Interaction):
         if pending:
             await send_chunks(inter, "\n".join(pending), ephemeral=True)
             await asyncio.sleep(0.35)
-        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
+        await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
         return
 
     st.logs.append("Use /continue to proceed.")

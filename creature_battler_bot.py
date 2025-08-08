@@ -284,6 +284,19 @@ async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Reco
     if not row:
         await inter.response.send_message("Use /register first.", ephemeral=True)
         return None
+    # Opportunistically update stored display name to avoid REST lookups later
+    try:
+        current_name = (
+            getattr(inter.user, 'global_name', None)
+            or getattr(inter.user, 'display_name', None)
+            or inter.user.name
+        )
+        await (await db_pool()).execute(
+            "UPDATE trainers SET display_name=$1 WHERE user_id=$2 AND COALESCE(display_name,'') <> $1",
+            current_name, inter.user.id
+        )
+    except Exception:
+        pass
     return row
 
 async def get_creature_count(user_id: int) -> int:
@@ -500,6 +513,19 @@ def simulate_round(st: BattleState):
 NAME_W = 22
 TRAINER_W = 16
 _owner_name_cache: Dict[int, str] = {}
+
+async def _resolve_trainer_name_from_db(user_id: int) -> Optional[str]:
+    """Get trainer's stored display name from DB (preferred) or None.
+    This avoids hitting the Discord REST API and rate limits.
+    """
+    try:
+        return await (await db_pool()).fetchval(
+            "SELECT COALESCE(display_name, user_id::text) FROM trainers WHERE user_id=$1",
+            user_id,
+        )
+    except Exception:
+        return None
+
 
 async def _resolve_trainer_name(owner_id: int) -> str:
     """Resolve trainer display name without privileged member intent."""
@@ -729,13 +755,14 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
 
     pool = await db_pool()
     # UPDATED: pull highest obtained glyph tier for each creature via subquery
-    rows = await pool.fetch("""
+    rows = await pool.fetch(
+    """
         SELECT
             r.name,
             r.wins,
             r.losses,
             r.is_dead,
-            r.owner_id,
+            COALESCE(t.display_name, r.owner_id::text) AS trainer_name,
             COALESCE((
                 SELECT MAX(cp.tier)
                 FROM creature_progress cp
@@ -743,16 +770,15 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
                   AND cp.glyph_unlocked = TRUE
             ), 0) AS max_glyph_tier
         FROM creature_records r
+        LEFT JOIN trainers t ON t.user_id = r.owner_id
         ORDER BY r.wins DESC, r.losses ASC, r.name ASC
         LIMIT 20
-    """)
-    trainer_names = await asyncio.gather(*[
-        _resolve_trainer_name(r["owner_id"]) for r in rows
-    ])
-    formatted: List[Tuple[str, int, int, bool, str, int]] = [
-        (r["name"], r["wins"], r["losses"], r["is_dead"], trainer_names[i], r["max_glyph_tier"])
-        for i, r in enumerate(rows)
-    ]
+    """
+)
+formatted: List[Tuple[str, int, int, bool, str, int]] = [
+    (r["name"], r["wins"], r["losses"], r["is_dead"], r["trainer_name"], r["max_glyph_tier"]) 
+    for r in rows
+]
 
     updated_ts = int(time.time())
     title = (

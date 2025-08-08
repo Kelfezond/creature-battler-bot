@@ -67,9 +67,6 @@ CREATE TABLE IF NOT EXISTS trainers (
   facility_level INT DEFAULT 1
 );
 
-
-ALTER TABLE trainers
-  ADD COLUMN IF NOT EXISTS display_name TEXT;
 CREATE TABLE IF NOT EXISTS creatures (
   id SERIAL PRIMARY KEY,
   owner_id BIGINT NOT NULL,
@@ -772,6 +769,10 @@ async def update_leaderboard_periodic():
 # ─── Battle finalize (records + leaderboard) ─────────────────
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
     player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
+    wins = None
+    unlocked_now = False
+    gained_stat = None
+    died = False
     win_cash, loss_cash = TIER_PAYOUTS[st.tier]
     payout = win_cash if player_won else loss_cash
     pool = await db_pool()
@@ -828,6 +829,7 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
                 st.logs.append(
                     f"✨ **{st.user_creature['name']}** gained **+1 {gained_stat}** from the victory!"
                 )
+                gained_stat = gained_stat
         except Exception as e:
             logger.error("Failed to apply victory stat gain: %s", e)
         # ── End NEW ─────────────────────────────────────────────────────────────
@@ -837,12 +839,37 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
         pct = int(death_roll * 100)
         if death_roll < 0.5:
             await _record_death(st.user_id, st.user_creature["name"])
+            died = True
             await pool.execute("DELETE FROM creatures WHERE id=$1", st.creature_id)
             st.logs.append(f"💀 Death roll {pct} (<50): **{st.user_creature['name']}** died (kept on leaderboard).")
         else:
             st.logs.append(f"🛡️ Death roll {pct} (≥50): **{st.user_creature['name']}** survived the defeat.")
 
     asyncio.create_task(update_leaderboard_now(reason="battle_finalize"))
+
+    return {"player_won": player_won, "payout": payout, "wins": wins, "unlocked_now": unlocked_now, "gained_stat": gained_stat, "died": died}
+
+
+# ─── Public battle summary helper ───────────────────────────
+def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: str) -> str:
+    winner = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
+    loser = st.opp_creature["name"] if summary.get("player_won") else st.user_creature["name"]
+    lines = [
+        f"**Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs **{st.opp_creature['name']}** (Tier {st.tier})",
+        f"🏅 Winner: **{winner}**",
+        f"💰 Payout: **+{summary.get('payout', 0)}** cash to {trainer_name}",
+    ]
+    wins = summary.get("wins")
+    if wins is not None:
+        lines.append(f"📈 Progress: Tier {st.tier} wins = {wins}/5")
+    if summary.get("unlocked_now"):
+        lines.append(f"🔓 **Tier {st.tier+1} unlocked!**")
+    gained = summary.get("gained_stat")
+    if gained:
+        lines.append(f"✨ Victory bonus: **+1 {gained}** to {st.user_creature['name']}")
+    if summary.get("died"):
+        lines.append(f"💀 {st.user_creature['name']} died and was removed from your stable (kept on leaderboard).")
+    return "\n".join(lines)
 
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
@@ -1157,11 +1184,14 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
         winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
         st.logs.append(f"Winner: {winner}")
-        await finalize_battle(inter, st)
+        summary = await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)
+        # Post public summary
+        trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
+        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
     else:
         st.logs.append("Use /continue to proceed.")
-    await send_chunks(inter, "\n".join(st.logs))
+    await send_chunks(inter, "\n".join(st.logs), ephemeral=True)
     st.next_log_idx = len(st.logs)
 
 @bot.tree.command(name="continue", description="Continue your current battle")
@@ -1184,17 +1214,20 @@ async def continue_battle(inter: discord.Interaction):
     if battle_ended:
         winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
         st.logs.append(f"Winner: {winner}")
-        await finalize_battle(inter, st)
+        summary = await finalize_battle(inter, st)
         active_battles.pop(inter.user.id, None)
+        # Post public summary
+        trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
+        await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
         new_logs = st.logs[st.next_log_idx:]
         st.next_log_idx = len(st.logs)
-        await send_chunks(inter, "\n".join(new_logs))
+        await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
         return
 
     st.logs.append("Use /continue to proceed.")
     new_logs = st.logs[st.next_log_idx:]
     st.next_log_idx = len(st.logs)
-    await send_chunks(inter, "\n".join(new_logs))
+    await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
 
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):

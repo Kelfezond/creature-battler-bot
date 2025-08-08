@@ -353,6 +353,44 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
     for chunk in chunks[1:]:
         await inter.followup.send(chunk, ephemeral=ephemeral)
 
+
+# ─── Command listing helper ─────────────────────────────────
+def _build_command_list(bot: commands.Bot) -> str:
+    """
+    Returns a formatted string listing all slash commands and their parameters.
+    Automatically paginated later by send_chunks().
+    """
+    try:
+        cmds = list(bot.tree.get_commands())
+    except Exception:
+        cmds = []
+    # Sort by name for stable output
+    cmds.sort(key=lambda c: getattr(c, "name", "").lower())
+    lines = ["**Commands**"]
+    for c in cmds:
+        name = getattr(c, "name", None) or "<unknown>"
+        desc = getattr(c, "description", "") or ""
+        # Collect parameter names (with ? for optional) if available
+        params = []
+        try:
+            for p in getattr(c, "parameters", []):
+                # discord.app_commands.Parameter has attributes: name, required
+                pname = getattr(p, "name", None) or getattr(p, "display_name", None) or "arg"
+                preq = getattr(p, "required", True)
+                params.append(f"<{pname}>" if preq else f"[{pname}]")
+        except Exception:
+            pass
+        sig = (" " + " ".join(params)) if params else ""
+        # Keep each command as a single concise bullet line
+        line = f"/{name}{sig} — {desc}".strip()
+        # Discord hard cap ~2000 chars per message; send_chunks handles chunking,
+        # but keep individual lines under ~180 chars to avoid split mid-line.
+        if len(line) > 180:
+            line = line[:177] + "…"
+        lines.append(line)
+    return "\n".join(lines) or "No commands registered."
+
+
 # ─── Battle cap helper ───────────────────────────────────────
 async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
     pool = await db_pool()
@@ -1484,21 +1522,21 @@ async def enc(inter: discord.Interaction, creature_name: str):
     await inter.followup.send(f"Added **{name}** to the Encyclopedia: {msg.jump_url}", ephemeral=True)
 
 
-@bot.tree.command(description="Show game overview and command list")
-async def info(inter: discord.Interaction):
-    overview = (
-        "**Game Overview**\n"
-        "Collect creatures, train their stats, and battle tiered opponents.\n"
-        "• Passive income: 60 cash/hour.\n"
-        "• Creature cap: max **5 creatures**.\n"
-        "• Legendary spawn chance: **0.5%**.\n"
-        "• On a loss, 50% chance the creature **dies** (remains on leaderboard as DEAD).\n"
-        f"• Daily battle cap: **{DAILY_BATTLE_CAP} battles / creature / day** (Europe/London).\n"
-        "• Leaderboard shows **Top 20** W/L with Trainer names and **Highest Glyph**; DEAD rows appear red.\n"
-        "• Use `/record <creature_name>` for lifetime record.\n"
-    )
-    await send_chunks(inter, overview, ephemeral=True)
 
-# ─── Launch ──────────────────────────────────────────────────
-if __name__ == "__main__":
+@bot.tree.command(description="Show all commands and what they do")
+async def info(inter: discord.Interaction):
+    # Overview kept brief; the main goal is the dynamic command list.
+    caps_line = "• Passive income: 60 cash/hour | Creature cap: " + str(MAX_CREATURES) + " | Daily cap: " + str(DAILY_BATTLE_CAP) + "/creature/day (Europe/London)."
+    header = (
+        "**Game Overview**\n"
+        "Collect, train, and battle creatures. Progress through tiers to unlock glyphs.\n"
+        + caps_line + "\n"
+    )
+    try:
+        cmd_text = _build_command_list(bot)
+    except Exception:
+        cmd_text = "Failed to build command list."
+    content = header + "\n" + cmd_text
+    await send_chunks(inter, content, ephemeral=True)
+
     bot.run(TOKEN)

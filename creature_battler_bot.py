@@ -1539,4 +1539,11 @@ async def info(inter: discord.Interaction):
     content = header + "\n" + cmd_text
     await send_chunks(inter, content, ephemeral=True)
 
+try:
+    synced = await bot.tree.sync()
+    logger.info("Slash commands synced (%d).", len(synced))
+except Exception as e:
+    logger.exception("Failed to sync commands: %s", e)
+
+if __name__ == "__main__":
     bot.run(TOKEN)

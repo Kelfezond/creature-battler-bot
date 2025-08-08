@@ -696,8 +696,8 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         traits_str = ", ".join(traits) if traits else ""
         img_prompt = (
             f"{cre_name}, {rarity} rarity, {traits_str}. "
-            "Ultra-detailed digital painting in the style of Warcraft Cinematic CGI, dramatic lighting, "
-            "heroic fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
+            "Ultra-detailed digital image in the style of Warcraft Cinematic CGI, dramatic lighting, "
+            "fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,

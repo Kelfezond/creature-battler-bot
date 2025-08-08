@@ -83,6 +83,10 @@ ALTER TABLE creatures
 ALTER TABLE trainers
   ADD COLUMN IF NOT EXISTS facility_level INT DEFAULT 1;
 
+-- store display names for leaderboards
+ALTER TABLE trainers
+  ADD COLUMN IF NOT EXISTS display_name TEXT;
+
 -- Per-creature/day battle cap (resets at midnight Europe/London)
 CREATE TABLE IF NOT EXISTS battle_caps (
   creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
@@ -944,8 +948,8 @@ async def register(inter: discord.Interaction):
     if await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", inter.user.id):
         return await inter.response.send_message("Already registered!", ephemeral=True)
     await pool.execute(
-        "INSERT INTO trainers(user_id, cash, trainer_points, facility_level) VALUES($1,$2,$3,$4)",
-        inter.user.id, 20000, 5, 1
+        "INSERT INTO trainers(user_id, cash, trainer_points, facility_level, display_name) VALUES($1,$2,$3,$4,$5)",
+        inter.user.id, 20000, 5, 1, (getattr(inter.user, 'global_name', None) or getattr(inter.user, 'display_name', None) or inter.user.name)
     )
     await inter.response.send_message(
         "Profile created! You received 20 000 cash and 5 trainer points.",

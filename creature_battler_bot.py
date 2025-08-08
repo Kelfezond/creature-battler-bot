@@ -119,6 +119,11 @@ CREATE TABLE IF NOT EXISTS leaderboard_messages (
   channel_id BIGINT PRIMARY KEY,
   message_id BIGINT
 );
+
+-- Encyclopedia target channel
+CREATE TABLE IF NOT EXISTS encyclopedia_channel (
+  channel_id BIGINT PRIMARY KEY
+);
 """
 
 async def db_pool() -> asyncpg.Pool:
@@ -612,7 +617,103 @@ def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optiona
             f"{'💀 DEAD' if dead else ''}"
         )
         lines.append(("- " if dead else "  ") + base_line)
-    return "```diff\n" + "\n".join(lines) + "\n```"
+    return "```diff
+
+# ─── Encyclopedia helpers ────────────────────────────────────
+async def _get_encyclopedia_channel_id() -> Optional[int]:
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM encyclopedia_channel LIMIT 1")
+    if chan:
+        try:
+            return int(chan)
+        except Exception:
+            return None
+    return None
+
+async def _ensure_encyclopedia_channel(channel_id: int) -> Optional[discord.TextChannel]:
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel
+        return None
+    except Exception as e:
+        logger.error("Failed to fetch encyclopedia channel %s: %s", channel_id, e)
+        return None
+
+def _format_stats_block(stats: Dict[str, int]) -> str:
+    # Show HP as both points and max HP (×5)
+    max_hp = stats.get("HP", 0) * 5
+    return (
+        f"HP: {stats.get('HP', 0)} (Max {max_hp}) | "
+        f"AR: {stats.get('AR', 0)} | "
+        f"PATK: {stats.get('PATK', 0)} | "
+        f"SATK: {stats.get('SATK', 0)} | "
+        f"SPD: {stats.get('SPD', 0)}"
+    )
+
+async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[str], stats: Dict[str, int]) -> tuple[str, Optional[str]]:
+    """
+    Returns (bio_text, image_url or None)
+    Uses OpenAI for both text (ChatCompletion) and image (Images.create).
+    """
+    # 1) Bio text
+    try:
+        sys_prompt = (
+            "You are writing a concise creature entry for an arena-battler encyclopedia. "
+            "These creatures are NOT from natural Warcraft lore—they are laboratory-bred specifically for fighting arenas. "
+            "Tone: punchy, evocative, 3–6 sentences max. "
+            "Include a hint of distinctive abilities implied by the stats/traits. Do not mention that you are an AI."
+        )
+        user_prompt = (
+            f"Name: {cre_name}\n"
+            f"Rarity: {rarity}\n"
+            f"Traits/Descriptors: {', '.join(traits) if traits else 'None'}\n"
+            f"Stats (HP, AR, PATK, SATK, SPD): {stats}\n\n"
+            "Write the bio now."
+        )
+
+        # Keep compatible with your existing OpenAI usage pattern
+        resp = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.8,
+                max_tokens=220,
+            )
+        )
+        bio_text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error("OpenAI bio error: %s", e)
+        bio_text = "A lab-forged arena combatant. (Bio generation failed.)"
+
+    # 2) Image (Warcraft Cinematic CGI style)
+    image_url = None
+    try:
+        traits_str = ", ".join(traits) if traits else ""
+        img_prompt = (
+            f"{cre_name}, {rarity} rarity, {traits_str}. "
+            "Ultra-detailed digital painting in the style of Warcraft Cinematic CGI, dramatic lighting, "
+            "heroic fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
+        )
+        img_resp = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: openai.Image.create(
+                prompt=img_prompt,
+                n=1,
+                size="1024x1024"
+            )
+        )
+        image_url = img_resp["data"][0]["url"]
+    except Exception as e:
+        logger.error("OpenAI image error: %s", e)
+        image_url = None
+
+    return bio_text, image_url
+\n" + "\n".join(lines) + "\n```"
 
 async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
     channel_id = await _get_leaderboard_channel_id()
@@ -790,7 +891,24 @@ async def setleaderboardchannel(inter: discord.Interaction):
 
     await inter.response.send_message(f"Leaderboard channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
     await _get_or_create_leaderboard_message(inter.channel.id)
-    await update_leaderboard_now(reason="admin_set_channel")
+    await update_leaderboard_now
+
+@bot.tree.command(description="(Admin) Set this channel as the Encyclopedia channel")
+async def setencyclopediachannel(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute("""
+        INSERT INTO encyclopedia_channel(channel_id)
+        VALUES ($1)
+        ON CONFLICT (channel_id) DO UPDATE SET channel_id = EXCLUDED.channel_id
+    """, inter.channel.id)
+
+    await inter.response.send_message(f"Encyclopedia channel set to {inter.channel.mention}.", ephemeral=True)
+(reason="admin_set_channel")
 
 @bot.tree.command(description="Register as a trainer")
 async def register(inter: discord.Interaction):
@@ -1214,6 +1332,65 @@ async def upgradeyes(inter: discord.Interaction):
         f"(total {daily_trainer_points_for(next_level)}/day).",
         ephemeral=True
     )
+
+
+
+@bot.tree.command(description="Add one of your creatures to the Encyclopedia")
+async def enc(inter: discord.Interaction, creature_name: str):
+    # Ensure player exists
+    if not await ensure_registered(inter):
+        return
+
+    # Find creature by owner/name (case-insensitive)
+    c_row = await (await db_pool()).fetchrow(
+        "SELECT id, name, rarity, descriptors, stats, current_hp FROM creatures "
+        "WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id, creature_name
+    )
+    if not c_row:
+        return await inter.response.send_message("Creature not found.", ephemeral=True)
+
+    # Encyclopedia channel
+    enc_chan_id = await _get_encyclopedia_channel_id()
+    if not enc_chan_id:
+        return await inter.response.send_message(
+            "No Encyclopedia channel configured. Ask an admin to run `/setencyclopediachannel` in the target channel.",
+            ephemeral=True
+        )
+    channel = await _ensure_encyclopedia_channel(enc_chan_id)
+    if not channel:
+        return await inter.response.send_message("Failed to resolve Encyclopedia channel.", ephemeral=True)
+
+    await inter.response.defer(thinking=True, ephemeral=True)
+
+    # Prepare data
+    name = c_row["name"]
+    rarity = c_row["rarity"]
+    traits = c_row["descriptors"] or []
+    stats = json.loads(c_row["stats"])
+    stats_block = _format_stats_block(stats)
+
+    # GPT bio + image
+    bio, image_url = await _gpt_generate_bio_and_image(name, rarity, traits, stats)
+
+    # Build embed
+    embed = discord.Embed(
+        title=f"{name} — {rarity}",
+        description=bio
+    )
+    embed.add_field(name="Traits", value=", ".join(traits) if traits else "None", inline=False)
+    embed.add_field(name="Stats", value=stats_block, inline=False)
+    if image_url:
+        embed.set_image(url=image_url)
+
+    try:
+        msg = await channel.send(embed=embed)
+    except Exception as e:
+        logger.error("Failed to post encyclopedia entry: %s", e)
+        return await inter.followup.send("Failed to post to the Encyclopedia channel.", ephemeral=True)
+
+    await inter.followup.send(f"Added **{name}** to the Encyclopedia: {msg.jump_url}", ephemeral=True)
+
 
 @bot.tree.command(description="Show game overview and command list")
 async def info(inter: discord.Interaction):

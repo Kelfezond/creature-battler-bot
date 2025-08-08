@@ -775,19 +775,18 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
         LIMIT 20
     """
 )
-formatted: List[Tuple[str, int, int, bool, str, int]] = [
-    (r["name"], r["wins"], r["losses"], r["is_dead"], r["trainer_name"], r["max_glyph_tier"]) 
-    for r in rows
-]
-
+    formatted: List[Tuple[str, int, int, bool, str, int]] = [
+        (r["name"], r["wins"], r["losses"], r["is_dead"], r["trainer_name"], r["max_glyph_tier"]) 
+        for r in rows
+    ]
     updated_ts = int(time.time())
     title = (
-    f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph)**\n"
-    f"Updated: <t:{updated_ts}:R>\n"
+        f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph)**\n"
+        f"Updated: <t:{updated_ts}:R>\n"
     )
     content = title + _format_leaderboard_lines(formatted)
     try:
-    await message.edit(content=content)
+        await message.edit(content=content)
         logger.info("Leaderboard updated (%s).", reason)
     except Exception as e:
         logger.error("Failed to edit leaderboard message: %s", e)

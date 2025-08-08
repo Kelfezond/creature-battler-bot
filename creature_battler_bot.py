@@ -594,18 +594,23 @@ async def _get_or_create_leaderboard_message(channel_id: int) -> Optional[discor
 
     return message
 
-def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str]]) -> str:
+# UPDATED: include glyph column
+def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optional[int]]]) -> str:
     """
-    Input rows: (name, wins, losses, is_dead, trainer_name)
+    Input rows: (name, wins, losses, is_dead, trainer_name, max_glyph_tier)
     Use a diff code block; prefix '-' for dead to render red.
     """
     lines = []
-    header = f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4} Status"
+    header = f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4} {'Glyph':>5} Status"
     lines.append("  " + header)
-    for idx, (name, wins, losses, dead, trainer_name) in enumerate(rows, start=1):
+    for idx, (name, wins, losses, dead, trainer_name, glyph_tier) in enumerate(rows, start=1):
         name = (name or "")[:NAME_W]
         trainer = (trainer_name or "")[:TRAINER_W]
-        base_line = f"{idx:>3}. {name:<{NAME_W}} {trainer:<{TRAINER_W}} {wins:>4} {losses:>4} {'💀 DEAD' if dead else ''}"
+        glyph_display = "-" if not glyph_tier or glyph_tier <= 0 else str(glyph_tier)
+        base_line = (
+            f"{idx:>3}. {name:<{NAME_W}} {trainer:<{TRAINER_W}} {wins:>4} {losses:>4} {glyph_display:>5} "
+            f"{'💀 DEAD' if dead else ''}"
+        )
         lines.append(("- " if dead else "  ") + base_line)
     return "```diff\n" + "\n".join(lines) + "\n```"
 
@@ -618,22 +623,37 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
         return
 
     pool = await db_pool()
+    # UPDATED: pull highest obtained glyph tier for each creature via subquery
     rows = await pool.fetch("""
-        SELECT name, wins, losses, is_dead, owner_id
-        FROM creature_records
-        ORDER BY wins DESC, losses ASC, name ASC
+        SELECT
+            r.name,
+            r.wins,
+            r.losses,
+            r.is_dead,
+            r.owner_id,
+            COALESCE((
+                SELECT MAX(cp.tier)
+                FROM creature_progress cp
+                WHERE cp.creature_id = r.creature_id
+                  AND cp.glyph_unlocked = TRUE
+            ), 0) AS max_glyph_tier
+        FROM creature_records r
+        ORDER BY r.wins DESC, r.losses ASC, r.name ASC
         LIMIT 20
     """)
     trainer_names = await asyncio.gather(*[
         _resolve_trainer_name(r["owner_id"]) for r in rows
     ])
-    formatted: List[Tuple[str, int, int, bool, str]] = [
-        (r["name"], r["wins"], r["losses"], r["is_dead"], trainer_names[i])
+    formatted: List[Tuple[str, int, int, bool, str, int]] = [
+        (r["name"], r["wins"], r["losses"], r["is_dead"], trainer_names[i], r["max_glyph_tier"])
         for i, r in enumerate(rows)
     ]
 
     updated_ts = int(time.time())
-    title = f"**Creature Leaderboard — Top 20 (Wins / Losses)**\nUpdated: <t:{updated_ts}:R>\n"
+    title = (
+        f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph)**\n"
+        f"Updated: <t:{updated_ts}:R>\n"
+    )
     content = title + _format_leaderboard_lines(formatted)
     try:
         await message.edit(content=content)
@@ -1164,7 +1184,7 @@ async def info(inter: discord.Interaction):
         "• Legendary spawn chance: **0.5%**.\n"
         "• On a loss, 50% chance the creature **dies** (remains on leaderboard as DEAD).\n"
         f"• Daily battle cap: **{DAILY_BATTLE_CAP} battles / creature / day** (Europe/London).\n"
-        "• Leaderboard shows **Top 20** W/L with Trainer names; DEAD rows appear red.\n"
+        "• Leaderboard shows **Top 20** W/L with Trainer names and **Highest Glyph**; DEAD rows appear red.\n"
         "• Use `/record <creature_name>` for lifetime record.\n"
     )
     await send_chunks(inter, overview, ephemeral=True)

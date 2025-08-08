@@ -687,47 +687,6 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
                 (f" {st.user_creature['name']} may now battle **Tier {st.tier + 1}**." if st.tier < 9 else "")
             )
 
-        # ── NEW: Victory stat gain (+1 random stat) ─────────────────────────────
-        # Only on win, and only for the surviving creature (wins never roll death here).
-        try:
-            # Choose a stat and apply +1 in memory first
-            gained_stat = random.choice(PRIMARY_STATS)
-            new_stats = dict(st.user_creature["stats"])  # shallow copy
-            new_stats[gained_stat] = int(new_stats.get(gained_stat, 0)) + 1
-
-            # Compute new HP values if HP increased
-            new_max_hp = int(new_stats["HP"]) * 5
-            # st.user_current_hp at this point is the final HP after battle rounds
-            new_cur_hp = st.user_current_hp
-            if gained_stat == "HP":
-                # On HP gain, increase current HP by +5 but cap at new max
-                new_cur_hp = min(st.user_current_hp + 5, new_max_hp)
-
-            # Persist to DB
-            await pool.execute(
-                "UPDATE creatures SET stats=$1, current_hp=$2 WHERE id=$3",
-                json.dumps(new_stats), new_cur_hp, st.creature_id
-            )
-
-            # Update in-memory snapshot so future logs/logic reflect the change
-            st.user_creature["stats"] = new_stats
-            st.user_max_hp = new_max_hp
-            st.user_current_hp = new_cur_hp
-
-            # Friendly log message
-            if gained_stat == "HP":
-                st.logs.append(
-                    f"✨ **{st.user_creature['name']}** gained **+1 HP** from the victory "
-                    f"(Max HP is now {new_max_hp}, current {new_cur_hp}/{new_max_hp})."
-                )
-            else:
-                st.logs.append(
-                    f"✨ **{st.user_creature['name']}** gained **+1 {gained_stat}** from the victory!"
-                )
-        except Exception as e:
-            logger.error("Failed to apply victory stat gain: %s", e)
-        # ── End NEW ─────────────────────────────────────────────────────────────
-
     if not player_won:
         death_roll = random.random()
         pct = int(death_roll * 100)

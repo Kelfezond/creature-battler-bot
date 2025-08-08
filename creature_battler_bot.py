@@ -969,6 +969,11 @@ async def setup_hook():
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
+    try:
+        synced = await bot.tree.sync()
+        logger.info("Slash commands synced (%d).", len(synced))
+    except Exception as e:
+        logger.exception("Failed to sync commands: %s", e)
 
 # ─── Slash commands ─────────────────────────────────────────
 
@@ -1538,12 +1543,6 @@ async def info(inter: discord.Interaction):
         cmd_text = "Failed to build command list."
     content = header + "\n" + cmd_text
     await send_chunks(inter, content, ephemeral=True)
-
-try:
-    synced = await bot.tree.sync()
-    logger.info("Slash commands synced (%d).", len(synced))
-except Exception as e:
-    logger.exception("Failed to sync commands: %s", e)
 
 if __name__ == "__main__":
     bot.run(TOKEN)

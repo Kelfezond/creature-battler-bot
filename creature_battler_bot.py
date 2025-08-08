@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS trainers (
   facility_level INT DEFAULT 1
 );
 
+
+ALTER TABLE trainers
+  ADD COLUMN IF NOT EXISTS display_name TEXT;
 CREATE TABLE IF NOT EXISTS creatures (
   id SERIAL PRIMARY KEY,
   owner_id BIGINT NOT NULL,

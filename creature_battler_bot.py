@@ -1221,6 +1221,9 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         await send_chunks(inter, "\n".join(st.logs), ephemeral=True)
         await asyncio.sleep(0.35)
         await inter.channel.send(format_public_battle_summary(st, summary, trainer_name))
+    else:
+        st.logs.append("Use /continue to proceed.")
+        await send_chunks(inter, "\n".join(st.logs), ephemeral=True)
     st.next_log_idx = len(st.logs)
 
 @bot.tree.command(name="continue", description="Continue your current battle")

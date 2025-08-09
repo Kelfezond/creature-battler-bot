@@ -25,6 +25,50 @@ except Exception as _e:
     logger.error("Failed to init OpenAI client: %s", _e)
     client = None
 
+
+def _extract_response_text(resp) -> str:
+    """
+    Extract best-effort text from OpenAI SDK responses across versions.
+    Returns "" if nothing usable is found.
+    """
+    try:
+        text = getattr(resp, "output_text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    except Exception:
+        pass
+    try:
+        choices = getattr(resp, "choices", None)
+        if choices and len(choices) > 0:
+            msg = getattr(choices[0], "message", None) or {}
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    except Exception:
+        pass
+    try:
+        if isinstance(resp, dict):
+            if "output" in resp:
+                out = resp["output"]
+                if isinstance(out, list) and out:
+                    first = out[0]
+                    if isinstance(first, dict):
+                        content = first.get("content") or []
+                        if isinstance(content, list) and content:
+                            text_item = content[0]
+                            if isinstance(text_item, dict):
+                                t = text_item.get("text", {}).get("value", "") or text_item.get("text", "") or ""
+                                if isinstance(t, str) and t.strip():
+                                    return t.strip()
+            if "choices" in resp and resp["choices"]:
+                content = resp["choices"][0].get("message", {}).get("content", "")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> str:
     if client is None:
         raise RuntimeError("OpenAI client not initialized")
@@ -35,14 +79,7 @@ def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
         temperature=temperature,
         max_output_tokens=max_tokens
     )
-    try:
-        return resp.output_text.strip()
-    except Exception:
-        try:
-            return resp.choices[0].message.content.strip()
-        except Exception:
-            return ""
-
+    return _extract_response_text(resp)
 def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> dict:
     """
     Calls GPT-5 Mini and expects a strict JSON object back.
@@ -54,24 +91,26 @@ def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
     try:
         resp = client.responses.create(
             model="gpt-5-mini",
-            input=input_text,
+            input="Return ONLY a strict JSON object. Do not include code fences.\n\n" + input_text,
             temperature=temperature,
-            max_output_tokens=max_tokens,
-            response_format={"type": "json_object"}
+            max_output_tokens=max_tokens
         )
-        text_out = getattr(resp, "output_text", "") or ""
-        if not text_out.strip():
+        text_out = _extract_response_text(resp)
+        if not isinstance(text_out, str) or not text_out.strip():
             logger.error("AI JSON empty output")
             return {}
-        try:
-            return json.loads(text_out)
-        except Exception as e:
-            logger.error("AI JSON parse error: %s | Raw: %s", e, text_out[:200])
-            return {}
+        raw = text_out.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            raw = "\n".join(raw.split("\n")[1:])
+        first = raw.find("{")
+        last = raw.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            raw = raw[first:last+1]
+        return json.loads(raw)
     except Exception as e:
-        logger.error("AI JSON request error: %s", e)
+        logger.error("AI JSON request/parse error: %s", e)
         return {}
-
 def ai_image(prompt: str, size: str = "1024x1024") -> str:
     if client is None:
         raise RuntimeError("OpenAI client not initialized")
@@ -795,7 +834,7 @@ def _format_stats_block(stats: Dict[str, int]) -> str:
 async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[str], stats: Dict[str, int]) -> tuple[str, Optional[str]]:
     """
     Returns (bio_text, image_url or None)
-    Uses OpenAI for both text (ChatCompletion) and image (Images.create).
+    Uses OpenAI for both text (Responses API) and image (Images.generate).
     """
     # 1) Bio text
     try:

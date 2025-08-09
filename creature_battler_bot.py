@@ -6,8 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import discord
 from discord.ext import commands, tasks
+import httpx
 from openai import OpenAI
-client = OpenAI()
+client = OpenAI(http_client=httpx.Client())
+logger.info("OpenAI client initialized: SDK active")
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

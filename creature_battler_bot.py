@@ -373,7 +373,7 @@ Avoid words: {', '.join(used_words)}
                 None,
                 lambda: ai_text(prompt, temperature=1.0, max_tokens=100)
             )
-            data = json.loads(text)
+            data = json.loads(resp_text)
             if "name" in data and len(data.get("descriptors", [])) == 3:
                 data["name"] = data["name"].title()
                 return data

@@ -1,12 +1,12 @@
 from __future__ import annotations
-import asyncio, json, logging, math, os, random, time, textwrap
+import asyncio, json, logging, math, os, random, time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import discord
 from discord.ext import commands, tasks
-import openai
+from openai import OpenAI
 
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -15,178 +15,10 @@ logger = logging.getLogger(__name__)
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-from openai import OpenAI
-try:
-    client = OpenAI()
-    logger.info("OpenAI client initialized: SDK active")
-except Exception as _e:
-    logger.error("Failed to init OpenAI client: %s", _e)
-    client = None
-
-
-
-def _extract_response_text(resp) -> str:
-    """
-    Extract best-effort text from OpenAI SDK responses across versions.
-    Returns "" if nothing usable is found.
-    """
-    try:
-        # New Responses API convenience
-        text = getattr(resp, "output_text", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-    except Exception:
-        pass
-    try:
-        # Object-style Responses API (pydantic objects)
-        out = getattr(resp, "output", None)
-        if out and isinstance(out, (list, tuple)) and len(out) > 0:
-            first = out[0]
-            content = getattr(first, "content", None)
-            if content and isinstance(content, (list, tuple)) and len(content) > 0:
-                item0 = content[0]
-                # item0.text could be a string or an object with .value
-                t = getattr(item0, "text", None)
-                if isinstance(t, str) and t.strip():
-                    return t.strip()
-                if hasattr(t, "value"):
-                    v = getattr(t, "value", "")
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
-                # Some SDKs wrap as dict-like
-                if isinstance(item0, dict):
-                    tv = item0.get("text", {})
-                    if isinstance(tv, dict):
-                        v = tv.get("value", "")
-                        if isinstance(v, str) and v.strip():
-                            return v.strip()
-    except Exception:
-        pass
-    try:
-        # Older Chat Completions style
-        choices = getattr(resp, "choices", None)
-        if choices and len(choices) > 0:
-            msg = getattr(choices[0], "message", None) or {}
-            content = getattr(msg, "content", None)
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-    except Exception:
-        pass
-    try:
-        # Raw dict-like access fallback
-        if isinstance(resp, dict):
-            # Responses API dict
-            if "output" in resp:
-                out = resp["output"]
-                if isinstance(out, list) and out:
-                    first = out[0]
-                    if isinstance(first, dict):
-                        content = first.get("content") or []
-                        if isinstance(content, list) and content:
-                            text_item = content[0]
-                            if isinstance(text_item, dict):
-                                t = text_item.get("text", {}).get("value", "") or text_item.get("text", "") or ""
-                                if isinstance(t, str) and t.strip():
-                                    return t.strip()
-            # Chat completions dict
-            if "choices" in resp and resp["choices"]:
-                content = resp["choices"][0].get("message", {}).get("content", "")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
-    except Exception:
-        pass
-    return ""
-
-
-
-def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> str:
-    if client is None:
-        raise RuntimeError("OpenAI client not initialized")
-    logger.info("Using gpt-5-mini for text generation")
-    resp = client.responses.create(
-        model="gpt-5-mini",
-        input=input_text,
-        max_output_tokens=max_tokens
-    )
-    return _extract_response_text(resp)
-
-def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> dict:
-    """
-    Calls GPT-5 Mini and expects a strict JSON object back.
-    Returns a Python dict (or a rich default on failure).
-    Strategy: try plain string `input` first; if empty text, retry with role/content format.
-    """
-    if client is None:
-        raise RuntimeError("OpenAI client not initialized")
-    logger.info("Using gpt-5-mini for JSON generation")
-
-    def _attempt(payload_input):
-        resp = client.responses.create(
-            model="gpt-5-mini",
-            input=payload_input,
-            max_output_tokens=max_tokens
-        )
-        text_out = _extract_response_text(resp)
-        try:
-            if isinstance(text_out, str):
-                logger.debug("AI RAW length: %s", len(text_out))
-                if 0 < len(text_out) <= 200:
-                    logger.debug("AI RAW preview: %r", text_out)
-            else:
-                logger.debug("AI RAW length: n/a")
-        except Exception:
-            pass
-        return text_out
-
-    # Attempt 1: simple string input
-    prompt = "Return ONLY a strict JSON object. Do not include code fences.\n\n" + input_text
-    text_out = _attempt(prompt)
-
-    # Attempt 2: role/content format if empty
-    if not isinstance(text_out, str) or not text_out.strip():
-        role_payload = [{
-            "role": "user",
-            "content": [{"type": "input_text", "text": prompt}]
-        }]
-        text_out = _attempt(role_payload)
-
-    if not isinstance(text_out, str) or not text_out.strip():
-        logger.error("AI JSON empty output (after 2 attempts)")
-        return {"name": "", "descriptors": ["wild","untamed","blank"], "species": "", "tags": [], "abilities": [], "stats": {}}
-
-    raw = text_out.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = "\n".join(raw.split("\n")[1:])
-
-    # clamp to object braces
-    first = raw.find("{")
-    last = raw.rfind("}")
-    if first != -1 and last != -1 and last > first:
-        raw = raw[first:last+1]
-
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        logger.error("AI JSON request/parse error: %s", e)
-        return {"name": "", "descriptors": ["wild","untamed","blank"], "species": "", "tags": [], "abilities": [], "stats": {}}
-
-def ai_image(prompt: str, size: str = "1024x1024") -> str:
-    if client is None:
-        raise RuntimeError("OpenAI client not initialized")
-    logger.info("Using gpt-image-1 for image generation")
-    img = client.images.generate(model="gpt-image-1", prompt=prompt, size=size)
-    try:
-        return img.data[0].url
-    except Exception:
-        try:
-            return img["data"][0]["url"]
-        except Exception:
-            return ""
-
-
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5-mini")
+IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
@@ -211,7 +43,7 @@ ADMIN_USER_IDS: set[int] = _parse_admin_ids(os.getenv("ADMIN_USER_IDS"))
 for env_name, env_val in {
     "DISCORD_TOKEN": TOKEN,
     "DATABASE_URL": DB_URL,
-    "OPENAI_API_KEY": openai.api_key,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
 }.items():
     if not env_val:
         raise RuntimeError(f"Missing environment variable: {env_name}")
@@ -489,36 +321,59 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
 async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
-    # Bound the "avoid" lists so the prompt doesn't get huge
-    used_names = [ (r["name"] or "").lower() for r in rows if r.get("name") ][:40]
-    used_words = sorted({ (w or "").lower() for r in rows for w in (r["descriptors"] or []) })[:200]
-    prompt = textwrap.dedent("""\
-    Return ONLY a strict JSON object for a new arena creature.
-    Schema:
-    {"name":"1-3 words (letters/spaces/hyphens only)","descriptors":["w1","w2","w3"]}
-    Constraints: rarity={RARITY}. Use unique single-word descriptors. Avoid names: {AVOID_NAMES}. Avoid descriptor words: {AVOID_WORDS}.
-    """)
-    prompt = (prompt
-              .replace("{RARITY}", rarity)
-              .replace("{AVOID_NAMES}", ", ".join(used_names))
-              .replace("{AVOID_WORDS}", ", ".join(used_words)))
+    used_names = [r["name"].lower() for r in rows]
+    used_words = {w.lower() for r in rows for w in (r["descriptors"] or [])}
+    prompt = f"""
+Invent a creature of rarity **{rarity}**. Return ONLY JSON:
+{{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
+Avoid names: {', '.join(used_names)}
+Avoid words: {', '.join(used_words)}
+"""
     for _ in range(3):
         try:
-            data = await asyncio.get_running_loop().run_in_executor(
+            resp = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: ai_json(prompt, temperature=0.8, max_tokens=120)
+                lambda: openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=1.0, max_tokens=100,
+                )
             )
-            # Validate minimally
-            if isinstance(data, dict) and "name" in data and isinstance(data.get("descriptors"), list) and len(data["descriptors"]) == 3:
-                data["name"] = str(data["name"]).title()
-                if not data["name"].strip():
-                    data["name"] = f"Wild {rarity.title()} {random.randint(1000,9999)}"
-                # Clean descriptors to single words
-                data["descriptors"] = [str(w).split()[0].strip(",.;:!?'\"()[]{}").lower() for w in data["descriptors"]]
+            data = json.loads(resp.choices[0].message.content.strip())
+            if "name" in data and len(data.get("descriptors", [])) == 3:
+                data["name"] = data["name"].title()
                 return data
         except Exception as e:
-            logger.error("OpenAI JSON error: %s", e)
-    return {"name": f"Wildling {random.randint(1000,9999)}", "descriptors": ["feral","swift","arcane"]}
+            logger.error("OpenAI error: %s", e)
+    return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
+
+
+# ─── OpenAI helpers (Responses API) ─────────────────────────
+async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 200) -> dict | None:
+    """
+    Calls the Responses API and requests a strict JSON object back.
+    Returns a dict or None on failure.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        resp = await loop.run_in_executor(
+            None,
+            lambda: client.responses.create(
+                model=TEXT_MODEL,
+                input=prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+                response_format={"type": "json_object"},
+            )
+        )
+        text = getattr(resp, "output_text", None) or ""
+        text = text.strip()
+        if not text:
+            return None
+        return json.loads(text)
+    except Exception as e:
+        logger.error("OpenAI JSON call failed: %s", e)
+        return None
 
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
@@ -735,7 +590,8 @@ async def _resolve_trainer_name_from_db(user_id: int) -> Optional[str]:
     try:
         return await (await db_pool()).fetchval(
             "SELECT COALESCE(display_name, user_id::text) FROM trainers WHERE user_id=$1",
-            user_id)
+            user_id,
+        )
     except Exception:
         return None
 
@@ -897,7 +753,7 @@ def _format_stats_block(stats: Dict[str, int]) -> str:
 async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[str], stats: Dict[str, int]) -> tuple[str, Optional[str]]:
     """
     Returns (bio_text, image_url or None)
-    Uses OpenAI for both text (Responses API) and image (Images.generate).
+    Uses OpenAI for both text (ChatCompletion) and image (Images.create).
     """
     # 1) Bio text
     try:
@@ -918,9 +774,17 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: ai_text(sys_prompt + "\n\n" + user_prompt, temperature=0.8, max_tokens=220)
+            lambda: openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.8,
+                max_tokens=220,
+            )
         )
-        bio_text = resp.strip()
+        bio_text = resp.choices[0].message.content.strip()
     except Exception as e:
         logger.error("OpenAI bio error: %s", e)
         bio_text = "A lab-forged arena combatant. (Bio generation failed.)"
@@ -936,9 +800,13 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: ai_image(img_prompt, size="1024x1024")
+            lambda: client.images.generate(
+                prompt=img_prompt,
+                n=1,
+                size="1024x1024"
+            )
         )
-        image_url = img_resp
+        image_url = img_resp["data"][0]["url"]
     except Exception as e:
         logger.error("OpenAI image error: %s", e)
         image_url = None
@@ -1717,12 +1585,3 @@ async def info(inter: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-
-def _merge_json_defaults(data: dict, defaults: dict) -> dict:
-    try:
-        out = dict(defaults)
-        if isinstance(data, dict):
-            out.update({k: v for k, v in data.items() if v is not None})
-        return out
-    except Exception:
-        return dict(defaults)

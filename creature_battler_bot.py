@@ -336,8 +336,8 @@ Avoid words: {', '.join(used_words)}
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: client.responses.create(
-                    model="gpt-3.5-turbo",
-                    input=[{"role": "user", "content": prompt}],
+                    model=TEXT_MODEL,
+                    input=prompt,
                     temperature=1.0, max_output_tokens=100,
                 )
             )
@@ -777,7 +777,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: client.responses.create(
-                model="gpt-3.5-turbo",
+                model=TEXT_MODEL,
                 input=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},

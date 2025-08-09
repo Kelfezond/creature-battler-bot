@@ -1026,9 +1026,7 @@ async def _openai_sanity_check():
                 model=TEXT_MODEL,
                 input="healthcheck",
                 max_output_tokens=1,
-                reasoning={"effort":"minimal"},
-                verbosity="low",
-            )
+                reasoning={"effort":"minimal"},            )
         )
         rid = getattr(resp, "id", "unknown")
         rmodel = getattr(resp, "model", TEXT_MODEL)

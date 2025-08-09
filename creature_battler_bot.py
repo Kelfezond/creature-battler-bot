@@ -6,14 +6,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import discord
 from discord.ext import commands, tasks
+from openai import OpenAI
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5-mini")
+IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")

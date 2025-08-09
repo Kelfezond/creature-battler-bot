@@ -336,7 +336,7 @@ Avoid words: {', '.join(used_words)}
                 lambda: client.responses.create(
                     model="gpt-3.5-turbo",
                     input=[{"role": "user", "content": prompt}],
-                    temperature=1.0, max_tokens=100,
+                    temperature=1.0, max_output_tokens=100,
                 )
             )
             data = json.loads(getattr(resp, 'output_text', '') or '')
@@ -781,7 +781,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.8,
-                max_tokens=220,
+                max_output_tokens=220,
             )
         )
         bio_text = getattr(resp, 'output_text', '') or ''

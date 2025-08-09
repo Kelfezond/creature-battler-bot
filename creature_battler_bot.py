@@ -1310,6 +1310,20 @@ async def cash(inter: discord.Interaction):
 
 @bot.tree.command(description="Add cash (dev utility)")
 async def cashadd(inter: discord.Interaction, amount: int):
+    # Admin gate for /cashadd
+    try:
+        user_id = inter.user.id if 'inter' in locals() or 'inter' in globals() else (interaction.user.id if 'interaction' in locals() or 'interaction' in globals() else None)
+    except Exception:
+        user_id = getattr(inter, 'user', getattr(inter, 'author', None)).id if 'inter' in locals() or 'inter' in globals() else None
+    if user_id is None:
+        await inter.response.send_message("Couldn't read user context.", ephemeral=True)
+        return
+    if user_id not in ADMIN_USER_IDS:
+        if not inter.response.is_done():
+            await inter.response.send_message("You are not permitted to use this command.", ephemeral=True)
+        else:
+            await inter.followup.send("You are not permitted to use this command.", ephemeral=True)
+        return
     if inter.user.id not in ADMIN_USER_IDS:
         return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
     if amount <= 0:

@@ -6,10 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import discord
 from discord.ext import commands, tasks
-import httpx
-from openai import OpenAI
-client = OpenAI(http_client=httpx.Client())
-logger.info("OpenAI client initialized: SDK active")
+import openai
+
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -332,8 +330,8 @@ Avoid words: {', '.join(used_words)}
         try:
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: client.chat.completions.create(
-                    model="gpt-5-mini",
+                lambda: openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=1.0, max_tokens=100,
                 )
@@ -745,8 +743,8 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: client.chat.completions.create(
-                model="gpt-5-mini",
+            lambda: openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
@@ -771,9 +769,13 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: client.images.generate(model="gpt-image-1", prompt=img_prompt, n=1, size="1024x1024")
+            lambda: openai.Image.create(
+                prompt=img_prompt,
+                n=1,
+                size="1024x1024"
+            )
         )
-        image_url = img_resp.data[0].url
+        image_url = img_resp["data"][0]["url"]
     except Exception as e:
         logger.error("OpenAI image error: %s", e)
         image_url = None

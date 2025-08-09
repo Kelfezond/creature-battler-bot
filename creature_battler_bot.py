@@ -17,6 +17,47 @@ DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+from openai import OpenAI
+try:
+    client = OpenAI()
+    logger.info("OpenAI client initialized: SDK active")
+except Exception as _e:
+    logger.error("Failed to init OpenAI client: %s", _e)
+    client = None
+
+def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> str:
+    if client is None:
+        raise RuntimeError("OpenAI client not initialized")
+    logger.info("Using gpt-5-mini for text generation")
+    resp = client.responses.create(
+        model="gpt-5-mini",
+        input=input_text,
+        temperature=temperature,
+        max_output_tokens=max_tokens
+    )
+    try:
+        return resp.output_text.strip()
+    except Exception:
+        try:
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            return ""
+
+def ai_image(prompt: str, size: str = "1024x1024") -> str:
+    if client is None:
+        raise RuntimeError("OpenAI client not initialized")
+    logger.info("Using gpt-image-1 for image generation")
+    img = client.images.generate(model="gpt-image-1", prompt=prompt, size=size)
+    try:
+        return img.data[0].url
+    except Exception:
+        try:
+            return img["data"][0]["url"]
+        except Exception:
+            return ""
+
+
+
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 
@@ -328,15 +369,11 @@ Avoid words: {', '.join(used_words)}
 """
     for _ in range(3):
         try:
-            resp = await asyncio.get_running_loop().run_in_executor(
+            resp_text = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: logger.info('Using gpt-5-mini for text generation')
-openai.responses.create(
-                    model='gpt-5-mini', input="""[{"role": "user", "content": prompt}]"""),
-                    temperature=1.0, max_tokens=100,
-                )
+                lambda: ai_text(prompt, temperature=1.0, max_tokens=100)
             )
-            data = json.loads(resp.choices[0].message.content.strip())
+            data = json.loads(text)
             if "name" in data and len(data.get("descriptors", [])) == 3:
                 data["name"] = data["name"].title()
                 return data
@@ -743,17 +780,9 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: logger.info('Using gpt-5-mini for text generation')
-openai.responses.create(
-                model='gpt-5-mini', input="""[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]"""),
-                temperature=0.8,
-                max_tokens=220,
-            )
+            lambda: ai_text(sys_prompt + "\n\n" + user_prompt, temperature=0.8, max_tokens=220)
         )
-        bio_text = resp.choices[0].message.content.strip()
+        bio_text = resp_text.strip()
     except Exception as e:
         logger.error("OpenAI bio error: %s", e)
         bio_text = "A lab-forged arena combatant. (Bio generation failed.)"
@@ -769,11 +798,7 @@ openai.responses.create(
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: openai.Image.create(
-                prompt=img_prompt,
-                n=1,
-                size="1024x1024"
-            )
+            lambda: ai_image(img_prompt, size="1024x1024")
         )
         image_url = img_resp["data"][0]["url"]
     except Exception as e:

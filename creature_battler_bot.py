@@ -330,8 +330,8 @@ Avoid words: {', '.join(used_words)}
         try:
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: openai.responses.create(
-                    model="gpt-5-mini",
+                lambda: openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=1.0, max_tokens=100,
                 )
@@ -743,8 +743,8 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: openai.responses.create(
-                model="gpt-5-mini",
+            lambda: openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
@@ -769,7 +769,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: openai.images.generate(
+            lambda: openai.Image.create(
                 prompt=img_prompt,
                 n=1,
                 size="1024x1024"

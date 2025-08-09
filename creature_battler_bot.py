@@ -331,7 +331,7 @@ Avoid words: {', '.join(used_words)}
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-5-mini",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=1.0, max_tokens=100,
                 )
@@ -744,7 +744,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
+                model="gpt-5-mini",
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},

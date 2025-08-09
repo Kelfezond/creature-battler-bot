@@ -341,7 +341,16 @@ Avoid words: {', '.join(used_words)}
                     temperature=1.0, max_output_tokens=100,
                 )
             )
-            data = json.loads(getattr(resp, 'output_text', '') or '')
+            text = (getattr(resp, 'output_text', '') or '').strip()
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", text)
+                if not m:
+                    raise
+                data = json.loads(m.group(0))
             if "name" in data and len(data.get("descriptors", [])) == 3:
                 data["name"] = data["name"].title()
                 return data

@@ -7,12 +7,13 @@ import asyncpg
 import discord
 from discord.ext import commands, tasks
 import httpx
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 from openai import OpenAI
 client = OpenAI(http_client=httpx.Client())
 logger.info("OpenAI client initialized: SDK active")
 # ─── Basic config & logging ──────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")

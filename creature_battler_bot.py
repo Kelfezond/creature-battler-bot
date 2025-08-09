@@ -30,14 +30,10 @@ logger.info("OpenAI client initialized: SDK active")
 
 # ─── Discord bot setup ──────────────────────────────────────
 intents = discord.Intents.default()
-# Enable if you need to read message content for prefix commands/logging
-intents.message_content = True
-intents.members = True  # often useful for guild operations
-
+# Keep privileged intents off unless enabled in the Developer Portal.
+intents.message_content = False
+intents.members = False
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS trainers (
   user_id BIGINT PRIMARY KEY,

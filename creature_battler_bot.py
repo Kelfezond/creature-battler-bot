@@ -1,5 +1,3 @@
-import logging
-import os
 from __future__ import annotations
 import asyncio, json, logging, math, os, random, time
 from dataclasses import dataclass
@@ -10,68 +8,58 @@ import discord
 from discord.ext import commands, tasks
 import httpx
 from openai import OpenAI
-
+client = OpenAI(http_client=httpx.Client())
+logger.info("OpenAI client initialized: SDK active")
+# ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# ─── Admin allow-list (ENV-driven) ───────────────────────────
-def _parse_admin_ids(raw: str):
-    s = set()
-    if not raw:
-        return s
-    for tok in raw.replace(",", " ").split():
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            s.add(int(tok))
-        except Exception:
-            pass
-    return s
-
-# Always define the symbol to avoid NameError
-try:
-    ADMIN_USER_IDS
-except NameError:
-    ADMIN_USER_IDS = set()
-
-# Merge ENV values into ADMIN_USER_IDS
-_env_ids = _parse_admin_ids(os.getenv("ADMIN_USER_IDS", ""))
-if _env_ids:
-    ADMIN_USER_IDS |= _env_ids
-
-# Log status
-try:
-    _ids_preview = ",".join(str(i) for i in sorted(ADMIN_USER_IDS)) if ADMIN_USER_IDS else "(empty)"
-    logger.info("Admin allow-list loaded: %s", _ids_preview)
-except Exception:
-    print("Admin allow-list loaded:", ",".join(str(i) for i in sorted(ADMIN_USER_IDS)) if ADMIN_USER_IDS else "(empty)")
-
-if not ADMIN_USER_IDS:
-    logger.warning("ADMIN_USER_IDS is empty. /cashadd will reject everyone. Set the env var on the *bot service*, not the database service.")
-# ─── Basic config & logging ──────────────────────────────────
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 
-# Validate required env vars early
+# Admin allow-list for privileged commands (e.g., /cashadd, /setleaderboardchannel)
+def _parse_admin_ids(raw: Optional[str]) -> set[int]:
+    ids: set[int] = set()
+    if not raw:
+        return ids
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning("Ignoring non-integer ADMIN_USER_IDS entry: %r", part)
+    return ids
 
-# Initialize OpenAI client (explicit httpx client to avoid proxy issues)
-# If your environment injects proxies, remove http_client below and let SDK manage it.
-_client_httpx = httpx.Client(timeout=30.0)
-client = OpenAI(api_key=OPENAI_API_KEY, http_client=_client_httpx)
-logger.info("OpenAI client initialized: SDK active")
+ADMIN_USER_IDS: set[int] = _parse_admin_ids(os.getenv("ADMIN_USER_IDS"))
 
-# ─── Discord bot setup ──────────────────────────────────────
+for env_name, env_val in {
+    "DISCORD_TOKEN": TOKEN,
+    "DATABASE_URL": DB_URL,
+    "OPENAI_API_KEY": openai.api_key,
+}.items():
+    if not env_val:
+        raise RuntimeError(f"Missing environment variable: {env_name}")
+
+if ADMIN_USER_IDS:
+    logger.info("Admin allow-list loaded: %s", ", ".join(map(str, ADMIN_USER_IDS)))
+else:
+    logger.warning("ADMIN_USER_IDS is not set; privileged commands will be denied for all users.")
+
+# ─── Discord client ──────────────────────────────────────────
 intents = discord.Intents.default()
-# Keep privileged intents off unless enabled in the Developer Portal.
-intents.message_content = False
-intents.members = False
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Keep message content if you already had it enabled for your app
+intents.message_content = True
+# IMPORTANT: do NOT enable members intent; we resolve trainer names via REST/cache
+bot = commands.Bot(command_prefix="/", intents=intents)
+
+# ─── Database helpers ────────────────────────────────────────
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS trainers (
   user_id BIGINT PRIMARY KEY,
@@ -1348,30 +1336,6 @@ async def cash(inter: discord.Interaction):
 
 @bot.tree.command(description="Add cash (dev utility)")
 async def cashadd(inter: discord.Interaction, amount: int):
-    # Guard: require ADMIN_USER_IDS configured and membership
-    if not ADMIN_USER_IDS:
-        await inter.response.send_message(
-            "Admin list is empty. Set ADMIN_USER_IDS on the bot service.", ephemeral=True
-        )
-        return
-    user_id = inter.user.id
-    if user_id not in ADMIN_USER_IDS:
-        await inter.response.send_message("You are not permitted to use this command.", ephemeral=True)
-        return
-    # Admin gate for /cashadd
-    try:
-        user_id = inter.user.id if 'inter' in locals() or 'inter' in globals() else (interaction.user.id if 'interaction' in locals() or 'interaction' in globals() else None)
-    except Exception:
-        user_id = getattr(inter, 'user', getattr(inter, 'author', None)).id if 'inter' in locals() or 'inter' in globals() else None
-    if user_id is None:
-        await inter.response.send_message("Couldn't read user context.", ephemeral=True)
-        return
-    if user_id not in ADMIN_USER_IDS:
-        if not inter.response.is_done():
-            await inter.response.send_message("You are not permitted to use this command.", ephemeral=True)
-        else:
-            await inter.followup.send("You are not permitted to use this command.", ephemeral=True)
-        return
     if inter.user.id not in ADMIN_USER_IDS:
         return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
     if amount <= 0:

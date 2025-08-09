@@ -76,7 +76,6 @@ def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
     resp = client.responses.create(
         model="gpt-5-mini",
         input=input_text,
-        temperature=temperature,
         max_output_tokens=max_tokens
     )
     return _extract_response_text(resp)
@@ -92,13 +91,12 @@ def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
         resp = client.responses.create(
             model="gpt-5-mini",
             input="Return ONLY a strict JSON object. Do not include code fences.\n\n" + input_text,
-            temperature=temperature,
             max_output_tokens=max_tokens
         )
         text_out = _extract_response_text(resp)
         if not isinstance(text_out, str) or not text_out.strip():
             logger.error("AI JSON empty output")
-            return {}
+        return {"name": "", "species": "", "tags": [], "abilities": [], "stats": {}}
         raw = text_out.strip()
         if raw.startswith("```"):
             raw = raw.strip("`")
@@ -110,7 +108,7 @@ def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
         return json.loads(raw)
     except Exception as e:
         logger.error("AI JSON request/parse error: %s", e)
-        return {}
+    return {"name": "", "species": "", "tags": [], "abilities": [], "stats": {}}
 def ai_image(prompt: str, size: str = "1024x1024") -> str:
     if client is None:
         raise RuntimeError("OpenAI client not initialized")
@@ -671,8 +669,7 @@ async def _resolve_trainer_name_from_db(user_id: int) -> Optional[str]:
     try:
         return await (await db_pool()).fetchval(
             "SELECT COALESCE(display_name, user_id::text) FROM trainers WHERE user_id=$1",
-            user_id,
-        )
+            user_id)
     except Exception:
         return None
 
@@ -1654,3 +1651,12 @@ async def info(inter: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
+
+def _merge_json_defaults(data: dict, defaults: dict) -> dict:
+    try:
+        out = dict(defaults)
+        if isinstance(data, dict):
+            out.update({k: v for k, v in data.items() if v is not None})
+        return out
+    except Exception:
+        return dict(defaults)

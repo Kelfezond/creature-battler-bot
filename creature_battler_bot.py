@@ -148,7 +148,7 @@ def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
     if not isinstance(text_out, str) or not text_out.strip():
         role_payload = [{
             "role": "user",
-            "content": [{"type": "text", "text": prompt}]
+            "content": [{"type": "input_text", "text": prompt}]
         }]
         text_out = _attempt(role_payload)
 
@@ -490,7 +490,7 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
     # Bound the "avoid" lists so the prompt doesn't get huge
-    used_names = [ (r["name"] or "").lower() for r in rows if r.get("name") ][:200]
+    used_names = [ (r["name"] or "").lower() for r in rows if r.get("name") ][:40]
     used_words = sorted({ (w or "").lower() for r in rows for w in (r["descriptors"] or []) })[:200]
     prompt = textwrap.dedent("""\
     Return ONLY a strict JSON object for a new arena creature.

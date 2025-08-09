@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, logging, math, os, random, time
+import asyncio, json, logging, math, os, random, time, re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,19 +7,21 @@ import asyncpg
 import discord
 from discord.ext import commands, tasks
 from openai import OpenAI
+
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+TOKEN     = os.getenv("DISCORD_TOKEN")
+DB_URL    = os.getenv("DATABASE_URL")
+GUILD_ID  = os.getenv("GUILD_ID") or None
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5-mini")
 IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+OPENAI_DEBUG = os.getenv("OPENAI_DEBUG", "0") == "1"
 
-TOKEN     = os.getenv("DISCORD_TOKEN")
-DB_URL    = os.getenv("DATABASE_URL")
-GUILD_ID  = os.getenv("GUILD_ID") or None
+logger.info("Using TEXT_MODEL=%s, IMAGE_MODEL=%s", TEXT_MODEL, IMAGE_MODEL)
 
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
@@ -44,7 +46,7 @@ ADMIN_USER_IDS: set[int] = _parse_admin_ids(os.getenv("ADMIN_USER_IDS"))
 for env_name, env_val in {
     "DISCORD_TOKEN": TOKEN,
     "DATABASE_URL": DB_URL,
-    "OPENAI_API_KEY": openai.api_key,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
 }.items():
     if not env_val:
         raise RuntimeError(f"Missing environment variable: {env_name}")
@@ -324,25 +326,92 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
     used_names = [r["name"].lower() for r in rows]
     used_words = {w.lower() for r in rows for w in (r["descriptors"] or [])}
+
+    # Random 50 sample for prompt compactness
+    used_names_list = list(used_names)
+    used_words_list = list(used_words)
+    from random import sample as _rsample
+    avoid_names = _rsample(used_names_list, min(50, len(used_names_list)))
+    avoid_words = _rsample(used_words_list, min(50, len(used_words_list)))
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
 {{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
-Avoid names: {', '.join(used_names)}
-Avoid words: {', '.join(used_words)}
+Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
+Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
 """
     for _ in range(3):
         try:
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: client.responses.create(model=TEXT_MODEL, input=prompt, temperature=1.0, max_output_tokens=1024, reasoning={"effort":"minimal"})
+                lambda: client.responses.create(
+                    model=TEXT_MODEL,
+                    input=prompt,
+                    temperature=1.0, max_output_tokens=256,
+                )
             )
-            data = json.loads(resp.choices[0].message.content.strip())
+            text = (getattr(resp, 'output_text', '') or '').strip()
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", text)
+                if not m:
+                    raise
+                data = json.loads(m.group(0))
             if "name" in data and len(data.get("descriptors", [])) == 3:
                 data["name"] = data["name"].title()
                 return data
         except Exception as e:
             logger.error("OpenAI error: %s", e)
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
+
+
+# ─── OpenAI helpers (Responses API) ─────────────────────────
+
+def _safe_dump_response(resp) -> str:
+    try:
+        if hasattr(resp, "model_dump"):
+            d = resp.model_dump(exclude_none=True)
+        elif hasattr(resp, "dict"):
+            d = resp.dict()
+        else:
+            return str(resp)[:1200]
+        import json as _json
+        return _json.dumps(d, ensure_ascii=False)[:1200]
+    except Exception:
+        try:
+            return str(resp)[:1200]
+        except Exception:
+            return "<unprintable response>"
+
+async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 512) -> dict | None:
+    """
+    Calls the Responses API and requests a strict JSON object back.
+    Returns a dict or None on failure.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        resp = await loop.run_in_executor(
+            None,
+            lambda: client.responses.create(
+                model=TEXT_MODEL,
+                input=prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+                response_format={"type": "json_object"},
+            )
+        )
+        text = getattr(resp, "output_text", None) or ""
+        text = text.strip()
+        if not text:
+            if OPENAI_DEBUG:
+                logger.error("Responses debug (empty): %s", _safe_dump_response(resp))
+            return None
+        return json.loads(text)
+    except Exception as e:
+        logger.error("OpenAI JSON call failed: %s", e)
+        return None
 
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
@@ -743,9 +812,17 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: client.responses.create(model=TEXT_MODEL, input=prompt, temperature=1.0, max_output_tokens=1024, reasoning={"effort":"minimal"})
+            lambda: client.responses.create(
+                model=TEXT_MODEL,
+                input=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.8,
+                max_output_tokens=220,
+            )
         )
-        bio_text = resp.choices[0].message.content.strip()
+        bio_text = getattr(resp, 'output_text', '') or ''
     except Exception as e:
         logger.error("OpenAI bio error: %s", e)
         bio_text = "A lab-forged arena combatant. (Bio generation failed.)"
@@ -761,8 +838,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: client.images.generate(
-                prompt=img_prompt,
+            lambda: client.images.generate(model=IMAGE_MODEL, prompt=img_prompt,
                 n=1,
                 size="1024x1024"
             )
@@ -931,8 +1007,36 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
     return "\n".join(lines)
 
 # ─── Bot events ──────────────────────────────────────────────
+
+async def _openai_sanity_check():
+    """
+    On boot, log a masked API key and perform a tiny Responses call to verify headers/auth.
+    """
+    try:
+        key = OPENAI_API_KEY or ""
+        masked = ("…" + key[-6:]) if key else "<missing>"
+        # Warn if the key looks like it has leading/trailing whitespace
+        if key and key != key.strip():
+            logger.warning("OPENAI_API_KEY appears to have leading/trailing whitespace.")
+        logger.info("OpenAI sanity: key tail=%s, model=%s", masked, TEXT_MODEL)
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(
+            None,
+            lambda: client.responses.create(
+                model=TEXT_MODEL,
+                input="healthcheck",
+                max_output_tokens=1,
+                reasoning={"effort":"minimal"},            )
+        )
+        rid = getattr(resp, "id", "unknown")
+        rmodel = getattr(resp, "model", TEXT_MODEL)
+        logger.info("OpenAI sanity OK (id=%s, model=%s)", rid, rmodel)
+    except Exception as e:
+        logger.error("OpenAI sanity FAILED: %s", e)
+
 @bot.event
 async def setup_hook():
+    await _openai_sanity_check()
 
 
     pool = await db_pool()

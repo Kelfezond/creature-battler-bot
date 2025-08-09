@@ -6,8 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import discord
 from discord.ext import commands, tasks
-import openai
-
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -330,11 +328,7 @@ Avoid words: {', '.join(used_words)}
         try:
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=1.0, max_tokens=100,
-                )
+                lambda: client.responses.create(model=TEXT_MODEL, input=prompt, temperature=1.0, max_output_tokens=1024, reasoning={"effort":"minimal"})
             )
             data = json.loads(resp.choices[0].message.content.strip())
             if "name" in data and len(data.get("descriptors", [])) == 3:
@@ -743,15 +737,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.8,
-                max_tokens=220,
-            )
+            lambda: client.responses.create(model=TEXT_MODEL, input=prompt, temperature=1.0, max_output_tokens=1024, reasoning={"effort":"minimal"})
         )
         bio_text = resp.choices[0].message.content.strip()
     except Exception as e:
@@ -769,7 +755,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: openai.Image.create(
+            lambda: client.images.generate(
                 prompt=img_prompt,
                 n=1,
                 size="1024x1024"

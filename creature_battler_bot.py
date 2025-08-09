@@ -1007,8 +1007,38 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
     return "\n".join(lines)
 
 # ─── Bot events ──────────────────────────────────────────────
+
+async def _openai_sanity_check():
+    """
+    On boot, log a masked API key and perform a tiny Responses call to verify headers/auth.
+    """
+    try:
+        key = OPENAI_API_KEY or ""
+        masked = ("…" + key[-6:]) if key else "<missing>"
+        # Warn if the key looks like it has leading/trailing whitespace
+        if key and key != key.strip():
+            logger.warning("OPENAI_API_KEY appears to have leading/trailing whitespace.")
+        logger.info("OpenAI sanity: key tail=%s, model=%s", masked, TEXT_MODEL)
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(
+            None,
+            lambda: client.responses.create(
+                model=TEXT_MODEL,
+                input="healthcheck",
+                max_output_tokens=1,
+                reasoning={"effort":"minimal"},
+                verbosity="low",
+            )
+        )
+        rid = getattr(resp, "id", "unknown")
+        rmodel = getattr(resp, "model", TEXT_MODEL)
+        logger.info("OpenAI sanity OK (id=%s, model=%s)", rid, rmodel)
+    except Exception as e:
+        logger.error("OpenAI sanity FAILED: %s", e)
+
 @bot.event
 async def setup_hook():
+    await _openai_sanity_check()
 
 
     pool = await db_pool()

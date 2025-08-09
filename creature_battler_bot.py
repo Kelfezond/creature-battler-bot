@@ -28,6 +28,16 @@ _client_httpx = httpx.Client(timeout=30.0)
 client = OpenAI(api_key=OPENAI_API_KEY, http_client=_client_httpx)
 logger.info("OpenAI client initialized: SDK active")
 
+# ─── Discord bot setup ──────────────────────────────────────
+intents = discord.Intents.default()
+# Enable if you need to read message content for prefix commands/logging
+intents.message_content = True
+intents.members = True  # often useful for guild operations
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS trainers (
   user_id BIGINT PRIMARY KEY,

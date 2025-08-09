@@ -388,27 +388,34 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
 async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
-    used_names = [r["name"].lower() for r in rows]
-    used_words = {w.lower() for r in rows for w in (r["descriptors"] or [])}
-    prompt = f"""
-Invent a creature of rarity **{rarity}**. Return ONLY JSON:
-{{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
-Avoid names: {', '.join(used_names)}
-Avoid words: {', '.join(used_words)}
-"""
+    # Bound the "avoid" lists so the prompt doesn't get huge
+    used_names = [ (r["name"] or "").lower() for r in rows if r.get("name") ][:200]
+    used_words = sorted({ (w or "").lower() for r in rows for w in (r["descriptors"] or []) })[:200]
+    prompt = (
+        "Return ONLY a strict JSON object for a new arena creature.
+"
+        "Schema:
+"
+        '{"name":"1-3 words (letters/spaces/hyphens only)","descriptors":["w1","w2","w3"]}
+'
+        f"Constraints: rarity={rarity}. Use unique single-word descriptors. "
+        f"Avoid names: {', '.join(used_names)}. Avoid descriptor words: {', '.join(used_words)}."
+    )
     for _ in range(3):
         try:
-            resp_text = await asyncio.get_running_loop().run_in_executor(
+            data = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: ai_text(prompt, temperature=1.0, max_tokens=100)
+                lambda: ai_json(prompt, temperature=0.8, max_tokens=120)
             )
-            data = json.loads(resp_text)
-            if "name" in data and len(data.get("descriptors", [])) == 3:
-                data["name"] = data["name"].title()
+            # Validate minimally
+            if isinstance(data, dict) and "name" in data and isinstance(data.get("descriptors"), list) and len(data["descriptors"]) == 3:
+                data["name"] = str(data["name"]).title()
+                # Clean descriptors to single words
+                data["descriptors"] = [str(w).split()[0].strip(",.;:!?'\"()[]{}").lower() for w in data["descriptors"]]
                 return data
         except Exception as e:
-            logger.error("OpenAI error: %s", e)
-    return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
+            logger.error("OpenAI JSON error: %s", e)
+    return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": ["mysterious", "untamed", "blank"]}
 
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
@@ -811,7 +818,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
             None,
             lambda: ai_text(sys_prompt + "\n\n" + user_prompt, temperature=0.8, max_tokens=220)
         )
-        bio_text = resp_text.strip()
+        bio_text = resp.strip()
     except Exception as e:
         logger.error("OpenAI bio error: %s", e)
         bio_text = "A lab-forged arena combatant. (Bio generation failed.)"
@@ -829,7 +836,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
             None,
             lambda: ai_image(img_prompt, size="1024x1024")
         )
-        image_url = img_resp["data"][0]["url"]
+        image_url = img_resp
     except Exception as e:
         logger.error("OpenAI image error: %s", e)
         image_url = None

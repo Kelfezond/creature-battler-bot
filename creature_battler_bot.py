@@ -19,6 +19,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5-mini")
 IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+OPENAI_DEBUG = os.getenv("OPENAI_DEBUG", "0") == "1"
 
 logger.info("Using TEXT_MODEL=%s, IMAGE_MODEL=%s", TEXT_MODEL, IMAGE_MODEL)
 
@@ -325,11 +326,18 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
     used_names = [r["name"].lower() for r in rows]
     used_words = {w.lower() for r in rows for w in (r["descriptors"] or [])}
+
+    # Random 50 sample for prompt compactness
+    used_names_list = list(used_names)
+    used_words_list = list(used_words)
+    from random import sample as _rsample
+    avoid_names = _rsample(used_names_list, min(50, len(used_names_list)))
+    avoid_words = _rsample(used_words_list, min(50, len(used_words_list)))
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
 {{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
-Avoid names: {', '.join(used_names)}
-Avoid words: {', '.join(used_words)}
+Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
+Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
 """
     for _ in range(3):
         try:
@@ -338,7 +346,7 @@ Avoid words: {', '.join(used_words)}
                 lambda: client.responses.create(
                     model=TEXT_MODEL,
                     input=prompt,
-                    temperature=1.0, max_output_tokens=100,
+                    temperature=1.0, max_output_tokens=256,
                 )
             )
             text = (getattr(resp, 'output_text', '') or '').strip()
@@ -360,7 +368,24 @@ Avoid words: {', '.join(used_words)}
 
 
 # ─── OpenAI helpers (Responses API) ─────────────────────────
-async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 200) -> dict | None:
+
+def _safe_dump_response(resp) -> str:
+    try:
+        if hasattr(resp, "model_dump"):
+            d = resp.model_dump(exclude_none=True)
+        elif hasattr(resp, "dict"):
+            d = resp.dict()
+        else:
+            return str(resp)[:1200]
+        import json as _json
+        return _json.dumps(d, ensure_ascii=False)[:1200]
+    except Exception:
+        try:
+            return str(resp)[:1200]
+        except Exception:
+            return "<unprintable response>"
+
+async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 512) -> dict | None:
     """
     Calls the Responses API and requests a strict JSON object back.
     Returns a dict or None on failure.
@@ -380,6 +405,8 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
         text = getattr(resp, "output_text", None) or ""
         text = text.strip()
         if not text:
+            if OPENAI_DEBUG:
+                logger.error("Responses debug (empty): %s", _safe_dump_response(resp))
             return None
         return json.loads(text)
     except Exception as e:

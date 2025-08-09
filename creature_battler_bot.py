@@ -7,19 +7,17 @@ import asyncpg
 import discord
 from discord.ext import commands, tasks
 import httpx
+from openai import OpenAI
 import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-from openai import OpenAI
-client = OpenAI(http_client=httpx.Client())
+client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client()))
 logger.info("OpenAI client initialized: SDK active")
 # ─── Basic config & logging ──────────────────────────────────
-
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 

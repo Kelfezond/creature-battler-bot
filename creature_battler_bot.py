@@ -26,18 +26,46 @@ except Exception as _e:
     client = None
 
 
+
 def _extract_response_text(resp) -> str:
     """
     Extract best-effort text from OpenAI SDK responses across versions.
     Returns "" if nothing usable is found.
     """
     try:
+        # New Responses API convenience
         text = getattr(resp, "output_text", None)
         if isinstance(text, str) and text.strip():
             return text.strip()
     except Exception:
         pass
     try:
+        # Object-style Responses API (pydantic objects)
+        out = getattr(resp, "output", None)
+        if out and isinstance(out, (list, tuple)) and len(out) > 0:
+            first = out[0]
+            content = getattr(first, "content", None)
+            if content and isinstance(content, (list, tuple)) and len(content) > 0:
+                item0 = content[0]
+                # item0.text could be a string or an object with .value
+                t = getattr(item0, "text", None)
+                if isinstance(t, str) and t.strip():
+                    return t.strip()
+                if hasattr(t, "value"):
+                    v = getattr(t, "value", "")
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                # Some SDKs wrap as dict-like
+                if isinstance(item0, dict):
+                    tv = item0.get("text", {})
+                    if isinstance(tv, dict):
+                        v = tv.get("value", "")
+                        if isinstance(v, str) and v.strip():
+                            return v.strip()
+    except Exception:
+        pass
+    try:
+        # Older Chat Completions style
         choices = getattr(resp, "choices", None)
         if choices and len(choices) > 0:
             msg = getattr(choices[0], "message", None) or {}
@@ -47,7 +75,9 @@ def _extract_response_text(resp) -> str:
     except Exception:
         pass
     try:
+        # Raw dict-like access fallback
         if isinstance(resp, dict):
+            # Responses API dict
             if "output" in resp:
                 out = resp["output"]
                 if isinstance(out, list) and out:
@@ -60,6 +90,7 @@ def _extract_response_text(resp) -> str:
                                 t = text_item.get("text", {}).get("value", "") or text_item.get("text", "") or ""
                                 if isinstance(t, str) and t.strip():
                                     return t.strip()
+            # Chat completions dict
             if "choices" in resp and resp["choices"]:
                 content = resp["choices"][0].get("message", {}).get("content", "")
                 if isinstance(content, str) and content.strip():
@@ -67,6 +98,7 @@ def _extract_response_text(resp) -> str:
     except Exception:
         pass
     return ""
+
 
 
 def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> str:
@@ -82,7 +114,7 @@ def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
 def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> dict:
     """
     Calls GPT-5 Mini and expects a strict JSON object back.
-    Returns a Python dict (or {} on failure).
+    Returns a Python dict (or a rich default on failure).
     """
     if client is None:
         raise RuntimeError("OpenAI client not initialized")
@@ -94,9 +126,13 @@ def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
             max_output_tokens=max_tokens
         )
         text_out = _extract_response_text(resp)
+        try:
+            logger.debug("AI RAW length: %s", len(text_out) if isinstance(text_out, str) else "n/a")
+        except Exception:
+            pass
         if not isinstance(text_out, str) or not text_out.strip():
             logger.error("AI JSON empty output")
-        return {"name": "", "species": "", "tags": [], "abilities": [], "stats": {}}
+            return {"name": "", "descriptors": ["wild","untamed","blank"], "species": "", "tags": [], "abilities": [], "stats": {}}
         raw = text_out.strip()
         if raw.startswith("```"):
             raw = raw.strip("`")
@@ -108,7 +144,8 @@ def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
         return json.loads(raw)
     except Exception as e:
         logger.error("AI JSON request/parse error: %s", e)
-    return {"name": "", "species": "", "tags": [], "abilities": [], "stats": {}}
+        return {"name": "", "descriptors": ["wild","untamed","blank"], "species": "", "tags": [], "abilities": [], "stats": {}}
+
 def ai_image(prompt: str, size: str = "1024x1024") -> str:
     if client is None:
         raise RuntimeError("OpenAI client not initialized")
@@ -447,12 +484,14 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
             # Validate minimally
             if isinstance(data, dict) and "name" in data and isinstance(data.get("descriptors"), list) and len(data["descriptors"]) == 3:
                 data["name"] = str(data["name"]).title()
+                if not data["name"].strip():
+                    data["name"] = f"Wild {rarity.title()} {random.randint(1000,9999)}"
                 # Clean descriptors to single words
                 data["descriptors"] = [str(w).split()[0].strip(",.;:!?'\"()[]{}").lower() for w in data["descriptors"]]
                 return data
         except Exception as e:
             logger.error("OpenAI JSON error: %s", e)
-    return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": ["mysterious", "untamed", "blank"]}
+    return {"name": f"Wild {rarity.title()} {random.randint(1000,9999)}", "descriptors": ["wild","untamed","blank"]}
 
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]

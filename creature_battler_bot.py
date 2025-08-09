@@ -43,6 +43,35 @@ def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
         except Exception:
             return ""
 
+def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> dict:
+    """
+    Calls GPT-5 Mini and expects a strict JSON object back.
+    Returns a Python dict (or {} on failure).
+    """
+    if client is None:
+        raise RuntimeError("OpenAI client not initialized")
+    logger.info("Using gpt-5-mini for JSON generation")
+    try:
+        resp = client.responses.create(
+            model="gpt-5-mini",
+            input=input_text,
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            response_format={"type": "json_object"}
+        )
+        text_out = getattr(resp, "output_text", "") or ""
+        if not text_out.strip():
+            logger.error("AI JSON empty output")
+            return {}
+        try:
+            return json.loads(text_out)
+        except Exception as e:
+            logger.error("AI JSON parse error: %s | Raw: %s", e, text_out[:200])
+            return {}
+    except Exception as e:
+        logger.error("AI JSON request error: %s", e)
+        return {}
+
 def ai_image(prompt: str, size: str = "1024x1024") -> str:
     if client is None:
         raise RuntimeError("OpenAI client not initialized")

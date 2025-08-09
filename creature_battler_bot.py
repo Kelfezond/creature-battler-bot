@@ -8,11 +8,10 @@ import discord
 from discord.ext import commands, tasks
 import httpx
 from openai import OpenAI
-import logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client())
-logger.info("OpenAI client initialized: SDK active")
+
 # ─── Basic config & logging ──────────────────────────────────
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")
@@ -21,44 +20,14 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 
-# Admin allow-list for privileged commands (e.g., /cashadd, /setleaderboardchannel)
-def _parse_admin_ids(raw: Optional[str]) -> set[int]:
-    ids: set[int] = set()
-    if not raw:
-        return ids
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            ids.add(int(part))
-        except ValueError:
-            logger.warning("Ignoring non-integer ADMIN_USER_IDS entry: %r", part)
-    return ids
+# Validate required env vars early
 
-ADMIN_USER_IDS: set[int] = _parse_admin_ids(os.getenv("ADMIN_USER_IDS"))
+# Initialize OpenAI client (explicit httpx client to avoid proxy issues)
+# If your environment injects proxies, remove http_client below and let SDK manage it.
+_client_httpx = httpx.Client(timeout=30.0)
+client = OpenAI(api_key=OPENAI_API_KEY, http_client=_client_httpx)
+logger.info("OpenAI client initialized: SDK active")
 
-for env_name, env_val in {
-    "DISCORD_TOKEN": TOKEN,
-    "DATABASE_URL": DB_URL,
-    "OPENAI_API_KEY": OPENAI_API_KEY,
-}.items():
-    if not env_val:
-        raise RuntimeError(f"Missing environment variable: {env_name}")
-
-if ADMIN_USER_IDS:
-    logger.info("Admin allow-list loaded: %s", ", ".join(map(str, ADMIN_USER_IDS)))
-else:
-    logger.warning("ADMIN_USER_IDS is not set; privileged commands will be denied for all users.")
-
-# ─── Discord client ──────────────────────────────────────────
-intents = discord.Intents.default()
-# Keep message content if you already had it enabled for your app
-intents.message_content = True
-# IMPORTANT: do NOT enable members intent; we resolve trainer names via REST/cache
-bot = commands.Bot(command_prefix="/", intents=intents)
-
-# ─── Database helpers ────────────────────────────────────────
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS trainers (
   user_id BIGINT PRIMARY KEY,

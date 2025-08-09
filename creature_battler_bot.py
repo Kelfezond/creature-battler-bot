@@ -943,35 +943,35 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
 async def setup_hook():
 
 
-pool = await db_pool()
-async with pool.acquire() as conn:
-    await conn.execute(SCHEMA_SQL)
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(SCHEMA_SQL)
 
-await _backfill_creature_records()
+    await _backfill_creature_records()
 
-if GUILD_ID:
-    guild_obj = discord.Object(id=int(GUILD_ID))
-    # Copy all defined commands to the guild and sync there
-    bot.tree.copy_global_to(guild=guild_obj)
-    await bot.tree.sync(guild=guild_obj)
-    # IMPORTANT: Clear global commands and sync empty to remove duplicates in suggestions
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
-    logger.info("Synced to guild %s and cleared global commands.", GUILD_ID)
-else:
-    await bot.tree.sync()
-    logger.info("Synced globally")
+    if GUILD_ID:
+        guild_obj = discord.Object(id=int(GUILD_ID))
+        # Copy all defined commands to the guild and sync there
+        bot.tree.copy_global_to(guild=guild_obj)
+        await bot.tree.sync(guild=guild_obj)
+        # IMPORTANT: Clear global commands and sync empty to remove duplicates in suggestions
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        logger.info("Synced to guild %s and cleared global commands.", GUILD_ID)
+    else:
+        await bot.tree.sync()
+        logger.info("Synced globally")
 
-for loop in (distribute_cash, distribute_points, regenerate_hp, update_leaderboard_periodic):
-    if not loop.is_running():
-        loop.start()
+    for loop in (distribute_cash, distribute_points, regenerate_hp, update_leaderboard_periodic):
+        if not loop.is_running():
+            loop.start()
 
-chan_id = await _get_leaderboard_channel_id()
-if chan_id:
-    await _get_or_create_leaderboard_message(chan_id)
-    await update_leaderboard_now(reason="startup")
-else:
-    logger.info("No leaderboard channel configured yet. Use /setleaderboardchannel in the desired channel or set LEADERBOARD_CHANNEL_ID.")
+    chan_id = await _get_leaderboard_channel_id()
+    if chan_id:
+        await _get_or_create_leaderboard_message(chan_id)
+        await update_leaderboard_now(reason="startup")
+    else:
+        logger.info("No leaderboard channel configured yet. Use /setleaderboardchannel in the desired channel or set LEADERBOARD_CHANNEL_ID.")
 
 
 @bot.event
@@ -980,10 +980,9 @@ async def on_ready():
     try:
         # No global sync here; setup_hook already handled guild/global registration and cleanup.
         synced = []
-        logger.info("Ready.")", len(synced))
+        logger.info("Ready. (%d commands)", len(synced))
     except Exception as e:
-    logger.exception("Error during on_ready: %s", e)
-
+        logger.exception("Error during on_ready: %s", e)
 # ─── Slash commands ─────────────────────────────────────────
 
 @bot.tree.command(description="(Admin) Set this channel as the live leaderboard channel")

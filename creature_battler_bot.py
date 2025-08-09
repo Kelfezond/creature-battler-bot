@@ -11,7 +11,7 @@ from openai import OpenAI
 import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client()))
+client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client())
 logger.info("OpenAI client initialized: SDK active")
 # ─── Basic config & logging ──────────────────────────────────
 TOKEN     = os.getenv("DISCORD_TOKEN")
@@ -41,7 +41,7 @@ ADMIN_USER_IDS: set[int] = _parse_admin_ids(os.getenv("ADMIN_USER_IDS"))
 for env_name, env_val in {
     "DISCORD_TOKEN": TOKEN,
     "DATABASE_URL": DB_URL,
-    "OPENAI_API_KEY": openai.api_key,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
 }.items():
     if not env_val:
         raise RuntimeError(f"Missing environment variable: {env_name}")

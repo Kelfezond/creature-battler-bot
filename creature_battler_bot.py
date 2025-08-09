@@ -391,16 +391,16 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     # Bound the "avoid" lists so the prompt doesn't get huge
     used_names = [ (r["name"] or "").lower() for r in rows if r.get("name") ][:200]
     used_words = sorted({ (w or "").lower() for r in rows for w in (r["descriptors"] or []) })[:200]
-    prompt = (
-        "Return ONLY a strict JSON object for a new arena creature.
-"
-        "Schema:
-"
-        '{"name":"1-3 words (letters/spaces/hyphens only)","descriptors":["w1","w2","w3"]}
-'
-        f"Constraints: rarity={rarity}. Use unique single-word descriptors. "
-        f"Avoid names: {', '.join(used_names)}. Avoid descriptor words: {', '.join(used_words)}."
-    )
+    prompt = textwrap.dedent("""\
+    Return ONLY a strict JSON object for a new arena creature.
+    Schema:
+    {"name":"1-3 words (letters/spaces/hyphens only)","descriptors":["w1","w2","w3"]}
+    Constraints: rarity={RARITY}. Use unique single-word descriptors. Avoid names: {AVOID_NAMES}. Avoid descriptor words: {AVOID_WORDS}.
+    """)
+    prompt = (prompt
+              .replace("{RARITY}", rarity)
+              .replace("{AVOID_NAMES}", ", ".join(used_names))
+              .replace("{AVOID_WORDS}", ", ".join(used_words)))
     for _ in range(3):
         try:
             data = await asyncio.get_running_loop().run_in_executor(

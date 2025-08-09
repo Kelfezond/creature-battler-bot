@@ -1,3 +1,5 @@
+import logging
+import os
 from __future__ import annotations
 import asyncio, json, logging, math, os, random, time
 from dataclasses import dataclass
@@ -12,6 +14,42 @@ from openai import OpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ─── Admin allow-list (ENV-driven) ───────────────────────────
+def _parse_admin_ids(raw: str):
+    s = set()
+    if not raw:
+        return s
+    for tok in raw.replace(",", " ").split():
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            s.add(int(tok))
+        except Exception:
+            pass
+    return s
+
+# Always define the symbol to avoid NameError
+try:
+    ADMIN_USER_IDS
+except NameError:
+    ADMIN_USER_IDS = set()
+
+# Merge ENV values into ADMIN_USER_IDS
+_env_ids = _parse_admin_ids(os.getenv("ADMIN_USER_IDS", ""))
+if _env_ids:
+    ADMIN_USER_IDS |= _env_ids
+
+# Log status
+try:
+    _ids_preview = ",".join(str(i) for i in sorted(ADMIN_USER_IDS)) if ADMIN_USER_IDS else "(empty)"
+    logger.info("Admin allow-list loaded: %s", _ids_preview)
+except Exception:
+    print("Admin allow-list loaded:", ",".join(str(i) for i in sorted(ADMIN_USER_IDS)) if ADMIN_USER_IDS else "(empty)")
+
+if not ADMIN_USER_IDS:
+    logger.warning("ADMIN_USER_IDS is empty. /cashadd will reject everyone. Set the env var on the *bot service*, not the database service.")
 # ─── Basic config & logging ──────────────────────────────────
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")
@@ -1310,6 +1348,16 @@ async def cash(inter: discord.Interaction):
 
 @bot.tree.command(description="Add cash (dev utility)")
 async def cashadd(inter: discord.Interaction, amount: int):
+    # Guard: require ADMIN_USER_IDS configured and membership
+    if not ADMIN_USER_IDS:
+        await inter.response.send_message(
+            "Admin list is empty. Set ADMIN_USER_IDS on the bot service.", ephemeral=True
+        )
+        return
+    user_id = inter.user.id
+    if user_id not in ADMIN_USER_IDS:
+        await inter.response.send_message("You are not permitted to use this command.", ephemeral=True)
+        return
     # Admin gate for /cashadd
     try:
         user_id = inter.user.id if 'inter' in locals() or 'inter' in globals() else (interaction.user.id if 'interaction' in locals() or 'interaction' in globals() else None)

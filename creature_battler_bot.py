@@ -111,36 +111,63 @@ def ai_text(input_text: str, temperature: float = 1.0, max_tokens: int = 200) ->
         max_output_tokens=max_tokens
     )
     return _extract_response_text(resp)
+
 def ai_json(input_text: str, temperature: float = 1.0, max_tokens: int = 200) -> dict:
     """
     Calls GPT-5 Mini and expects a strict JSON object back.
     Returns a Python dict (or a rich default on failure).
+    Strategy: try plain string `input` first; if empty text, retry with role/content format.
     """
     if client is None:
         raise RuntimeError("OpenAI client not initialized")
     logger.info("Using gpt-5-mini for JSON generation")
-    try:
+
+    def _attempt(payload_input):
         resp = client.responses.create(
             model="gpt-5-mini",
-            input="Return ONLY a strict JSON object. Do not include code fences.\n\n" + input_text,
+            input=payload_input,
             max_output_tokens=max_tokens
         )
         text_out = _extract_response_text(resp)
         try:
-            logger.debug("AI RAW length: %s", len(text_out) if isinstance(text_out, str) else "n/a")
+            if isinstance(text_out, str):
+                logger.debug("AI RAW length: %s", len(text_out))
+                if 0 < len(text_out) <= 200:
+                    logger.debug("AI RAW preview: %r", text_out)
+            else:
+                logger.debug("AI RAW length: n/a")
         except Exception:
             pass
-        if not isinstance(text_out, str) or not text_out.strip():
-            logger.error("AI JSON empty output")
-            return {"name": "", "descriptors": ["wild","untamed","blank"], "species": "", "tags": [], "abilities": [], "stats": {}}
-        raw = text_out.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            raw = "\n".join(raw.split("\n")[1:])
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first != -1 and last != -1 and last > first:
-            raw = raw[first:last+1]
+        return text_out
+
+    # Attempt 1: simple string input
+    prompt = "Return ONLY a strict JSON object. Do not include code fences.\n\n" + input_text
+    text_out = _attempt(prompt)
+
+    # Attempt 2: role/content format if empty
+    if not isinstance(text_out, str) or not text_out.strip():
+        role_payload = [{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}]
+        }]
+        text_out = _attempt(role_payload)
+
+    if not isinstance(text_out, str) or not text_out.strip():
+        logger.error("AI JSON empty output (after 2 attempts)")
+        return {"name": "", "descriptors": ["wild","untamed","blank"], "species": "", "tags": [], "abilities": [], "stats": {}}
+
+    raw = text_out.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = "\n".join(raw.split("\n")[1:])
+
+    # clamp to object braces
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        raw = raw[first:last+1]
+
+    try:
         return json.loads(raw)
     except Exception as e:
         logger.error("AI JSON request/parse error: %s", e)
@@ -491,7 +518,7 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
                 return data
         except Exception as e:
             logger.error("OpenAI JSON error: %s", e)
-    return {"name": f"Wild {rarity.title()} {random.randint(1000,9999)}", "descriptors": ["wild","untamed","blank"]}
+    return {"name": f"Wildling {random.randint(1000,9999)}", "descriptors": ["feral","swift","arcane"]}
 
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]

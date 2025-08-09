@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import discord
 from discord.ext import commands, tasks
-from openai import OpenAI
+import openai
 
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -15,10 +15,7 @@ logger = logging.getLogger(__name__)
 TOKEN     = os.getenv("DISCORD_TOKEN")
 DB_URL    = os.getenv("DATABASE_URL")
 GUILD_ID  = os.getenv("GUILD_ID") or None
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
-TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5-mini")
-IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
@@ -43,7 +40,7 @@ ADMIN_USER_IDS: set[int] = _parse_admin_ids(os.getenv("ADMIN_USER_IDS"))
 for env_name, env_val in {
     "DISCORD_TOKEN": TOKEN,
     "DATABASE_URL": DB_URL,
-    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "OPENAI_API_KEY": openai.api_key,
 }.items():
     if not env_val:
         raise RuntimeError(f"Missing environment variable: {env_name}")
@@ -335,7 +332,7 @@ Avoid words: {', '.join(used_words)}
                 None,
                 lambda: client.responses.create(
                     model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}],
+                    input=[{"role": "user", "content": prompt}],
                     temperature=1.0, max_tokens=100,
                 )
             )
@@ -346,34 +343,6 @@ Avoid words: {', '.join(used_words)}
         except Exception as e:
             logger.error("OpenAI error: %s", e)
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
-
-
-# ─── OpenAI helpers (Responses API) ─────────────────────────
-async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 200) -> dict | None:
-    """
-    Calls the Responses API and requests a strict JSON object back.
-    Returns a dict or None on failure.
-    """
-    loop = asyncio.get_running_loop()
-    try:
-        resp = await loop.run_in_executor(
-            None,
-            lambda: client.responses.create(
-                model=TEXT_MODEL,
-                input=prompt,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                response_format={"type": "json_object"},
-            )
-        )
-        text = getattr(resp, "output_text", None) or ""
-        text = text.strip()
-        if not text:
-            return None
-        return json.loads(text)
-    except Exception as e:
-        logger.error("OpenAI JSON call failed: %s", e)
-        return None
 
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
@@ -776,7 +745,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
             None,
             lambda: client.responses.create(
                 model="gpt-3.5-turbo",
-                messages=[
+                input=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
@@ -800,7 +769,8 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: client.images.generate(model=IMAGE_MODEL, prompt=img_prompt,
+            lambda: openai.Image.create(
+                prompt=img_prompt,
                 n=1,
                 size="1024x1024"
             )

@@ -346,8 +346,7 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
                 None,
                 lambda: client.responses.create(
                     model=TEXT_MODEL,
-                    input=prompt,
-                    temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS,
+                    input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS,
                 )
             )
             text = (getattr(resp, 'output_text', '') or '').strip()
@@ -429,7 +428,6 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
             lambda: client.responses.create(
                 model=TEXT_MODEL,
                 input=prompt,
-                temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 response_format={"type": "json_object"},
             )
@@ -850,7 +848,6 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.8,
                 max_output_tokens=MAX_OUTPUT_TOKENS,
             )
         )

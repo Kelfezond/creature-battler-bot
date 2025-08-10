@@ -1,8 +1,4 @@
 from __future__ import annotations
-# Concurrency controls
-BATTLE_LOCK = asyncio.Lock()
-SPAWN_SEMAPHORE = asyncio.Semaphore(2)
-
 import asyncio, json, logging, math, os, random, time, re
 
 # Global battle lock
@@ -12,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
 from openai import OpenAI
 
@@ -1137,16 +1132,46 @@ async def on_ready():
     except Exception as e:
         logger.exception("Error during on_ready: %s", e)
 
-# Interaction helpers
-async def safe_ack(inter: discord.Interaction, *, thinking: bool = True, ephemeral: bool = False) -> bool:
+# ─── Admin helper resolvers ─────────────────────────────────
+async def _extract_user_id_from_mention_or_id(s: str) -> Optional[int]:
+    """
+    Accepts formats: <@123>, <@!123>, raw numeric id '123'.
+    Returns int user_id or None.
+    """
     try:
-        if not inter.response.is_done():
-            await inter.response.defer(thinking=thinking, ephemeral=ephemeral)
-    except discord.NotFound:
-        return False
+        s = s.strip()
+        m = re.match(r"<@!?(\d+)>", s)
+        if m:
+            return int(m.group(1))
+        if s.isdigit():
+            return int(s)
+        return None
     except Exception:
-        pass
-    return True
+        return None
+
+async def _find_single_trainer_id_by_display_name(name_like: str) -> Optional[int]:
+    """
+    Try to resolve a single trainer by display_name (case-insensitive).
+    Prefers exact (ILIKE) match; if multiple, returns None (ambiguous).
+    """
+    pool = await db_pool()
+    # First try exact case-insensitive match
+    rows = await pool.fetch(
+        "SELECT user_id FROM trainers WHERE display_name ILIKE $1",
+        name_like
+    )
+    if not rows:
+        # Try wildcard contains search
+        rows = await pool.fetch(
+            "SELECT user_id FROM trainers WHERE display_name ILIKE $1",
+            f"%{name_like}%"
+        )
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return int(rows[0]["user_id"])
+    # Ambiguous
+    return None
 
 # ─── Slash commands ─────────────────────────────────────────
 
@@ -1199,12 +1224,6 @@ async def register(inter: discord.Interaction):
 
 @bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
 async def spawn(inter: discord.Interaction):
-    if not await safe_ack(inter, thinking=True):
-        return
-    # limit concurrent spawns
-    if SPAWN_SEMAPHORE.locked():
-        await inter.followup.send("Spawning is busy—try again in a moment.", ephemeral=True)
-        return
     row = await ensure_registered(inter)
     if not row:
         return
@@ -1351,27 +1370,89 @@ async def glyphs(inter: discord.Interaction, creature_name: str):
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
+
+@bot.tree.command(description="(Admin) Reimburse daily battle usage for a creature by name")
+async def dailylimit(inter: discord.Interaction, creature_name: str, number: int):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if number <= 0:
+        return await inter.response.send_message("Number must be positive.", ephemeral=True)
+
+    pool = await db_pool()
+    rows = await pool.fetch(
+        "SELECT id, name, owner_id FROM creatures WHERE name ILIKE $1",
+        creature_name
+    )
+    if not rows:
+        rows = await pool.fetch(
+            "SELECT id, name, owner_id FROM creatures WHERE name ILIKE $1",
+            f"%{creature_name}%"
+        )
+    if not rows:
+        return await inter.response.send_message("No creature found by that name.", ephemeral=True)
+
+    exact = [r for r in rows if str(r["name"]).lower() == creature_name.lower()]
+    if len(rows) > 1 and len(exact) == 1:
+        rows = exact
+    if len(rows) != 1:
+        preview_names = []
+        for r in rows[:8]:
+            owner_name = await _resolve_trainer_name_from_db(int(r["owner_id"])) or str(r["owner_id"])
+            preview_names.append(f"{r['name']} (owner {owner_name})")
+        return await inter.response.send_message(
+            "Multiple creatures match that name. Be more specific.\nMatches: " + ", ".join(preview_names),
+            ephemeral=True
+        )
+
+    creature_id = int(rows[0]["id"])
+    cname = str(rows[0]["name"])
+    owner_id = int(rows[0]["owner_id"])
+    owner_name = await _resolve_trainer_name_from_db(owner_id) or str(owner_id)
+
+    async with (await db_pool()).acquire() as conn:
+        async with conn.transaction():
+            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+            row = await conn.fetchrow(
+                "SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE",
+                creature_id, day
+            )
+            if not row:
+                return await inter.response.send_message(
+                    f"No battle usage recorded today for **{cname}** (owner {owner_name}); nothing to reimburse.",
+                    ephemeral=True
+                )
+            current = int(row["count"])
+            new_count = max(0, current - number)
+            if new_count == 0:
+                await conn.execute(
+                    "DELETE FROM battle_caps WHERE creature_id=$1 AND day=$2",
+                    creature_id, day
+                )
+            else:
+                await conn.execute(
+                    "UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2",
+                    creature_id, day, new_count
+                )
+
+    await inter.response.send_message(
+        f"Reimbursed **{number}** daily usage for **{cname}** (owner {owner_name}).",
+        ephemeral=True
+    )
+
 @bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
 async def battle(inter: discord.Interaction, creature_name: str, tier: int):
-    if not await safe_ack(inter, thinking=True):
+    if tier not in TIER_EXTRAS:
+        return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
+    if inter.user.id in active_battles:
+        return await inter.response.send_message("You already have an active battle – use /continue.", ephemeral=True)
+    if not await ensure_registered(inter):
         return
-    # single battle at a time (simple gate)
-    if BATTLE_LOCK.locked():
-        await inter.followup.send("A battle is already running—try again in a moment.", ephemeral=True)
-        return
-    async with BATTLE_LOCK:
-        if tier not in TIER_EXTRAS:
-            return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
-        if inter.user.id in active_battles:
-            return await inter.response.send_message("You already have an active battle – use /continue.", ephemeral=True)
-        if not await ensure_registered(inter):
-            return
-    
-    
-        # Global battle gate: only one battle may run at a time
-        global current_battler_id
-        if battle_lock.locked() and (current_battler_id is not None) and (current_battler_id != inter.user.id):
-            await inter.response.send_message(
+
+
+    # Global battle gate: only one battle may run at a time
+    global current_battler_id
+    if battle_lock.locked() and (current_battler_id is not None) and (current_battler_id != inter.user.id):
+        await inter.response.send_message(
             f"⚔ A battle is already in progress by <@{current_battler_id}>. Please try again shortly.",
             ephemeral=True
         )
@@ -1543,18 +1624,78 @@ async def cash(inter: discord.Interaction):
     if row:
         await inter.response.send_message(f"You have {row['cash']} cash.", ephemeral=True)
 
-@bot.tree.command(description="Add cash (dev utility)")
-async def cashadd(inter: discord.Interaction, amount: int):
+
+@bot.tree.command(description="(Admin) Add cash to a player by name/mention/id, or 'all'")
+async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
     if inter.user.id not in ADMIN_USER_IDS:
         return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
     if amount <= 0:
         return await inter.response.send_message("Positive amounts only.", ephemeral=True)
-    if not await ensure_registered(inter):
-        return
-    await (await db_pool()).execute(
-        "UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, inter.user.id
-    )
-    await inter.response.send_message(f"Added {amount} cash.", ephemeral=True)
+
+    tgt = (target or "").strip()
+    if tgt.lower() in ("me", "self"):
+        user_id = inter.user.id
+    elif tgt.lower() == "all":
+        updated = await (await db_pool()).execute("UPDATE trainers SET cash = cash + $1", amount)
+        try:
+            count = int(str(updated).split()[-1])
+        except Exception:
+            count = 0
+        return await inter.response.send_message(f"Added {amount} cash to **all** trainers ({count} rows).", ephemeral=True)
+    else:
+        user_id = await _extract_user_id_from_mention_or_id(tgt)
+        if user_id is None:
+            user_id = await _find_single_trainer_id_by_display_name(tgt)
+        if user_id is None:
+            return await inter.response.send_message(
+                "Couldn't uniquely resolve that trainer. Try a mention, raw ID, or an exact display name.", ephemeral=True
+            )
+
+    pool = await db_pool()
+    exists = await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id)
+    if not exists:
+        return await inter.response.send_message("That user isn't registered.", ephemeral=True)
+
+    await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, user_id)
+    name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
+    await inter.response.send_message(f"Added **{amount}** cash to **{name}**.", ephemeral=True)
+
+
+@bot.tree.command(description="(Admin) Add trainer points to a player by name/mention/id, or 'all'")
+async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str = "me"):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if amount <= 0:
+        return await inter.response.send_message("Positive amounts only.", ephemeral=True)
+
+    tgt = (target or "").strip()
+    if tgt.lower() in ("me", "self"):
+        user_id = inter.user.id
+    elif tgt.lower() == "all":
+        updated = await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + $1", amount)
+        try:
+            count = int(str(updated).split()[-1])
+        except Exception:
+            count = 0
+        return await inter.response.send_message(f"Added {amount} trainer points to **all** trainers ({count} rows).", ephemeral=True)
+    else:
+        user_id = await _extract_user_id_from_mention_or_id(tgt)
+        if user_id is None:
+            user_id = await _find_single_trainer_id_by_display_name(tgt)
+        if user_id is None:
+            return await inter.response.send_message(
+                "Couldn't uniquely resolve that trainer. Try a mention, raw ID, or an exact display name.", ephemeral=True
+            )
+
+    pool = await db_pool()
+    exists = await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id)
+    if not exists:
+        return await inter.response.send_message("That user isn't registered.", ephemeral=True)
+
+    await pool.execute("UPDATE trainers SET trainer_points = trainer_points + $1 WHERE user_id=$2", amount, user_id)
+    name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
+    await inter.response.send_message(f"Added **{amount}** trainer points to **{name}**.", ephemeral=True)
+
 
 @bot.tree.command(description="Check your trainer points")
 async def trainerpoints(inter: discord.Interaction):
@@ -1762,117 +1903,3 @@ async def info(inter: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-
-# Admin: resolve mention/id/name
-async def _extract_user_id_from_mention_or_id(s: str):
-    s = (s or "").strip()
-    m = re.match(r"<@!?(\d+)>", s)
-    if m:
-        return int(m.group(1))
-    if s.isdigit():
-        return int(s)
-    return None
-
-async def _find_single_trainer_id_by_display_name(name_like: str):
-    pool = await db_pool()
-    rows = await pool.fetch("SELECT user_id FROM trainers WHERE display_name ILIKE $1", name_like)
-    if not rows:
-        rows = await pool.fetch("SELECT user_id FROM trainers WHERE display_name ILIKE $1", f"%{name_like}%")
-    if not rows:
-        return None
-    return int(rows[0]["user_id"]) if len(rows) == 1 else None
-
-
-@bot.tree.command(description="(Admin) Add cash to a player by name/mention/id, or 'all'")
-async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
-    if inter.user.id not in ADMIN_USER_IDS:
-        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
-    if amount <= 0:
-        return await inter.response.send_message("Positive amounts only.", ephemeral=True)
-
-    tgt = (target or "").strip()
-    if tgt.lower() in ("me", "self"):
-        user_id = inter.user.id
-    elif tgt.lower() == "all":
-        updated = await (await db_pool()).execute("UPDATE trainers SET cash = cash + $1", amount)
-        try:
-            count = int(str(updated).split()[-1])
-        except Exception:
-            count = 0
-        return await inter.response.send_message(f"Added {amount} cash to **all** trainers ({count} rows).", ephemeral=True)
-    else:
-        user_id = await _extract_user_id_from_mention_or_id(tgt)
-        if user_id is None:
-            user_id = await _find_single_trainer_id_by_display_name(tgt)
-        if user_id is None:
-            return await inter.response.send_message("Couldn't resolve that trainer. Use a mention, raw ID, or exact display name.", ephemeral=True)
-
-    pool = await db_pool()
-    exists = await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id)
-    if not exists:
-        return await inter.response.send_message("That user isn't registered.", ephemeral=True)
-
-    await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, user_id)
-    await inter.response.send_message(f"Added **{amount}** cash.", ephemeral=True)
-
-
-@bot.tree.command(description="(Admin) Add trainer points to a player by name/mention/id, or 'all'")
-async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str = "me"):
-    if inter.user.id not in ADMIN_USER_IDS:
-        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
-    if amount <= 0:
-        return await inter.response.send_message("Positive amounts only.", ephemeral=True)
-
-    tgt = (target or "").strip()
-    if tgt.lower() in ("me", "self"):
-        user_id = inter.user.id
-    elif tgt.lower() == "all":
-        updated = await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + $1", amount)
-        try:
-            count = int(str(updated).split()[-1])
-        except Exception:
-            count = 0
-        return await inter.response.send_message(f"Added {amount} trainer points to **all** trainers ({count} rows).", ephemeral=True)
-    else:
-        user_id = await _extract_user_id_from_mention_or_id(tgt)
-        if user_id is None:
-            user_id = await _find_single_trainer_id_by_display_name(tgt)
-        if user_id is None:
-            return await inter.response.send_message("Couldn't resolve that trainer. Use a mention, raw ID, or exact display name.", ephemeral=True)
-
-    pool = await db_pool()
-    exists = await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id)
-    if not exists:
-        return await inter.response.send_message("That user isn't registered.", ephemeral=True)
-
-    await pool.execute("UPDATE trainers SET trainer_points = trainer_points + $1 WHERE user_id=$2", amount, user_id)
-    await inter.response.send_message(f"Added **{amount}** trainer points.", ephemeral=True)
-
-
-@bot.tree.command(description="(Admin) Reimburse daily battle usage for a creature by name")
-async def dailylimit(inter: discord.Interaction, creature_name: str, number: int):
-    if inter.user.id not in ADMIN_USER_IDS:
-        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
-    if number <= 0:
-        return await inter.response.send_message("Number must be positive.", ephemeral=True)
-
-    pool = await db_pool()
-    rows = await pool.fetch("SELECT id, name FROM creatures WHERE name ILIKE $1", creature_name)
-    if not rows:
-        rows = await pool.fetch("SELECT id, name FROM creatures WHERE name ILIKE $1", f"%{creature_name}%")
-    if not rows or len(rows) > 1:
-        return await inter.response.send_message("Couldn't uniquely identify that creature.", ephemeral=True)
-
-    cid = int(rows[0]["id"])
-    async with (await db_pool()).acquire() as conn:
-        async with conn.transaction():
-            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
-            row = await conn.fetchrow("SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE", cid, day)
-            if not row:
-                return await inter.response.send_message("No battles recorded today for that creature.", ephemeral=True)
-            new_count = max(0, int(row["count"]) - number)
-            if new_count == 0:
-                await conn.execute("DELETE FROM battle_caps WHERE creature_id=$1 AND day=$2", cid, day)
-            else:
-                await conn.execute("UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2", cid, day, new_count)
-    await inter.response.send_message(f"Reimbursed **{number}** daily uses.", ephemeral=True)

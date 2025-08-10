@@ -358,10 +358,10 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
         try:
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: resp = await asyncio.to_thread(lambda: client.responses.create(
+                lambda: client.responses.create(
                     model=TEXT_MODEL,
                     input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS,
-                ))
+                )
             )
             text = (getattr(resp, 'output_text', '') or '').strip()
             if not text:
@@ -398,7 +398,7 @@ async def generate_creature_name(rarity: str) -> str:
     )
     for _ in range(3):
         try:
-            resp = resp = await asyncio.to_thread(lambda: client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS))
+            resp = client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS)
             try:
                 text = resp.output_text
             except Exception:
@@ -479,12 +479,12 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
     try:
         resp = await loop.run_in_executor(
             None,
-            lambda: resp = await asyncio.to_thread(lambda: client.responses.create(
+            lambda: client.responses.create(
                 model=TEXT_MODEL,
                 input=prompt,
                 max_output_tokens=max_output_tokens,
                 response_format={"type": "json_object"},
-            ))
+            )
         )
         text = getattr(resp, "output_text", None) or ""
         text = text.strip()
@@ -896,14 +896,14 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: resp = await asyncio.to_thread(lambda: client.responses.create(
+            lambda: client.responses.create(
                 model=TEXT_MODEL,
                 input=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 max_output_tokens=MAX_OUTPUT_TOKENS,
-            ))
+            )
         )
         bio_text = getattr(resp, 'output_text', '') or ''
     except Exception as e:
@@ -1254,11 +1254,13 @@ async def register(inter: discord.Interaction):
     )
 
 @bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
-async def spawn(inter: discord.Interaction):
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+async def spawn(inter: discord.Interaction):
     if not await safe_ack(inter, thinking=True):
         return
-    async with SPAWN_SEMAPHORE:
+    if SPAWN_SEMAPHORE.locked():
+        await safe_followup(inter, "Spawning is busy—try again in a moment.", ephemeral=True)
+        return
     row = await ensure_registered(inter)
     if not row:
         return
@@ -1475,8 +1477,8 @@ async def dailylimit(inter: discord.Interaction, creature_name: str, number: int
     )
 
 @bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
-async def battle(inter: discord.Interaction, creature_name: str, tier: int):
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if not await safe_ack(inter, thinking=True):
         return
 if BATTLE_LOCK.locked():
@@ -1972,4 +1974,3 @@ async def on_app_command_error(inter: discord.Interaction, error: app_commands.A
         # swallow
         pass
     logger.exception("App command error", exc_info=error)
-

@@ -1,5 +1,8 @@
 from __future__ import annotations
 import asyncio, json, logging, math, os, random, time, re
+
+# Global battle lock
+active_battle_user_id = None
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -232,6 +235,10 @@ class BattleState:
     rounds: int = 0
 
 active_battles: Dict[int, BattleState] = {}
+
+# ─── Global battle lock (one at a time) ───────────
+battle_lock = asyncio.Lock()
+current_battler_id: Optional[int] = None
 
 # ─── Scheduled rewards & regen ───────────────────────────────
 @tasks.loop(hours=1)
@@ -1330,6 +1337,15 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if not await ensure_registered(inter):
         return
 
+
+    # Global battle gate: only one battle may run at a time
+    global current_battler_id
+    if battle_lock.locked() and (current_battler_id is not None) and (current_battler_id != inter.user.id):
+        await inter.response.send_message(
+            f"⚔ A battle is already in progress by <@{current_battler_id}>. Please try again shortly.",
+            ephemeral=True
+        )
+        return
     c_row = await (await db_pool()).fetchrow(
         "SELECT id,name,stats,current_hp FROM creatures "
         "WHERE owner_id=$1 AND name ILIKE $2",
@@ -1360,79 +1376,92 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             "Try again after midnight Europe/London.", ephemeral=True
         )
 
-    await inter.response.defer(thinking=True)
 
-    user_cre = {"name": c_row["name"], "stats": stats}
-    rarity = rarity_for_tier(tier)
-    name_only = await generate_creature_name(rarity)
-    extra = random.randint(*TIER_EXTRAS[tier])
-    opp_stats = allocate_stats(rarity, extra)
-    opp_cre = {"name": name_only, "stats": opp_stats}
-    st = BattleState(
-        inter.user.id, c_row["id"], tier,
-        user_cre, c_row["current_hp"], max_hp,
-        opp_cre, opp_stats["HP"] * 5, opp_stats["HP"] * 5,
-        logs=[]
-    )
-    active_battles[inter.user.id] = st
-    st.logs += [
-        f"Battle start! Tier {tier} (+{extra} pts) — Daily battle use for {user_cre['name']}: {count}/{DAILY_BATTLE_CAP}",
-        f"{user_cre['name']} vs {opp_cre['name']}",
-        f"Opponent rarity (tier table) → {rarity}",
-        "",
-        "Your creature:",
-        stat_block(user_cre["name"], st.user_current_hp, st.user_max_hp, stats),
-        "Opponent:",
-        stat_block(opp_cre["name"], st.opp_max_hp, st.opp_max_hp, opp_stats),
-        "",
-        "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
-        "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
-        f"Daily cap: Each creature can start at most {DAILY_BATTLE_CAP} battles per Europe/London day.",
-    ]
-    max_tier = await _max_unlocked_tier(c_row["id"])
-    st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
+    await battle_lock.acquire()
+    current_battler_id = inter.user.id
+    try:
+        await inter.response.defer(thinking=True)
+
+        user_cre = {"name": c_row["name"], "stats": stats}
+        rarity = rarity_for_tier(tier)
+        name_only = await generate_creature_name(rarity)
+        extra = random.randint(*TIER_EXTRAS[tier])
+        opp_stats = allocate_stats(rarity, extra)
+        opp_cre = {"name": name_only, "stats": opp_stats}
+        st = BattleState(
+            inter.user.id, c_row["id"], tier,
+            user_cre, c_row["current_hp"], max_hp,
+            opp_cre, opp_stats["HP"] * 5, opp_stats["HP"] * 5,
+            logs=[]
+        )
+        active_battles[inter.user.id] = st
+        st.logs += [
+            f"Battle start! Tier {tier} (+{extra} pts) — Daily battle use for {user_cre['name']}: {count}/{DAILY_BATTLE_CAP}",
+            f"{user_cre['name']} vs {opp_cre['name']}",
+            f"Opponent rarity (tier table) → {rarity}",
+            "",
+            "Your creature:",
+            stat_block(user_cre["name"], st.user_current_hp, st.user_max_hp, stats),
+            "Opponent:",
+            stat_block(opp_cre["name"], st.opp_max_hp, st.opp_max_hp, opp_stats),
+            "",
+            "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
+            "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
+            f"Daily cap: Each creature can start at most {DAILY_BATTLE_CAP} battles per Europe/London day.",
+        ]
+        max_tier = await _max_unlocked_tier(c_row["id"])
+        st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
 
     
-    # Public start (concise)
-    start_public = (
-        f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\n"
-        f"Opponent rarity: **{rarity}**"
-    )
-    await inter.followup.send(start_public, ephemeral=False)
+        # Public start (concise)
+        start_public = (
+            f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\n"
+            f"Opponent rarity: **{rarity}**"
+        )
+        await inter.followup.send(start_public, ephemeral=False)
 
-    # Drip-feed rounds privately
-    st.next_log_idx = len(st.logs)
-    for _ in range(10):
-        if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
-        simulate_round(st)
-        new_logs = st.logs[st.next_log_idx:]
+        # Drip-feed rounds privately
         st.next_log_idx = len(st.logs)
-        if new_logs:
-            await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
-            await asyncio.sleep(0.2)
+        for _ in range(10):
+            if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+            simulate_round(st)
+            new_logs = st.logs[st.next_log_idx:]
+            st.next_log_idx = len(st.logs)
+            if new_logs:
+                await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
+                await asyncio.sleep(0.2)
 
-    await (await db_pool()).execute(
-        "UPDATE creatures SET current_hp=$1 WHERE id=$2",
-        max(st.user_current_hp, 0), st.creature_id
-    )
+        await (await db_pool()).execute(
+            "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+            max(st.user_current_hp, 0), st.creature_id
+        )
 
-    if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-        winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
-        st.logs.append(f"Winner: {winner}")
-        summary = await finalize_battle(inter, st)
-        active_battles.pop(inter.user.id, None)
-        trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
-        pending = st.logs[st.next_log_idx:]
-        st.next_log_idx = len(st.logs)
-        if pending:
-            await send_chunks(inter, "\n".join(pending), ephemeral=True)
-            await asyncio.sleep(0.35)
-        await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
-    else:
-        st.logs.append("Use /continue to proceed.")
-        await send_chunks(inter, "\n".join(st.logs[st.next_log_idx:]), ephemeral=True)
-        st.next_log_idx = len(st.logs)
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
+            st.logs.append(f"Winner: {winner}")
+            summary = await finalize_battle(inter, st)
+            active_battles.pop(inter.user.id, None)
+            trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
+            pending = st.logs[st.next_log_idx:]
+            st.next_log_idx = len(st.logs)
+            if pending:
+                await send_chunks(inter, "\n".join(pending), ephemeral=True)
+                await asyncio.sleep(0.35)
+            await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
+        else:
+            st.logs.append("Use /continue to proceed.")
+            await send_chunks(inter, "\n".join(st.logs[st.next_log_idx:]), ephemeral=True)
+            st.next_log_idx = len(st.logs)
 
+
+
+    finally:
+        try:
+            current_battler_id = None
+            if battle_lock.locked():
+                battle_lock.release()
+        except Exception:
+            pass
 
 @bot.tree.command(name="continue", description="Continue your current battle")
 async def continue_battle(inter: discord.Interaction):

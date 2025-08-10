@@ -1316,8 +1316,9 @@ async def creatures(inter: discord.Interaction):
         desc = ", ".join(r["descriptors"] or []) or "None"
         max_hp = st["HP"] * 5
         left = left_map.get(int(r["id"]), DAILY_BATTLE_CAP)
-        lines.append(
-            f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
+                overall = int(st['AR'] + st['PATK'] + st['SATK'] + st['SPD'])
+lines.append(
+            f"{idx}. **{r['name']}** ({r['rarity']} | Overall:{overall}) – {desc} | "
             f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
             f"SATK:{st['SATK']} SPD:{st['SPD']} | Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
         )

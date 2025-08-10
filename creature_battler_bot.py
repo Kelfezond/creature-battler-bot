@@ -416,6 +416,28 @@ def _extract_image_url(img_resp):
         return img_resp["data"][0]["url"]
     except Exception:
         return None
+
+
+def _extract_image_bytes(img_resp):
+    # Try SDK object path
+    try:
+        data = getattr(img_resp, "data", None)
+        if data and len(data) > 0:
+            b64v = getattr(data[0], "b64_json", None)
+            if b64v:
+                import base64 as _b64
+                return _b64.b64decode(b64v)
+    except Exception:
+        pass
+    # Try dict-like
+    try:
+        b64v = img_resp["data"][0].get("b64_json")
+        if b64v:
+            import base64 as _b64
+            return _b64.b64decode(b64v)
+    except Exception:
+        pass
+    return None
 # ─── OpenAI helpers (Responses API) ─────────────────────────
 
 def _safe_dump_response(resp) -> str:
@@ -885,17 +907,21 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
         img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: client.images.generate(model=IMAGE_MODEL, prompt=img_prompt,
+            lambda: client.images.generate(
+                model=IMAGE_MODEL,
+                prompt=img_prompt,
                 n=1,
                 size="1024x1024"
             )
         )
         image_url = _extract_image_url(img_resp)
+        image_bytes = _extract_image_bytes(img_resp)
     except Exception as e:
         logger.error("OpenAI image error: %s", e)
         image_url = None
+        image_bytes = None
 
-    return bio_text, image_url
+    return bio_text, image_url, image_bytes
 
 
 async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
@@ -1628,8 +1654,7 @@ async def enc(inter: discord.Interaction, creature_name: str):
     stats_block = _format_stats_block(stats)
 
     # GPT bio + image
-    bio, image_url = await _gpt_generate_bio_and_image(name, rarity, traits, stats)
-
+    bio, image_url, image_bytes = await _gpt_generate_bio_and_image(name, rarity, traits, stats)
     # Build embed
     embed = discord.Embed(
         title=f"{name} — {rarity}",
@@ -1639,9 +1664,19 @@ async def enc(inter: discord.Interaction, creature_name: str):
     embed.add_field(name="Stats", value=stats_block, inline=False)
     if image_url:
         embed.set_image(url=image_url)
+        file_to_send = None
+    elif image_bytes:
+        embed.set_image(url="attachment://creature.png")
+        import io as _io
+        file_to_send = discord.File(_io.BytesIO(image_bytes), filename="creature.png")
+    else:
+        file_to_send = None
 
     try:
-        msg = await channel.send(embed=embed)
+        if file_to_send:
+            msg = await channel.send(embed=embed, file=file_to_send)
+        else:
+            msg = await channel.send(embed=embed)
     except Exception as e:
         logger.error("Failed to post encyclopedia entry: %s", e)
         return await inter.followup.send("Failed to post to the Encyclopedia channel.", ephemeral=True)

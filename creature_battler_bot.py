@@ -385,7 +385,7 @@ async def generate_creature_name(rarity: str) -> str:
     )
     for _ in range(3):
         try:
-            resp = client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS, temperature=0.9)
+            resp = client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS)
             try:
                 text = resp.output_text
             except Exception:

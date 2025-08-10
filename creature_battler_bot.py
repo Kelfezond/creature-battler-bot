@@ -992,7 +992,7 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
             ), 0) AS max_glyph_tier
         FROM creature_records r
         LEFT JOIN trainers t ON t.user_id = r.owner_id
-        ORDER BY r.wins DESC, r.losses ASC, r.name ASC
+        ORDER BY max_glyph_tier DESC, r.wins DESC, r.losses ASC, r.name ASC
         LIMIT 20
     """
 )

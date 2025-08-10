@@ -245,7 +245,7 @@ active_battles: Dict[int, BattleState] = {}
 
 # ─── Global battle lock (one at a time) ───────────
 battle_lock = asyncio.Lock()
-current_battler_id: Optional[int] = None
+current_battler_id = None
 
 # ─── Scheduled rewards & regen ───────────────────────────────
 @tasks.loop(hours=1)

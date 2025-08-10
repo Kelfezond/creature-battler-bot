@@ -1,5 +1,6 @@
 from __future__ import annotations
-import asyncio, json, logging, math, os, random, time, re
+import asyncio
+import logging, json, logging, math, os, random, time, re
 
 # Global battle lock
 active_battle_user_id = None
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from openai import OpenAI
 
@@ -65,6 +67,11 @@ intents = discord.Intents.default()
 # Keep message content if you already had it enabled for your app
 intents.message_content = True
 # IMPORTANT: do NOT enable members intent; we resolve trainer names via REST/cache
+
+# ─── Concurrency controls ─────────────────────────────────
+BATTLE_LOCK = asyncio.Lock()
+SPAWN_SEMAPHORE = asyncio.Semaphore(2)  # allow 2 spawns at once; tune if needed
+
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # ─── Database helpers ────────────────────────────────────────
@@ -351,10 +358,10 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
         try:
             resp = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: client.responses.create(
+                lambda: resp = await asyncio.to_thread(lambda: client.responses.create(
                     model=TEXT_MODEL,
                     input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS,
-                )
+                ))
             )
             text = (getattr(resp, 'output_text', '') or '').strip()
             if not text:
@@ -391,7 +398,7 @@ async def generate_creature_name(rarity: str) -> str:
     )
     for _ in range(3):
         try:
-            resp = client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS)
+            resp = resp = await asyncio.to_thread(lambda: client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS))
             try:
                 text = resp.output_text
             except Exception:
@@ -472,12 +479,12 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
     try:
         resp = await loop.run_in_executor(
             None,
-            lambda: client.responses.create(
+            lambda: resp = await asyncio.to_thread(lambda: client.responses.create(
                 model=TEXT_MODEL,
                 input=prompt,
                 max_output_tokens=max_output_tokens,
                 response_format={"type": "json_object"},
-            )
+            ))
         )
         text = getattr(resp, "output_text", None) or ""
         text = text.strip()
@@ -889,14 +896,14 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         # Keep compatible with your existing OpenAI usage pattern
         resp = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: client.responses.create(
+            lambda: resp = await asyncio.to_thread(lambda: client.responses.create(
                 model=TEXT_MODEL,
                 input=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 max_output_tokens=MAX_OUTPUT_TOKENS,
-            )
+            ))
         )
         bio_text = getattr(resp, 'output_text', '') or ''
     except Exception as e:
@@ -1173,6 +1180,30 @@ async def _find_single_trainer_id_by_display_name(name_like: str) -> Optional[in
     # Ambiguous
     return None
 
+
+# ─── Interaction helpers ─────────────────────────────────
+async def safe_ack(inter: discord.Interaction, *, thinking: bool = True, ephemeral: bool = False) -> bool:
+    """
+    Immediately acknowledge the interaction if not already done.
+    Returns True if we're safe to continue; False if the interaction was invalidated.
+    """
+    try:
+        if not inter.response.is_done():
+            await inter.response.defer(thinking=thinking, ephemeral=ephemeral)
+    except discord.NotFound:
+        # Interaction token expired/unknown; just stop quietly.
+        return False
+    except Exception:
+        # If we raced with a late defer/send, carry on using followups.
+        pass
+    return True
+
+async def safe_followup(inter: discord.Interaction, content: str = None, **kwargs):
+    try:
+        return await inter.followup.send(content, **kwargs)
+    except Exception as e:
+        logging.getLogger(__name__).exception("Failed to followup.send", exc_info=e)
+
 # ─── Slash commands ─────────────────────────────────────────
 
 @bot.tree.command(description="(Admin) Set this channel as the live leaderboard channel")
@@ -1224,6 +1255,10 @@ async def register(inter: discord.Interaction):
 
 @bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
 async def spawn(inter: discord.Interaction):
+@app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+    if not await safe_ack(inter, thinking=True):
+        return
+    async with SPAWN_SEMAPHORE:
     row = await ensure_registered(inter)
     if not row:
         return
@@ -1231,7 +1266,7 @@ async def spawn(inter: discord.Interaction):
     if not can_spawn:
         return
     if row["cash"] < 10_000:
-        return await inter.response.send_message("Not enough cash.", ephemeral=True)
+        return await inter.followup.send("Not enough cash.", ephemeral=True)
 
     await (await db_pool()).execute(
         "UPDATE trainers SET cash = cash - 10000 WHERE user_id=$1", inter.user.id
@@ -1441,10 +1476,17 @@ async def dailylimit(inter: discord.Interaction, creature_name: str, number: int
 
 @bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
 async def battle(inter: discord.Interaction, creature_name: str, tier: int):
+@app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+    if not await safe_ack(inter, thinking=True):
+        return
+if BATTLE_LOCK.locked():
+    await safe_followup(inter, "A battle is already running—try again in a moment.", ephemeral=True)
+    return
+async with BATTLE_LOCK:
     if tier not in TIER_EXTRAS:
-        return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
+        return await inter.followup.send("Invalid tier (1-9).", ephemeral=True)
     if inter.user.id in active_battles:
-        return await inter.response.send_message("You already have an active battle – use /continue.", ephemeral=True)
+        return await inter.followup.send("You already have an active battle – use /continue.", ephemeral=True)
     if not await ensure_registered(inter):
         return
 
@@ -1452,7 +1494,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     # Global battle gate: only one battle may run at a time
     global current_battler_id
     if battle_lock.locked() and (current_battler_id is not None) and (current_battler_id != inter.user.id):
-        await inter.response.send_message(
+        await inter.followup.send(
             f"⚔ A battle is already in progress by <@{current_battler_id}>. Please try again shortly.",
             ephemeral=True
         )
@@ -1463,18 +1505,18 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         inter.user.id, creature_name
     )
     if not c_row:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
+        return await inter.followup.send("Creature not found.", ephemeral=True)
 
     stats = json.loads(c_row["stats"])
     max_hp = stats["HP"] * 5
     if c_row["current_hp"] <= 0:
-        return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
+        return await inter.followup.send(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
 
     allowed_tier = await _max_unlocked_tier(c_row["id"])
     if tier > allowed_tier:
         need_prev = tier - 1
         wins_prev = await _get_wins_for_tier(c_row["id"], need_prev)
-        return await inter.response.send_message(
+        return await inter.followup.send(
             f"Tier {tier} is locked for **{c_row['name']}**. Current unlock: **1..{allowed_tier}**. "
             f"You need **5 wins at Tier {need_prev}** to unlock Tier {tier} (current: {wins_prev}/5).",
             ephemeral=True
@@ -1482,7 +1524,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
 
     allowed, count = await _can_start_battle_and_increment(c_row["id"])
     if not allowed:
-        return await inter.response.send_message(
+        return await inter.followup.send(
             f"Daily battle cap reached for **{c_row['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
             "Try again after midnight Europe/London.", ephemeral=True
         )
@@ -1903,3 +1945,31 @@ async def info(inter: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
+
+# ─── App command error handler ────────────────────────────
+logger = logging.getLogger(__name__)
+
+@bot.tree.error
+async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
+    # Try to ensure the interaction is acknowledged so we can reply ephemerally
+    try:
+        if not inter.response.is_done():
+            try:
+                await inter.response.defer(thinking=False, ephemeral=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Specific messaging for cooldown
+    if isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"Slow down—try again in {error.retry_after:.1f}s."
+    else:
+        msg = "Sorry—something went wrong handling that command."
+    try:
+        await inter.followup.send(msg, ephemeral=True)
+    except Exception:
+        # swallow
+        pass
+    logger.exception("App command error", exc_info=error)
+

@@ -19,7 +19,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5-mini")
 IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
-# Allow big generations (over 1000 tokens) for /enc, /battle, /spawn
 MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1400"))
 OPENAI_DEBUG = os.getenv("OPENAI_DEBUG", "0") == "1"
 
@@ -323,7 +322,7 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
         return False
     return True
 
-async def generate_creature_meta(rarity: str, *, include_descriptors: bool = True) -> Dict[str, Any]:
+async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
     used_names = [r["name"].lower() for r in rows]
@@ -337,11 +336,8 @@ async def generate_creature_meta(rarity: str, *, include_descriptors: bool = Tru
     avoid_words = _rsample(used_words_list, min(50, len(used_words_list)))
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
-"
-    f"{{\"name\":\"1-3 words\" + (",\"descriptors\":[\"w1\",\"w2\",\"w3\"]" if include_descriptors else "")  + "}}
-"
-    f"Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
-"
+{{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
+Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
 Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
 """
     for _ in range(3):
@@ -364,15 +360,45 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
                 if not m:
                     raise
                 data = json.loads(m.group(0))
-            if ("name" in data) and (len(data.get("descriptors", [])) == 3 or not include_descriptors):
+            if "name" in data and len(data.get("descriptors", [])) == 3:
                 data["name"] = data["name"].title()
-                data.setdefault("descriptors", [] if not include_descriptors else data.get("descriptors", []))
                 return data
         except Exception as e:
             logger.error("OpenAI error: %s", e)
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
 
+
+
+
+# ─── Name-only generator for battles ─────────────────────────
+async def generate_creature_name(rarity: str) -> str:
+    """Ask the model for a name only (short) to reduce tokens."""
+    # Pull some existing names to avoid dupes
+    pool = await db_pool()
+    rows = await pool.fetch("SELECT name FROM creatures")
+    used = sorted({r["name"].lower() for r in rows})[:50]
+    prompt = (
+        f"Invent a creature of rarity **{rarity}**. Return ONLY JSON\\n"
+        f"{{\"name\":\"1-3 words\"}}\\n"
+        f"Avoid names: {', '.join(used) if used else 'None'}\\n"
+    )
+    for _ in range(3):
+        try:
+            resp = client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS, temperature=0.9)
+            try:
+                text = resp.output_text
+            except Exception:
+                text = str(resp)
+            import re as _re, json as _json
+            m = _re.search(r"\{[\s\S]*\}", text or "")
+            data = _json.loads(m.group(0)) if m else {}
+            if "name" in data:
+                return str(data["name"]).title()
+        except Exception as e:
+            logger.error("OpenAI name-only error: %s", e)
+    import random as _random
+    return f"Wild{_random.randint(1000,9999)}"
 # ─── OpenAI helpers (Responses API) ─────────────────────────
 
 def _safe_dump_response(resp) -> str:
@@ -391,7 +417,7 @@ def _safe_dump_response(resp) -> str:
         except Exception:
             return "<unprintable response>"
 
-async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = None) -> dict | None:
+async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 512) -> dict | None:
     """
     Calls the Responses API and requests a strict JSON object back.
     Returns a dict or None on failure.
@@ -404,7 +430,7 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
                 model=TEXT_MODEL,
                 input=prompt,
                 temperature=temperature,
-                max_output_tokens=(max_output_tokens or MAX_OUTPUT_TOKENS),
+                max_output_tokens=max_output_tokens,
                 response_format={"type": "json_object"},
             )
         )
@@ -849,16 +875,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                 size="1024x1024"
             )
         )
-        image_url = None
-        try:
-            # Newer SDK: object with .data list
-            image_url = getattr(img_resp, "data", None)[0].url
-        except Exception:
-            try:
-                # Fallback if dict-like
-                image_url = img_resp["data"][0]["url"]
-            except Exception:
-                image_url = None
+        image_url = img_resp["data"][0]["url"]
     except Exception as e:
         logger.error("OpenAI image error: %s", e)
         image_url = None
@@ -1132,7 +1149,7 @@ async def spawn(inter: discord.Interaction):
     await inter.response.defer(thinking=True)
 
     rarity = spawn_rarity()
-    meta = await generate_creature_meta(rarity, include_descriptors=False)
+    meta = await generate_creature_meta(rarity)
     stats = allocate_stats(rarity)
     max_hp = stats["HP"] * 5
 
@@ -1306,11 +1323,10 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
 
     user_cre = {"name": c_row["name"], "stats": stats}
     rarity = rarity_for_tier(tier)
-    meta = await generate_creature_meta(rarity)
+    name_only = await generate_creature_name(rarity)
     extra = random.randint(*TIER_EXTRAS[tier])
     opp_stats = allocate_stats(rarity, extra)
-    opp_cre = {"name": meta["name"], "stats": opp_stats}
-
+    opp_cre = {"name": name_only, "stats": opp_stats}
     st = BattleState(
         inter.user.id, c_row["id"], tier,
         user_cre, c_row["current_hp"], max_hp,

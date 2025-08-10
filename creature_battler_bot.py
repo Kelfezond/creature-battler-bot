@@ -398,6 +398,24 @@ async def generate_creature_name(rarity: str) -> str:
             logger.error("OpenAI name-only error: %s", e)
     import random as _random
     return f"Wild{_random.randint(1000,9999)}"
+
+
+# Robust extractor for Images API responses (dict or SDK object)
+def _extract_image_url(img_resp):
+    # Newer SDK returns ImagesResponse with .data -> objects with .url
+    try:
+        data = getattr(img_resp, "data", None)
+        if data and len(data) > 0:
+            url = getattr(data[0], "url", None)
+            if url:
+                return url
+    except Exception:
+        pass
+    # Older / dict-like
+    try:
+        return img_resp["data"][0]["url"]
+    except Exception:
+        return None
 # ─── OpenAI helpers (Responses API) ─────────────────────────
 
 def _safe_dump_response(resp) -> str:
@@ -872,7 +890,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                 size="1024x1024"
             )
         )
-        image_url = img_resp["data"][0]["url"]
+        image_url = _extract_image_url(img_resp)
     except Exception as e:
         logger.error("OpenAI image error: %s", e)
         image_url = None

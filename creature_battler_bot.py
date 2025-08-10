@@ -1316,11 +1316,11 @@ async def creatures(inter: discord.Interaction):
         desc = ", ".join(r["descriptors"] or []) or "None"
         max_hp = st["HP"] * 5
         left = left_map.get(int(r["id"]), DAILY_BATTLE_CAP)
-                overall = int(st['AR'] + st['PATK'] + st['SATK'] + st['SPD'])
-lines.append(
-            f"{idx}. **{r['name']}** ({r['rarity']} | Overall:{overall}) – {desc} | "
+        overall = int(st.get('HP', 0) + st.get('AR', 0) + st.get('PATK', 0) + st.get('SATK', 0) + st.get('PDEF', 0) + st.get('SDEF', 0) + st.get('SPD', 0))
+        lines.append(
+            f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
             f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
-            f"SATK:{st['SATK']} SPD:{st['SPD']} | Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
+            f"SATK:{st['SATK']} SPD:{st['SPD']} | Overall:{overall} | Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 

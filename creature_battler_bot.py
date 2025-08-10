@@ -329,6 +329,7 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
         return False
     return True
 
+
 async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
@@ -347,28 +348,32 @@ Invent a creature of rarity **{rarity}**. Return ONLY JSON:
 Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
 Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
 """
+    import asyncio as _asyncio, json as _json, re as _re
     for _ in range(3):
         try:
-            resp = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: client.responses.create(
+            resp = await _with_timeout(
+                _to_thread(lambda: client.responses.create(
                     model=TEXT_MODEL,
-                    input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS,
-                )
+                    input=prompt,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                )),
+                timeout=20.0
             )
             text = (getattr(resp, 'output_text', '') or '').strip()
             if not text:
                 continue
             try:
-                data = json.loads(text)
+                data = _json.loads(text)
             except Exception:
-                m = re.search(r"\{[\s\S]*\}", text)
+                m = _re.search(r"\{[\s\S]*\}", text)
                 if not m:
                     raise
-                data = json.loads(m.group(0))
+                data = _json.loads(m.group(0))
             if "name" in data and len(data.get("descriptors", [])) == 3:
-                data["name"] = data["name"].title()
+                data["name"] = str(data["name"]).title()
                 return data
+        except _asyncio.TimeoutError:
+            logger.warning("generate_creature_meta timed out; retrying…")
         except Exception as e:
             logger.error("OpenAI error: %s", e)
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
@@ -378,32 +383,41 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
 
 
 # ─── Name-only generator for battles ─────────────────────────
+
 async def generate_creature_name(rarity: str) -> str:
-    """Ask the model for a name only (short) to reduce tokens."""
+    """Ask the model for a name only (short) to reduce tokens. Non-blocking with timeout."""
     # Pull some existing names to avoid dupes
     pool = await db_pool()
     rows = await pool.fetch("SELECT name FROM creatures")
     used = sorted({r["name"].lower() for r in rows})[:50]
     prompt = (
-        f"Invent a creature of rarity **{rarity}**. Return ONLY JSON\\n"
-        f"{{\"name\":\"1-3 words\"}}\\n"
-        f"Avoid names: {', '.join(used) if used else 'None'}\\n"
+        f"Invent a creature of rarity **{rarity}**. Return ONLY JSON\n"
+        f"{{\"name\":\"1-3 words\"}}\n"
+        f"Avoid names: {', '.join(used) if used else 'None'}\n"
     )
+    import random as _random, re as _re, json as _json
     for _ in range(3):
         try:
-            resp = client.responses.create(model=TEXT_MODEL, input=prompt, max_output_tokens=MAX_OUTPUT_TOKENS)
+            resp = await _with_timeout(
+                _to_thread(lambda: client.responses.create(
+                    model=TEXT_MODEL,
+                    input=prompt,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                )),
+                timeout=15.0
+            )
             try:
-                text = resp.output_text
+                text = getattr(resp, "output_text", None) or ""
             except Exception:
-                text = str(resp)
-            import re as _re, json as _json
+                text = str(resp) if resp is not None else ""
             m = _re.search(r"\{[\s\S]*\}", text or "")
             data = _json.loads(m.group(0)) if m else {}
             if "name" in data:
                 return str(data["name"]).title()
+        except asyncio.TimeoutError:
+            logger.warning("generate_creature_name timed out; retrying…")
         except Exception as e:
             logger.error("OpenAI name-only error: %s", e)
-    import random as _random
     return f"Wild{_random.randint(1000,9999)}"
 
 
@@ -463,6 +477,16 @@ def _safe_dump_response(resp) -> str:
         except Exception:
             return "<unprintable response>"
 
+
+# ─── Async helpers to isolate blocking calls + enforce timeouts ──────────────
+async def _to_thread(fn):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn)
+
+async def _with_timeout(coro, timeout: float = 15.0):
+    return await asyncio.wait_for(coro, timeout=timeout)
+
+
 async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 512) -> dict | None:
     """
     Calls the Responses API and requests a strict JSON object back.
@@ -470,14 +494,17 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
     """
     loop = asyncio.get_running_loop()
     try:
-        resp = await loop.run_in_executor(
-            None,
-            lambda: client.responses.create(
-                model=TEXT_MODEL,
-                input=prompt,
-                max_output_tokens=max_output_tokens,
-                response_format={"type": "json_object"},
-            )
+        resp = await _with_timeout(
+            loop.run_in_executor(
+                None,
+                lambda: client.responses.create(
+                    model=TEXT_MODEL,
+                    input=prompt,
+                    max_output_tokens=max_output_tokens,
+                    response_format={"type": "json_object"},
+                ),
+            ),
+            timeout=20.0,
         )
         text = getattr(resp, "output_text", None) or ""
         text = text.strip()
@@ -485,6 +512,14 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
             if OPENAI_DEBUG:
                 logger.error("Responses debug (empty): %s", _safe_dump_response(resp))
             return None
+        return json.loads(text)
+    except asyncio.TimeoutError:
+        logger.error("OpenAI JSON call timed out.")
+        return None
+    except Exception as e:
+        logger.error("OpenAI JSON call failed: %s", e)
+        return None
+
         return json.loads(text)
     except Exception as e:
         logger.error("OpenAI JSON call failed: %s", e)
@@ -887,7 +922,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
 
         # Keep compatible with your existing OpenAI usage pattern
-        resp = await asyncio.get_running_loop().run_in_executor(
+        resp = await _with_timeout(resp = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: client.responses.create(
                 model=TEXT_MODEL,
@@ -897,7 +932,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                 ],
                 max_output_tokens=MAX_OUTPUT_TOKENS,
             )
-        )
+        ), timeout=25.0)
         bio_text = getattr(resp, 'output_text', '') or ''
     except Exception as e:
         logger.error("OpenAI bio error: %s", e)
@@ -912,7 +947,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
             "Ultra-detailed digital image in the style of Warcraft Cinematic CGI, dramatic lighting, "
             "fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
         )
-        img_resp = await asyncio.get_running_loop().run_in_executor(
+        img_resp = await _with_timeout(img_resp = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: client.images.generate(
                 model=IMAGE_MODEL,
@@ -920,7 +955,7 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                 n=1,
                 size="1024x1024"
             )
-        )
+        ), timeout=30.0)
         image_url = _extract_image_url(img_resp)
         image_bytes = _extract_image_bytes(img_resp)
     except Exception as e:

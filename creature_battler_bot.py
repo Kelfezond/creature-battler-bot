@@ -323,7 +323,7 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
         return False
     return True
 
-async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
+async def generate_creature_meta(rarity: str, *, include_descriptors: bool = True) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
     used_names = [r["name"].lower() for r in rows]
@@ -337,8 +337,11 @@ async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     avoid_words = _rsample(used_words_list, min(50, len(used_words_list)))
     prompt = f"""
 Invent a creature of rarity **{rarity}**. Return ONLY JSON:
-{{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
-Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
+"
+    f"{{\"name\":\"1-3 words\" + (",\"descriptors\":[\"w1\",\"w2\",\"w3\"]" if include_descriptors else "")  + "}}
+"
+    f"Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
+"
 Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
 """
     for _ in range(3):
@@ -361,8 +364,9 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
                 if not m:
                     raise
                 data = json.loads(m.group(0))
-            if "name" in data and len(data.get("descriptors", [])) == 3:
+            if ("name" in data) and (len(data.get("descriptors", [])) == 3 or not include_descriptors):
                 data["name"] = data["name"].title()
+                data.setdefault("descriptors", [] if not include_descriptors else data.get("descriptors", []))
                 return data
         except Exception as e:
             logger.error("OpenAI error: %s", e)
@@ -1128,7 +1132,7 @@ async def spawn(inter: discord.Interaction):
     await inter.response.defer(thinking=True)
 
     rarity = spawn_rarity()
-    meta = await generate_creature_meta(rarity)
+    meta = await generate_creature_meta(rarity, include_descriptors=False)
     stats = allocate_stats(rarity)
     max_hp = stats["HP"] * 5
 

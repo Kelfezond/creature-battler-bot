@@ -961,7 +961,6 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                     prompt=img_prompt,
                     n=1,
                     size="1024x1024",
-                    response_format="url",
                 ),
             )
         except Exception as _e1:
@@ -973,7 +972,6 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
                     prompt=img_prompt,
                     n=1,
                     size="512x512",
-                    response_format="url",
                 ),
             )
 

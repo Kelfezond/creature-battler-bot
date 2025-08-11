@@ -1891,6 +1891,28 @@ async def enc(inter: discord.Interaction, creature_name: str):
     if not c_row:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
+    # Gate: Common/Uncommon cannot be added to the Encyclopedia
+    # unless they have >10 total wins OR have unlocked Glyph 3.
+    rarity_val = str(c_row["rarity"])
+    if rarity_val in ("Common", "Uncommon"):
+        pool = await db_pool()
+        async with pool.acquire() as conn:
+            total_wins = await conn.fetchval(
+                "SELECT COALESCE(SUM(wins),0) FROM creature_progress WHERE creature_id=$1",
+                c_row["id"]
+            )
+            glyph3_unlocked = await conn.fetchval(
+                "SELECT glyph_unlocked FROM creature_progress WHERE creature_id=$1 AND tier=3",
+                c_row["id"]
+            )
+        if (total_wins or 0) <= 10 and not bool(glyph3_unlocked):
+            return await inter.response.send_message(
+                f"Encyclopedia entry denied for **{c_row['name']}** ({rarity_val}). "
+                "Common/Uncommon creatures must have **>10 total wins** or **Glyph 3 unlocked**.\n"
+                f"Current: Wins **{(total_wins or 0)}**, Glyph 3 {'✅' if glyph3_unlocked else '❌'}.",
+                ephemeral=True
+            )
+
     # Encyclopedia channel
     enc_chan_id = await _get_encyclopedia_channel_id()
     if not enc_chan_id:

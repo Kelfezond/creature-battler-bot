@@ -937,7 +937,9 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         logger.error("OpenAI bio error: %s", e)
         bio_text = "A lab-forged arena combatant. (Bio generation failed.)"
 
-    # 2) Image (Warcraft Cinematic CGI style)
+    
+
+# 2) Image (Warcraft Cinematic CGI style)
     image_url = None
     try:
         traits_str = ", ".join(traits) if traits else ""
@@ -947,25 +949,44 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
             "fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
         )
         loop = asyncio.get_running_loop()
-        img_resp = await _with_timeout(
-            loop.run_in_executor(
+        image_url = None
+        image_bytes = None
+
+        # Single high-res attempt with NO timeout. If it fails for any reason, fall back to 512x512 (also no timeout).
+        try:
+            img_resp = await loop.run_in_executor(
                 None,
                 lambda: client.images.generate(
                     model=IMAGE_MODEL,
                     prompt=img_prompt,
                     n=1,
                     size="1024x1024",
+                    response_format="url",
                 ),
-            ),
-            timeout=30.0,
-        )
+            )
+        except Exception as _e1:
+            logger.warning("Primary image generation failed (%s). Falling back to 512x512.", type(_e1).__name__)
+            img_resp = await loop.run_in_executor(
+                None,
+                lambda: client.images.generate(
+                    model=IMAGE_MODEL,
+                    prompt=img_prompt,
+                    n=1,
+                    size="512x512",
+                    response_format="url",
+                ),
+            )
+
+        # Prefer URL; bytes fallback handled if present
         image_url = _extract_image_url(img_resp)
-        image_bytes = _extract_image_bytes(img_resp)
+        if not image_url:
+            image_bytes = _extract_image_bytes(img_resp)
+        if not (image_url or image_bytes):
+            raise RuntimeError("Image generation returned no data")
     except Exception as e:
-        logger.error("OpenAI image error: %s", e)
+        logger.error("OpenAI image error (%s): %s", type(e).__name__, e)
         image_url = None
         image_bytes = None
-
     return bio_text, image_url, image_bytes
 
 

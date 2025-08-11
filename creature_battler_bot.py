@@ -1338,7 +1338,7 @@ async def creatures(inter: discord.Interaction):
         desc = ", ".join(r["descriptors"] or []) or "None"
         max_hp = st["HP"] * 5
         left = left_map.get(int(r["id"]), DAILY_BATTLE_CAP)
-        overall = int(st.get('HP', 0) + st.get('AR', 0) + st.get('PATK', 0) + st.get('SATK', 0) + st.get('PDEF', 0) + st.get('SDEF', 0) + st.get('SPD', 0))
+        overall = int(st.get('HP', 0) + st.get('AR', 0) + st.get('PATK', 0) + st.get('SATK', 0) + st.get('SPD', 0))
         lines.append(
             f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
             f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
@@ -1962,6 +1962,8 @@ async def enc(inter: discord.Interaction, creature_name: str):
         return await inter.followup.send("Failed to post to the Encyclopedia channel.", ephemeral=True)
 
     await inter.followup.send(f"Added **{name}** to the Encyclopedia: {msg.jump_url}", ephemeral=True)
+
+
 
 
 

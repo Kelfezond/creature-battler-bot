@@ -520,11 +520,6 @@ async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_
         logger.error("OpenAI JSON call failed: %s", e)
         return None
 
-        return json.loads(text)
-    except Exception as e:
-        logger.error("OpenAI JSON call failed: %s", e)
-        return None
-
 async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
     if not inter.response.is_done():
@@ -900,7 +895,7 @@ def _format_stats_block(stats: Dict[str, int]) -> str:
         f"SPD: {stats.get('SPD', 0)}"
     )
 
-async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[str], stats: Dict[str, int]) -> tuple[str, Optional[str]]:
+async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[str], stats: Dict[str, int]) -> tuple[str, Optional[str], Optional[bytes]]:
     """
     Returns (bio_text, image_url or None)
     Uses OpenAI for both text (ChatCompletion) and image (Images.create).
@@ -922,17 +917,21 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         )
 
         # Keep compatible with your existing OpenAI usage pattern
-        resp = await _with_timeout(resp = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: client.responses.create(
-                model=TEXT_MODEL,
-                input=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-            )
-        ), timeout=25.0)
+        loop = asyncio.get_running_loop()
+        resp = await _with_timeout(
+            loop.run_in_executor(
+                None,
+                lambda: client.responses.create(
+                    model=TEXT_MODEL,
+                    input=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                ),
+            ),
+            timeout=25.0,
+        )
         bio_text = getattr(resp, 'output_text', '') or ''
     except Exception as e:
         logger.error("OpenAI bio error: %s", e)
@@ -947,15 +946,19 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
             "Ultra-detailed digital image in the style of Warcraft Cinematic CGI, dramatic lighting, "
             "fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
         )
-        img_resp = await _with_timeout(img_resp = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: client.images.generate(
-                model=IMAGE_MODEL,
-                prompt=img_prompt,
-                n=1,
-                size="1024x1024"
-            )
-        ), timeout=30.0)
+        loop = asyncio.get_running_loop()
+        img_resp = await _with_timeout(
+            loop.run_in_executor(
+                None,
+                lambda: client.images.generate(
+                    model=IMAGE_MODEL,
+                    prompt=img_prompt,
+                    n=1,
+                    size="1024x1024",
+                ),
+            ),
+            timeout=30.0,
+        )
         image_url = _extract_image_url(img_resp)
         image_bytes = _extract_image_bytes(img_resp)
     except Exception as e:

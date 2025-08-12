@@ -1321,6 +1321,7 @@ async def spawn(inter: discord.Interaction):
 async def creatures(inter: discord.Interaction):
     if not await ensure_registered(inter):
         return
+    max_glyph = await _max_glyph_for_trainer(inter.user.id)
     rows = await (await db_pool()).fetch(
         "SELECT id,name,rarity,descriptors,stats,current_hp FROM creatures "
         "WHERE owner_id=$1 ORDER BY id", inter.user.id
@@ -1333,6 +1334,7 @@ async def creatures(inter: discord.Interaction):
     left_map = await _battles_left_map(ids)
 
     lines = []
+    lines.append(f"**Highest Glyph Achieved:** {max_glyph if (max_glyph or 0) > 0 else '-'}")
     for idx, r in enumerate(rows, 1):
         st = json.loads(r["stats"])
         desc = ", ".join(r["descriptors"] or []) or "None"

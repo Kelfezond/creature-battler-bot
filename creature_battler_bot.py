@@ -1330,10 +1330,8 @@ async def creatures(inter: discord.Interaction):
     if not rows:
         return await inter.response.send_message("You own no creatures.", ephemeral=True)
 
-    # Precompute lookups
     ids = [int(r["id"]) for r in rows]
 
-    # Highest glyph per creature (max tier where glyph_unlocked = TRUE)
     glyph_rows = await (await db_pool()).fetch(
         """
         SELECT creature_id,
@@ -1346,10 +1344,8 @@ async def creatures(inter: discord.Interaction):
     )
     glyph_map = {int(r["creature_id"]): int(r["max_glyph"] or 0) for r in glyph_rows}
 
-    # Battles left per creature for today (Europe/London)
     left_map = await _battles_left_map(ids)
 
-    # Send each creature as its own message, using newline formatting
     first = True
     for r in rows:
         st = json.loads(r["stats"])
@@ -1360,19 +1356,16 @@ async def creatures(inter: discord.Interaction):
         glyph_disp = "-" if g <= 0 else str(g)
         overall = int(st.get("HP", 0) + st.get("AR", 0) + st.get("PATK", 0) + st.get("SATK", 0) + st.get("SPD", 0))
 
-        msg = (
-            f"**{r['name']}** ({r['rarity']})
-"
-            f"{desc}
-"
-            f"HP: {r['current_hp']}/{max_hp}
-"
-            f"AR: {st.get('AR', 0)}  PATK: {st.get('PATK', 0)}  SATK: {st.get('SATK', 0)}  SPD: {st.get('SPD', 0)}
-"
-            f"Overall: {overall}  |  Glyph: {glyph_disp}
-"
-            f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
-        )
+        lines = [
+            f"**{r['name']}** ({r['rarity']})",
+            f"{desc}",
+            f"HP: {r['current_hp']}/{max_hp}",
+            f"AR: {st.get('AR', 0)}  PATK: {st.get('PATK', 0)}  SATK: {st.get('SATK', 0)}  SPD: {st.get('SPD', 0)}",
+            f"Overall: {overall}  |  Glyph: {glyph_disp}",
+            f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**",
+        ]
+        msg = "
+".join(lines)
 
         if first and not inter.response.is_done():
             await inter.response.send_message(msg, ephemeral=True)

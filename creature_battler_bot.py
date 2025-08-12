@@ -1323,7 +1323,6 @@ async def spawn(inter: discord.Interaction):
 async def creatures(inter: discord.Interaction):
     if not await ensure_registered(inter):
         return
-    max_glyph = await _max_glyph_for_trainer(inter.user.id)
     rows = await (await db_pool()).fetch(
         "SELECT id,name,rarity,descriptors,stats,current_hp FROM creatures "
         "WHERE owner_id=$1 ORDER BY id", inter.user.id
@@ -1333,20 +1332,34 @@ async def creatures(inter: discord.Interaction):
 
     # NEW: compute remaining battles for each creature (Europe/London day)
     ids = [int(r["id"]) for r in rows]
+
+    # Highest glyph per creature (max tier where glyph_unlocked = TRUE)
+    glyph_rows = await (await db_pool()).fetch(
+        """
+        SELECT creature_id,
+               COALESCE(MAX(CASE WHEN glyph_unlocked THEN tier ELSE 0 END), 0) AS max_glyph
+        FROM creature_progress
+        WHERE creature_id = ANY($1::int[])
+        GROUP BY creature_id
+        """,
+        ids
+    )
+    glyph_map = {int(r["creature_id"]): int(r["max_glyph"] or 0) for r in glyph_rows}
     left_map = await _battles_left_map(ids)
 
     lines = []
-    lines.append(f"**Highest Glyph Achieved:** {max_glyph if (max_glyph or 0) > 0 else '-'}")
     for idx, r in enumerate(rows, 1):
         st = json.loads(r["stats"])
         desc = ", ".join(r["descriptors"] or []) or "None"
         max_hp = st["HP"] * 5
         left = left_map.get(int(r["id"]), DAILY_BATTLE_CAP)
+        g = glyph_map.get(int(r["id"]), 0)
+        glyph_disp = "-" if not g or g <= 0 else str(g)
         overall = int(st.get('HP', 0) + st.get('AR', 0) + st.get('PATK', 0) + st.get('SATK', 0) + st.get('SPD', 0))
         lines.append(
             f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
             f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
-            f"SATK:{st['SATK']} SPD:{st['SPD']} | Overall:{overall} | Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
+            f"SATK:{st['SATK']} SPD:{st['SPD']} | Overall:{overall} | Glyph:{glyph_disp} | Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 

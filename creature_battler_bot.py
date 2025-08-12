@@ -1323,6 +1323,7 @@ async def spawn(inter: discord.Interaction):
 async def creatures(inter: discord.Interaction):
     if not await ensure_registered(inter):
         return
+    await inter.response.defer(ephemeral=True)
     rows = await (await db_pool()).fetch(
         "SELECT id,name,rarity,descriptors,stats,current_hp FROM creatures "
         "WHERE owner_id=$1 ORDER BY id", inter.user.id
@@ -1364,14 +1365,9 @@ async def creatures(inter: discord.Interaction):
             f"Overall: {overall}  |  Glyph: {glyph_disp}",
             f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**",
         ]
-        msg = "
-".join(lines)
+        msg = "\n".join(lines)
 
-        if first and not inter.response.is_done():
-            await inter.response.send_message(msg, ephemeral=True)
-            first = False
-        else:
-            await inter.followup.send(msg, ephemeral=True)
+        await inter.followup.send(msg, ephemeral=True)
 
 @bot.tree.command(description="See your creature's lifetime win/loss record")
 async def record(inter: discord.Interaction, creature_name: str):

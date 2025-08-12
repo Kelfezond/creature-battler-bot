@@ -1,26 +1,6 @@
 from __future__ import annotations
 
-async def _max_glyph_for_trainer(user_id: int) -> int:
-    """Return the highest glyph tier unlocked by any of the user's creatures."""
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        val = await conn.fetchval(
-            """
-            SELECT COALESCE(MAX(cp.tier), 0)
-            FROM creature_progress cp
-            JOIN creatures c ON c.id = cp.creature_id
-            WHERE c.owner_id = $1 AND cp.glyph_unlocked = TRUE
-            """, user_id
-        )
-        try:
-            return int(val or 0)
-        except Exception:
-            return 0
-
 import asyncio, json, logging, math, os, random, time, re
-
-# Global battle lock
-active_battle_user_id = None
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,14 +21,13 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5-mini")
 IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1400"))
-OPENAI_DEBUG = os.getenv("OPENAI_DEBUG", "0") == "1"
 
 logger.info("Using TEXT_MODEL=%s, IMAGE_MODEL=%s", TEXT_MODEL, IMAGE_MODEL)
 
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 
-# Admin allow-list for privileged commands (e.g., /cashadd, /setleaderboardchannel)
+# Admin allow-list for privileged commands
 def _parse_admin_ids(raw: Optional[str]) -> set[int]:
     ids: set[int] = set()
     if not raw:
@@ -80,9 +59,7 @@ else:
 
 # ─── Discord client ──────────────────────────────────────────
 intents = discord.Intents.default()
-# Keep message content if you already had it enabled for your app
-intents.message_content = True
-# IMPORTANT: do NOT enable members intent; we resolve trainer names via REST/cache
+intents.message_content = True  # enable content for commands
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # ─── Database helpers ────────────────────────────────────────
@@ -132,7 +109,7 @@ CREATE TABLE IF NOT EXISTS creature_progress (
   PRIMARY KEY (creature_id, tier)
 );
 
--- Lifetime win/loss records that persist even after a creature dies or is sold
+-- Lifetime win/loss records (persist after death/sale)
 CREATE TABLE IF NOT EXISTS creature_records (
   creature_id INT,
   owner_id BIGINT NOT NULL,
@@ -163,9 +140,9 @@ async def db_pool() -> asyncpg.Pool:
         bot._pool = await asyncpg.create_pool(DB_URL)
     return bot._pool
 
-# ─── Game constants ──────────────────────────────────────────
+# ─── Game constants & utilities ──────────────────────────────
 MAX_CREATURES = 5
-DAILY_BATTLE_CAP = 2  # <— used for display of remaining battles
+DAILY_BATTLE_CAP = 2
 
 SELL_PRICES: Dict[str, int] = {
     "Common": 1_000,
@@ -176,12 +153,18 @@ SELL_PRICES: Dict[str, int] = {
 }
 
 def spawn_rarity() -> str:
+    """Determine rarity of a new spawn via weighted chance."""
     r = random.random() * 100.0
-    if r < 75.0: return "Common"
-    elif r < 88.0: return "Uncommon"
-    elif r < 95.0: return "Rare"
-    elif r < 99.5: return "Epic"
-    else: return "Legendary"
+    if r < 75.0:
+        return "Common"
+    elif r < 88.0:
+        return "Uncommon"
+    elif r < 95.0:
+        return "Rare"
+    elif r < 99.5:
+        return "Epic"
+    else:
+        return "Legendary"
 
 TIER_RARITY_WEIGHTS: Dict[int, Tuple[List[str], List[int]]] = {
     1: (["Common"], [100]),
@@ -204,15 +187,20 @@ FACILITY_LEVELS: Dict[int, Dict[str, Any]] = {
     5: {"name": "BioSync Reactor Chamber", "bonus": 4, "cost": 275_000, "desc": "A synchronized chamber tuned to physical and mental rhythms. Terrain and resistance fields shift unpredictably to enhance reflex development."},
     6: {"name": "SynapseForge Hyperlab", "bonus": 5, "cost": 500_000, "desc": "A high-tech fusion of neural feedback, virtual training microcosms, and time-compressed simulations. Mastery is forged at the speed of thought."},
 }
+
 def facility_bonus(level: int) -> int:
     level = max(1, min(MAX_FACILITY_LEVEL, level))
     return FACILITY_LEVELS[level]["bonus"]
+
 def daily_trainer_points_for(level: int) -> int:
     return 5 + facility_bonus(level)
 
 POINT_POOLS = {
-    "Common": (25, 50), "Uncommon": (50, 100), "Rare": (100, 200),
-    "Epic": (200, 400), "Legendary": (400, 800),
+    "Common": (25, 50),
+    "Uncommon": (50, 100),
+    "Rare": (100, 200),
+    "Epic": (200, 400),
+    "Legendary": (400, 800),
 }
 TIER_EXTRAS = {
     1: (0, 10),  2: (10, 30), 3: (30, 60), 4: (60, 100),
@@ -220,10 +208,8 @@ TIER_EXTRAS = {
     8: (220, 260), 9: (260, 300)
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
-
 ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
 ACTION_WEIGHTS = [38, 22, 22, 18]
-
 TIER_PAYOUTS: Dict[int, Tuple[int, int]] = {
     1: (1000, 500),
     2: (7130, 3560),
@@ -236,7 +222,6 @@ TIER_PAYOUTS: Dict[int, Tuple[int, int]] = {
     9: (50000, 25000),
 }
 
-# ─── Battle state ────────────────────────────────────────────
 @dataclass
 class BattleState:
     user_id: int
@@ -252,15 +237,13 @@ class BattleState:
     next_log_idx: int = 0
     rounds: int = 0
 
+# Track active battles by user ID (allows multiple battles concurrently across users)
 active_battles: Dict[int, BattleState] = {}
 
-# ─── Global battle lock (one at a time) ───────────
-battle_lock = asyncio.Lock()
-current_battler_id: Optional[int] = None
-
-# ─── Scheduled rewards & regen ───────────────────────────────
+# ─── Scheduled tasks ─────────────────────────────────────────
 @tasks.loop(hours=1)
 async def distribute_cash():
+    # Skip immediate run after restart
     if distribute_cash.current_loop == 0:
         logger.info("Skipping first hourly cash distribution after restart")
         return
@@ -289,34 +272,19 @@ async def regenerate_hp():
             (stats->>'HP')::int * 5
         )
     """)
-    logger.info("Regenerated 20%% HP for all creatures")
+    logger.info("Regenerated 20% HP for all creatures")
 
-# ─── Utility functions ───────────────────────────────────────
-def roll_d100() -> int: return random.randint(1, 100)
-def rarity_for_tier(tier: int) -> str:
-    rarities, weights = TIER_RARITY_WEIGHTS[tier]
-    return random.choices(rarities, weights=weights, k=1)[0]
-def allocate_stats(rarity: str, extra: int = 0) -> Dict[str, int]:
-    pool = random.randint(*POINT_POOLS[rarity]) + extra
-    stats = {k: 1 for k in PRIMARY_STATS}
-    pool -= len(PRIMARY_STATS)
-    for _ in range(pool):
-        stats[random.choice(PRIMARY_STATS)] += 1
-    return stats
-def stat_block(name: str, cur_hp: int, max_hp: int, s: Dict[str, int]) -> str:
-    return (f"{name} – HP:{cur_hp}/{max_hp} "
-            f"AR:{s['AR']} PATK:{s['PATK']} SATK:{s['SATK']} SPD:{s['SPD']}")
-def choose_action() -> str:
-    return random.choices(ACTIONS, weights=ACTION_WEIGHTS, k=1)[0]
-
+# ─── Helper functions ────────────────────────────────────────
 async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Record]:
+    """Ensure the user has a trainer profile; send error message if not."""
     row = await (await db_pool()).fetchrow(
-        "SELECT cash, trainer_points, facility_level FROM trainers WHERE user_id=$1", inter.user.id
+        "SELECT cash, trainer_points, facility_level FROM trainers WHERE user_id=$1",
+        inter.user.id
     )
     if not row:
         await inter.response.send_message("Use /register first.", ephemeral=True)
         return None
-    # Opportunistically update stored display name to avoid REST lookups later
+    # Update stored display name (if changed) to avoid redundant API calls
     try:
         current_name = (
             getattr(inter.user, 'global_name', None)
@@ -331,414 +299,20 @@ async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Reco
         pass
     return row
 
-async def get_creature_count(user_id: int) -> int:
-    return await (await db_pool()).fetchval(
-        "SELECT COUNT(*) FROM creatures WHERE owner_id=$1", user_id
+async def ensure_creature(inter: discord.Interaction, creature_name: str) -> Optional[asyncpg.Record]:
+    """Fetch the user's creature by name; send error message if not found."""
+    row = await (await db_pool()).fetchrow(
+        "SELECT id, name, rarity, descriptors, stats, current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id, creature_name
     )
-
-async def enforce_creature_cap(inter: discord.Interaction) -> bool:
-    count = await get_creature_count(inter.user.id)
-    if count >= MAX_CREATURES:
-        await inter.response.send_message(
-            f"You already own the maximum of {MAX_CREATURES} creatures. "
-            "Sell one before spawning a new egg.",
-            ephemeral=True
-        )
-        return False
-    return True
-
-async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
-    pool = await db_pool()
-    rows = await pool.fetch("SELECT name, descriptors FROM creatures")
-    used_names = [r["name"].lower() for r in rows]
-    used_words = {w.lower() for r in rows for w in (r["descriptors"] or [])}
-
-    # Random 50 sample for prompt compactness
-    used_names_list = list(used_names)
-    used_words_list = list(used_words)
-    from random import sample as _rsample
-    avoid_names = _rsample(used_names_list, min(50, len(used_names_list)))
-    avoid_words = _rsample(used_words_list, min(50, len(used_words_list)))
-    prompt = f"""
-Invent a creature of rarity **{rarity}**. Return ONLY JSON:
-{{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
-Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
-Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
-"""
-    import asyncio as _asyncio, json as _json, re as _re
-    for _ in range(3):
-        try:
-            resp = await _with_timeout(
-                _to_thread(lambda: client.responses.create(
-                    model=TEXT_MODEL,
-                    input=prompt,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                )),
-                timeout=20.0
-            )
-            text = (getattr(resp, 'output_text', '') or '').strip()
-            if not text:
-                continue
-            try:
-                data = _json.loads(text)
-            except Exception:
-                m = _re.search(r"\{[\s\S]*\}", text)
-                if not m:
-                    raise
-                data = _json.loads(m.group(0))
-            if "name" in data and len(data.get("descriptors", [])) == 3:
-                data["name"] = str(data["name"]).title()
-                return data
-        except _asyncio.TimeoutError:
-            logger.warning("generate_creature_meta timed out; retrying…")
-        except Exception as e:
-            logger.error("OpenAI error: %s", e)
-    return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
-
-# ─── Name-only generator for battles ─────────────────────────
-
-async def generate_creature_name(rarity: str) -> str:
-    """Ask the model for a name only (short) to reduce tokens. Non-blocking with timeout."""
-    # Pull some existing names to avoid dupes
-    pool = await db_pool()
-    rows = await pool.fetch("SELECT name FROM creatures")
-    used = sorted({r["name"].lower() for r in rows})[:50]
-    prompt = (
-        f"Invent a creature of rarity **{rarity}**. Return ONLY JSON\n"
-        f"{{\"name\":\"1-3 words\"}}\n"
-        f"Avoid names: {', '.join(used) if used else 'None'}\n"
-    )
-    import random as _random, re as _re, json as _json
-    for _ in range(3):
-        try:
-            resp = await _with_timeout(
-                _to_thread(lambda: client.responses.create(
-                    model=TEXT_MODEL,
-                    input=prompt,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                )),
-                timeout=15.0
-            )
-            try:
-                text = getattr(resp, "output_text", None) or ""
-            except Exception:
-                text = str(resp) if resp is not None else ""
-            m = _re.search(r"\{[\s\S]*\}", text or "")
-            data = _json.loads(m.group(0)) if m else {}
-            if "name" in data:
-                return str(data["name"]).title()
-        except asyncio.TimeoutError:
-            logger.warning("generate_creature_name timed out; retrying…")
-        except Exception as e:
-            logger.error("OpenAI name-only error: %s", e)
-    return f"Wild{_random.randint(1000,9999)}"
-
-# Robust extractor for Images API responses (dict or SDK object)
-def _extract_image_url(img_resp):
-    # Newer SDK returns ImagesResponse with .data -> objects with .url
-    try:
-        data = getattr(img_resp, "data", None)
-        if data and len(data) > 0:
-            url = getattr(data[0], "url", None)
-            if url:
-                return url
-    except Exception:
-        pass
-    # Older / dict-like
-    try:
-        return img_resp["data"][0]["url"]
-    except Exception:
+    if not row:
+        await inter.response.send_message("Creature not found.", ephemeral=True)
         return None
+    return row
 
-def _extract_image_bytes(img_resp):
-    # Try SDK object path
-    try:
-        data = getattr(img_resp, "data", None)
-        if data and len(data) > 0:
-            b64v = getattr(data[0], "b64_json", None)
-            if b64v:
-                import base64 as _b64
-                return _b64.b64decode(b64v)
-    except Exception:
-        pass
-    # Try dict-like
-    try:
-        b64v = img_resp["data"][0].get("b64_json")
-        if b64v:
-            import base64 as _b64
-            return _b64.b64decode(b64v)
-    except Exception:
-        pass
-    return None
-# ─── OpenAI helpers (Responses API) ─────────────────────────
-
-def _safe_dump_response(resp) -> str:
-    try:
-        if hasattr(resp, "model_dump"):
-            d = resp.model_dump(exclude_none=True)
-        elif hasattr(resp, "dict"):
-            d = resp.dict()
-        else:
-            return str(resp)[:1200]
-        import json as _json
-        return _json.dumps(d, ensure_ascii=False)[:1200]
-    except Exception:
-        try:
-            return str(resp)[:1200]
-        except Exception:
-            return "<unprintable response>"
-
-# ─── Async helpers to isolate blocking calls + enforce timeouts ──────────────
-async def _to_thread(fn):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, fn)
-
-async def _with_timeout(coro, timeout: float = 15.0):
-    return await asyncio.wait_for(coro, timeout=timeout)
-
-async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 512) -> dict | None:
-    """
-    Calls the Responses API and requests a strict JSON object back.
-    Returns a dict or None on failure.
-    """
-    loop = asyncio.get_running_loop()
-    try:
-        resp = await _with_timeout(
-            loop.run_in_executor(
-                None,
-                lambda: client.responses.create(
-                    model=TEXT_MODEL,
-                    input=prompt,
-                    max_output_tokens=max_output_tokens,
-                    response_format={"type": "json_object"},
-                ),
-            ),
-            timeout=20.0,
-        )
-        text = getattr(resp, "output_text", None) or ""
-        text = text.strip()
-        if not text:
-            if OPENAI_DEBUG:
-                logger.error("Responses debug (empty): %s", _safe_dump_response(resp))
-            return None
-        return json.loads(text)
-    except asyncio.TimeoutError:
-        logger.error("OpenAI JSON call timed out.")
-        return None
-    except Exception as e:
-        logger.error("OpenAI JSON call failed: %s", e)
-        return None
-
-async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool = False):
-    chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
-    if not inter.response.is_done():
-        await inter.response.send_message(chunks[0], ephemeral=ephemeral)
-    else:
-        await inter.followup.send(chunks[0], ephemeral=ephemeral)
-    for chunk in chunks[1:]:
-        await inter.followup.send(chunk, ephemeral=ephemeral)
-
-# ─── Command listing helper ─────────────────────────────────
-def _build_command_list(bot: commands.Bot) -> str:
-    """
-    Returns a formatted string listing all slash commands and their parameters.
-    Automatically paginated later by send_chunks().
-    """
-    try:
-        cmds = list(bot.tree.get_commands())
-    except Exception:
-        cmds = []
-    # Sort by name for stable output
-    cmds.sort(key=lambda c: getattr(c, "name", "").lower())
-    lines = ["**Commands**"]
-    for c in cmds:
-        name = getattr(c, "name", None) or "<unknown>"
-        desc = getattr(c, "description", "") or ""
-        # Collect parameter names (with ? for optional) if available
-        params = []
-        try:
-            for p in getattr(c, "parameters", []):
-                # discord.app_commands.Parameter has attributes: name, required
-                pname = getattr(p, "name", None) or getattr(p, "display_name", None) or "arg"
-                preq = getattr(p, "required", True)
-                params.append(f"<{pname}>" if preq else f"[{pname}]")
-        except Exception:
-            pass
-        sig = (" " + " ".join(params)) if params else ""
-        # Keep each command as a single concise bullet line
-        line = f"/{name}{sig} — {desc}".strip()
-        # Discord hard cap ~2000 chars per message; send_chunks handles chunking,
-        # but keep individual lines under ~180 chars to avoid split mid-line.
-        if len(line) > 180:
-            line = line[:177] + "…"
-        lines.append(line)
-    return "\n".join(lines) or "No commands registered."
-
-# ─── Battle cap helper ───────────────────────────────────────
-async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
-            row = await conn.fetchrow(
-                "SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE",
-                creature_id, day
-            )
-            if not row:
-                await conn.execute(
-                    "INSERT INTO battle_caps(creature_id, day, count) VALUES($1,$2,1)",
-                    creature_id, day
-                )
-                return True, 1
-            current = row["count"]
-            if current >= DAILY_BATTLE_CAP:
-                return False, current
-            new_count = current + 1
-            await conn.execute(
-                "UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2",
-                creature_id, day, new_count
-            )
-            return True, new_count
-
-# NEW: bulk fetch remaining battles for /creatures
-async def _battles_left_map(creature_ids: List[int]) -> Dict[int, int]:
-    """
-    Returns {creature_id: remaining} for the given ids for today's Europe/London day.
-    Creatures with no row yet are assumed to have full cap remaining.
-    """
-    result: Dict[int, int] = {cid: DAILY_BATTLE_CAP for cid in creature_ids}
-    if not creature_ids:
-        return result
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
-        rows = await conn.fetch(
-            "SELECT creature_id, count FROM battle_caps WHERE day=$1 AND creature_id = ANY($2::int[])",
-            day, creature_ids
-        )
-    for r in rows:
-        left = max(0, DAILY_BATTLE_CAP - int(r["count"]))
-        result[int(r["creature_id"])] = left
-    return result
-
-# ─── Progress / Glyphs helpers ───────────────────────────────
-async def _get_progress(conn: asyncpg.Connection, creature_id: int, tier: int) -> Optional[asyncpg.Record]:
-    return await conn.fetchrow(
-        "SELECT wins, glyph_unlocked FROM creature_progress WHERE creature_id=$1 AND tier=$2",
-        creature_id, tier
-    )
-
-async def _get_wins_for_tier(creature_id: int, tier: int) -> int:
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        row = await _get_progress(conn, creature_id, tier)
-        return (row["wins"] if row else 0)
-
-async def _max_unlocked_tier(creature_id: int) -> int:
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        unlocked = 1
-        for t in range(1, 9):
-            row = await _get_progress(conn, creature_id, t)
-            wins_t = (row["wins"] if row else 0)
-            if wins_t >= 5:
-                unlocked = t + 1
-            else:
-                break
-        return unlocked
-
-async def _record_win_and_maybe_unlock(creature_id: int, tier: int) -> Tuple[int, bool]:
-    pool = await db_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await _get_progress(conn, creature_id, tier)
-            if not row:
-                wins = 1
-                glyph = (wins >= 5)
-                await conn.execute(
-                    "INSERT INTO creature_progress(creature_id,tier,wins,glyph_unlocked) VALUES($1,$2,$3,$4)",
-                    creature_id, tier, wins, glyph
-                )
-                return wins, glyph
-            wins = row["wins"] + 1
-            glyph = row["glyph_unlocked"]
-            if not glyph and wins >= 5:
-                await conn.execute(
-                    "UPDATE creature_progress SET wins=$3, glyph_unlocked=true WHERE creature_id=$1 AND tier=$2",
-                    creature_id, tier, wins
-                )
-                return wins, True
-            else:
-                await conn.execute(
-                    "UPDATE creature_progress SET wins=$3 WHERE creature_id=$1 AND tier=$2",
-                    creature_id, tier, wins
-                )
-                return wins, False
-
-def simulate_round(st: BattleState):
-    st.rounds += 1
-    st.logs.append(f"Round {st.rounds}")
-    sudden_death_mult = 1.1 ** (st.rounds // 10)
-    if st.rounds % 10 == 0:
-        st.logs.append(f"⚡ Sudden Death intensifies! Global damage ×{sudden_death_mult:.2f}")
-    while True:
-        user_act, opp_act = choose_action(), choose_action()
-        if not (user_act == "Defend" and opp_act == "Defend"):
-            break
-    st.logs.append(
-        f"{st.user_creature['name']} chooses **{user_act}** | "
-        f"{st.opp_creature['name']} chooses **{opp_act}**"
-    )
-    st.logs.append(
-        f"{st.user_creature['name']} HP {st.user_current_hp}/{st.user_max_hp} | "
-        f"{st.opp_creature['name']} HP {st.opp_current_hp}/{st.opp_max_hp}"
-    )
-    uc, oc = st.user_creature, st.opp_creature
-    order = [("user", uc, oc, user_act, opp_act), ("opp", oc, uc, opp_act, user_act)]
-    if uc["stats"]["SPD"] < oc["stats"]["SPD"] or (
-        uc["stats"]["SPD"] == oc["stats"]["SPD"] and random.choice([0, 1])
-    ):
-        order.reverse()
-    for side, atk, dfn, act, dfn_act in order:
-        if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
-        if act == "Defend":
-            st.logs.append(f"{atk['name']} is defending.")
-            continue
-        swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
-        for _ in range(swings):
-            if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
-            S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
-            AR_val = 0 if act == "Special" else dfn["stats"]["AR"] // 2
-            rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
-            s = sum(rolls)
-            dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
-            if act == "Aggressive": dmg = math.ceil(dmg * 1.25)
-            if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
-            if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
-            if side == "user": st.opp_current_hp -= dmg
-            else: st.user_current_hp -= dmg
-            act_word = {"Attack":"hits","Aggressive":"aggressively hits","Special":"unleashes a special attack on"}[act]
-            note = " (defended)" if dfn_act == "Defend" else ""
-            st.logs.append(f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg"
-                           f"{' (rolls '+str(rolls)+')' if act!='Special' else ''}{note}")
-            if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-                st.logs.append(f"{dfn['name']} is down!")
-                break
-    st.logs.append(
-        f"{st.user_creature['name']} HP {max(st.user_current_hp,0)}/{st.user_max_hp} | "
-        f"{st.opp_creature['name']} HP {max(st.opp_current_hp,0)}/{st.opp_max_hp}"
-    )
-    st.logs.append("")
-
-# ─── Leaderboard helpers ─────────────────────────────────────
-NAME_W = 22
-TRAINER_W = 16
-_owner_name_cache: Dict[int, str] = {}
-
+# ─── Leaderboard and records utilities ───────────────────────
 async def _resolve_trainer_name_from_db(user_id: int) -> Optional[str]:
-    """Get trainer's stored display name from DB (preferred) or None.
-    This avoids hitting the Discord REST API and rate limits.
-    """
+    """Fetch trainer's display name from DB (fallback to user_id if not set)."""
     try:
         return await (await db_pool()).fetchval(
             "SELECT COALESCE(display_name, user_id::text) FROM trainers WHERE user_id=$1",
@@ -746,26 +320,6 @@ async def _resolve_trainer_name_from_db(user_id: int) -> Optional[str]:
         )
     except Exception:
         return None
-
-async def _resolve_trainer_name(owner_id: int) -> str:
-    """Resolve trainer display name without privileged member intent."""
-    if owner_id in _owner_name_cache:
-        return _owner_name_cache[owner_id]
-    name: Optional[str] = None
-    u = bot.get_user(owner_id)
-    if not u:
-        try:
-            u = await bot.fetch_user(owner_id)  # REST; no privileged intent needed
-        except Exception:
-            u = None
-    if u:
-        name = getattr(u, "global_name", None) or u.name
-    if not name:
-        name = str(owner_id)
-    if len(name) > TRAINER_W:
-        name = name[:TRAINER_W]
-    _owner_name_cache[owner_id] = name
-    return name
 
 async def _backfill_creature_records():
     pool = await db_pool()
@@ -804,436 +358,96 @@ async def _record_death(owner_id: int, name: str):
         owner_id, name
     )
 
-async def _get_leaderboard_channel_id() -> Optional[int]:
-    pool = await db_pool()
-    chan = await pool.fetchval("SELECT channel_id FROM leaderboard_messages LIMIT 1")
-    if chan:
-        return int(chan)
-    if LEADERBOARD_CHANNEL_ID_ENV:
-        try:
-            return int(LEADERBOARD_CHANNEL_ID_ENV)
-        except Exception:
-            logger.error("LEADERBOARD_CHANNEL_ID env was set but not an integer.")
-    return None
-
-async def _get_or_create_leaderboard_message(channel_id: int) -> Optional[discord.Message]:
-    try:
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-    except Exception as e:
-        logger.error("Failed to fetch leaderboard channel %s: %s", channel_id, e)
-        return None
-
-    pool = await db_pool()
-    msg_id = await pool.fetchval(
-        "SELECT message_id FROM leaderboard_messages WHERE channel_id=$1", channel_id
+async def _get_progress(conn: asyncpg.Connection, creature_id: int, tier: int) -> Optional[asyncpg.Record]:
+    return await conn.fetchrow(
+        "SELECT wins, glyph_unlocked FROM creature_progress WHERE creature_id=$1 AND tier=$2",
+        creature_id, tier
     )
 
-    message: Optional[discord.Message] = None
-    if msg_id:
-        try:
-            message = await channel.fetch_message(int(msg_id))
-        except Exception:
-            message = None
+async def _get_wins_for_tier(creature_id: int, tier: int) -> int:
+    async with (await db_pool()).acquire() as conn:
+        row = await _get_progress(conn, creature_id, tier)
+        return (row["wins"] if row else 0)
 
-    if message is None:
-        try:
-            message = await channel.send("Initializing leaderboard…")
-            await pool.execute("""
-                INSERT INTO leaderboard_messages(channel_id, message_id)
-                VALUES ($1,$2)
-                ON CONFLICT (channel_id) DO UPDATE SET message_id=EXCLUDED.message_id
-            """, channel_id, message.id)
-        except Exception as e:
-            logger.error("Failed to create leaderboard message: %s", e)
-            return None
-
-    return message
-
-# UPDATED: include glyph column
-
-def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optional[int]]]) -> str:
-    """
-    Input rows: (name, wins, losses, is_dead, trainer_name, max_glyph_tier)
-    Use a diff code block; prefix '-' for dead to render red.
-    """
-    lines: List[str] = []
-    header = f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4} {'Glyph':>5} Status"
-    lines.append("  " + header)
-    for idx, (name, wins, losses, dead, trainer_name, glyph_tier) in enumerate(rows, start=1):
-        name = (name or "")[:NAME_W]
-        trainer = (trainer_name or "")[:TRAINER_W]
-        glyph_display = "-" if not glyph_tier or glyph_tier <= 0 else str(glyph_tier)
-        base_line = (
-            f"{idx:>3}. {name:<{NAME_W}} {trainer:<{TRAINER_W}} {wins:>4} {losses:>4} {glyph_display:>5} "
-            f"{'💀 DEAD' if dead else ''}"
-        )
-        lines.append(("- " if dead else "  ") + base_line)
-    return "```diff\n" + "\n".join(lines) + "\n```"
-# ─── Encyclopedia helpers ────────────────────────────────────
-async def _get_encyclopedia_channel_id() -> Optional[int]:
-    pool = await db_pool()
-    chan = await pool.fetchval("SELECT channel_id FROM encyclopedia_channel LIMIT 1")
-    if chan:
-        try:
-            return int(chan)
-        except Exception:
-            return None
-    return None
-
-async def _ensure_encyclopedia_channel(channel_id: int) -> Optional[discord.TextChannel]:
-    try:
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-        if isinstance(channel, (discord.TextChannel, discord.Thread)):
-            return channel
-        return None
-    except Exception as e:
-        logger.error("Failed to fetch encyclopedia channel %s: %s", channel_id, e)
-        return None
-
-def _format_stats_block(stats: Dict[str, int]) -> str:
-    # Show HP as both points and max HP (×5)
-    max_hp = stats.get("HP", 0) * 5
-    return (
-        f"HP: {stats.get('HP', 0)} (Max {max_hp}) | "
-        f"AR: {stats.get('AR', 0)} | "
-        f"PATK: {stats.get('PATK', 0)} | "
-        f"SATK: {stats.get('SATK', 0)} | "
-        f"SPD: {stats.get('SPD', 0)}"
-    )
-
-async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[str], stats: Dict[str, int]) -> tuple[str, Optional[str], Optional[bytes]]:
-    """
-    Returns (bio_text, image_url or None)
-    Uses OpenAI for both text (ChatCompletion) and image (Images.create).
-    """
-    # 1) Bio text
-    try:
-        sys_prompt = (
-            "You are writing a concise creature entry for an arena-battler encyclopedia. "
-            "These creatures are NOT from natural Warcraft lore—they are laboratory-bred specifically for fighting arenas. "
-            "Tone: punchy, evocative, 3–6 sentences max. "
-            "Include a hint of distinctive abilities implied by the stats/traits. Do not mention that you are an AI."
-        )
-        user_prompt = (
-            f"Name: {cre_name}\n"
-            f"Rarity: {rarity}\n"
-            f"Traits/Descriptors: {', '.join(traits) if traits else 'None'}\n"
-            f"Stats (HP, AR, PATK, SATK, SPD): {stats}\n\n"
-            "Write the bio now."
-        )
-
-        # Keep compatible with your existing OpenAI usage pattern
-        loop = asyncio.get_running_loop()
-        resp = await _with_timeout(
-            loop.run_in_executor(
-                None,
-                lambda: client.responses.create(
-                    model=TEXT_MODEL,
-                    input=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                ),
-            ),
-            timeout=25.0,
-        )
-        bio_text = getattr(resp, 'output_text', '') or ''
-    except Exception as e:
-        logger.error("OpenAI bio error: %s", e)
-        bio_text = "A lab-forged arena combatant. (Bio generation failed.)"
-
-    
-
-# 2) Image (Warcraft Cinematic CGI style)
-    image_url = None
-    try:
-        traits_str = ", ".join(traits) if traits else ""
-        img_prompt = (
-            f"{cre_name}, {rarity} rarity, {traits_str}. "
-            "Ultra-detailed digital image in the style of Warcraft Cinematic CGI, dramatic lighting, "
-            "fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
-        )
-        loop = asyncio.get_running_loop()
-        image_url = None
-        image_bytes = None
-
-        # Single high-res attempt with NO timeout. If it fails for any reason, fall back to 512x512 (also no timeout).
-        try:
-            img_resp = await loop.run_in_executor(
-                None,
-                lambda: client.images.generate(
-                    model=IMAGE_MODEL,
-                    prompt=img_prompt,
-                    n=1,
-                    size="1024x1024",
-                ),
-            )
-        except Exception as _e1:
-            logger.warning("Primary image generation failed (%s). Falling back to 512x512.", type(_e1).__name__)
-            img_resp = await loop.run_in_executor(
-                None,
-                lambda: client.images.generate(
-                    model=IMAGE_MODEL,
-                    prompt=img_prompt,
-                    n=1,
-                    size="512x512",
-                ),
-            )
-
-        # Prefer URL; bytes fallback handled if present
-        image_url = _extract_image_url(img_resp)
-        if not image_url:
-            image_bytes = _extract_image_bytes(img_resp)
-        if not (image_url or image_bytes):
-            raise RuntimeError("Image generation returned no data")
-    except Exception as e:
-        logger.error("OpenAI image error (%s): %s", type(e).__name__, e)
-        image_url = None
-        image_bytes = None
-    return bio_text, image_url, image_bytes
-
-async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
-    channel_id = await _get_leaderboard_channel_id()
-    if not channel_id:
-        return
-    message = await _get_or_create_leaderboard_message(channel_id)
-    if message is None:
-        return
-
-    pool = await db_pool()
-    # UPDATED: pull highest obtained glyph tier for each creature via subquery
-    rows = await pool.fetch(
-    """
-        SELECT
-            r.name,
-            r.wins,
-            r.losses,
-            r.is_dead,
-            COALESCE(t.display_name, r.owner_id::text) AS trainer_name,
-            COALESCE((
-                SELECT MAX(cp.tier)
-                FROM creature_progress cp
-                WHERE cp.creature_id = r.creature_id
-                  AND cp.glyph_unlocked = TRUE
-            ), 0) AS max_glyph_tier
-        FROM creature_records r
-        LEFT JOIN trainers t ON t.user_id = r.owner_id
-        ORDER BY max_glyph_tier DESC, r.wins DESC, r.losses ASC, r.name ASC
-        LIMIT 20
-    """
-)
-    formatted: List[Tuple[str, int, int, bool, str, int]] = [
-        (r["name"], r["wins"], r["losses"], r["is_dead"], r["trainer_name"], r["max_glyph_tier"]) 
-        for r in rows
-    ]
-    updated_ts = int(time.time())
-    title = (
-        f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph)**\n"
-        f"Updated: <t:{updated_ts}:R>\n"
-    )
-    content = title + _format_leaderboard_lines(formatted)
-    try:
-        await message.edit(content=content)
-        logger.info("Leaderboard updated (%s).", reason)
-    except Exception as e:
-        logger.error("Failed to edit leaderboard message: %s", e)
-
-@tasks.loop(minutes=5)
-async def update_leaderboard_periodic():
-    await update_leaderboard_now(reason="periodic")
-
-# ─── Battle finalize (records + leaderboard) ─────────────────
-async def finalize_battle(inter: discord.Interaction, st: BattleState):
-    player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
-    wins = None
-    unlocked_now = False
-    gained_stat = None
-    died = False
-    win_cash, loss_cash = TIER_PAYOUTS[st.tier]
-    payout = win_cash if player_won else loss_cash
-    pool = await db_pool()
-
-    await _ensure_record(st.user_id, st.creature_id, st.user_creature["name"])
-    await _record_result(st.user_id, st.user_creature["name"], player_won)
-
-    await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", payout, st.user_id)
-    st.logs.append(f"You {'won' if player_won else 'lost'} the Tier {st.tier} battle: +{payout} cash awarded.")
-
-    if player_won:
-        wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
-        st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
-        if unlocked_now:
-            st.logs.append(
-                f"🏅 **Tier {st.tier} Glyph unlocked!**" +
-                (f" {st.user_creature['name']} may now battle **Tier {st.tier + 1}**." if st.tier < 9 else "")
-            )
-
-        # ── NEW: Victory stat gain (+1 random stat) ─────────────────────────────
-        # Only on win, and only for the surviving creature (wins never roll death here).
-        try:
-            # Choose a stat and apply +1 in memory first
-            gained_stat = random.choice(PRIMARY_STATS)
-            new_stats = dict(st.user_creature["stats"])  # shallow copy
-            new_stats[gained_stat] = int(new_stats.get(gained_stat, 0)) + 1
-
-            # Compute new HP values if HP increased
-            new_max_hp = int(new_stats["HP"]) * 5
-            # st.user_current_hp at this point is the final HP after battle rounds
-            new_cur_hp = st.user_current_hp
-            if gained_stat == "HP":
-                # On HP gain, increase current HP by +5 but cap at new max
-                new_cur_hp = min(st.user_current_hp + 5, new_max_hp)
-
-            # Persist to DB
-            await pool.execute(
-                "UPDATE creatures SET stats=$1, current_hp=$2 WHERE id=$3",
-                json.dumps(new_stats), new_cur_hp, st.creature_id
-            )
-
-            # Update in-memory snapshot so future logs/logic reflect the change
-            st.user_creature["stats"] = new_stats
-            st.user_max_hp = new_max_hp
-            st.user_current_hp = new_cur_hp
-
-            # Friendly log message
-            if gained_stat == "HP":
-                st.logs.append(
-                    f"✨ **{st.user_creature['name']}** gained **+1 HP** from the victory "
-                    f"(Max HP is now {new_max_hp}, current {new_cur_hp}/{new_max_hp})."
-                )
+async def _max_unlocked_tier(creature_id: int) -> int:
+    async with (await db_pool()).acquire() as conn:
+        unlocked = 1
+        for t in range(1, 9):
+            row = await _get_progress(conn, creature_id, t)
+            wins_t = (row["wins"] if row else 0)
+            if wins_t >= 5:
+                unlocked = t + 1
             else:
-                st.logs.append(
-                    f"✨ **{st.user_creature['name']}** gained **+1 {gained_stat}** from the victory!"
+                break
+        return unlocked
+
+async def _record_win_and_maybe_unlock(creature_id: int, tier: int) -> Tuple[int, bool]:
+    async with (await db_pool()).acquire() as conn:
+        async with conn.transaction():
+            row = await _get_progress(conn, creature_id, tier)
+            if not row:
+                wins = 1
+                glyph_unlocked = (wins >= 5)
+                await conn.execute(
+                    "INSERT INTO creature_progress(creature_id, tier, wins, glyph_unlocked) VALUES($1,$2,$3,$4)",
+                    creature_id, tier, wins, glyph_unlocked
                 )
-                gained_stat = gained_stat
-        except Exception as e:
-            logger.error("Failed to apply victory stat gain: %s", e)
-        # ── End NEW ─────────────────────────────────────────────────────────────
+                return wins, glyph_unlocked
+            wins = row["wins"] + 1
+            glyph_unlocked = row["glyph_unlocked"]
+            if not glyph_unlocked and wins >= 5:
+                await conn.execute(
+                    "UPDATE creature_progress SET wins=$3, glyph_unlocked=true WHERE creature_id=$1 AND tier=$2",
+                    creature_id, tier, wins
+                )
+                return wins, True
+            else:
+                await conn.execute(
+                    "UPDATE creature_progress SET wins=$3 WHERE creature_id=$1 AND tier=$2",
+                    creature_id, tier, wins
+                )
+                return wins, False
 
-    if not player_won:
-        death_roll = random.random()
-        pct = int(death_roll * 100)
-        if death_roll < 0.5:
-            await _record_death(st.user_id, st.user_creature["name"])
-            died = True
-            await pool.execute("DELETE FROM creatures WHERE id=$1", st.creature_id)
-            st.logs.append(f"💀 Death roll {pct} (<50): **{st.user_creature['name']}** died (kept on leaderboard).")
-        else:
-            st.logs.append(f"🛡️ Death roll {pct} (≥50): **{st.user_creature['name']}** survived the defeat.")
-
-    asyncio.create_task(update_leaderboard_now(reason="battle_finalize"))
-
-    return {"player_won": player_won, "payout": payout, "wins": wins, "unlocked_now": unlocked_now, "gained_stat": gained_stat, "died": died}
-
-# ─── Public battle summary helper ───────────────────────────
-def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: str) -> str:
-    winner = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
-    loser = st.opp_creature["name"] if summary.get("player_won") else st.user_creature["name"]
-    lines = [
-        f"**Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs **{st.opp_creature['name']}** (Tier {st.tier})",
-        f"🏅 Winner: **{winner}**",
-        f"💰 Payout: **+{summary.get('payout', 0)}** cash to {trainer_name}",
-    ]
-    wins = summary.get("wins")
-    if wins is not None:
-        lines.append(f"📈 Progress: Tier {st.tier} wins = {wins}/5")
-    if summary.get("unlocked_now"):
-        lines.append(f"🔓 **Tier {st.tier+1} unlocked!**")
-    gained = summary.get("gained_stat")
-    if gained:
-        lines.append(f"✨ Victory bonus: **+1 {gained}** to {st.user_creature['name']}")
-    if summary.get("died"):
-        lines.append(f"💀 {st.user_creature['name']} died and was removed from your stable (kept on leaderboard).")
-    return "\n".join(lines)
-
-# ─── Bot events ──────────────────────────────────────────────
+# ─── Bot event handlers ───────────────────────────────────────
 @bot.event
 async def setup_hook():
-
-    pool = await db_pool()
-    async with pool.acquire() as conn:
+    conn = await (await db_pool()).acquire()
+    try:
         await conn.execute(SCHEMA_SQL)
-
+    finally:
+        await (await db_pool()).release(conn)
     await _backfill_creature_records()
-
+    # Register commands to a specific guild if GUILD_ID is set, otherwise globally
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
-        # Copy all defined commands to the guild and sync there
         bot.tree.copy_global_to(guild=guild_obj)
         await bot.tree.sync(guild=guild_obj)
-        # IMPORTANT: Clear global commands and sync empty to remove duplicates in suggestions
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
-        logger.info("Synced to guild %s and cleared global commands.", GUILD_ID)
+        logger.info("Synced commands to guild %s and cleared global commands.", GUILD_ID)
     else:
         await bot.tree.sync()
-        logger.info("Synced globally")
+        logger.info("Synced commands globally")
 
-    for loop in (distribute_cash, distribute_points, regenerate_hp, update_leaderboard_periodic):
-        if not loop.is_running():
-            loop.start()
-
+    # Start background tasks
+    for task_loop in (distribute_cash, distribute_points, regenerate_hp):
+        if not task_loop.is_running():
+            task_loop.start()
+    # Initialize leaderboard if configured
     chan_id = await _get_leaderboard_channel_id()
     if chan_id:
         await _get_or_create_leaderboard_message(chan_id)
         await update_leaderboard_now(reason="startup")
     else:
-        logger.info("No leaderboard channel configured yet. Use /setleaderboardchannel in the desired channel or set LEADERBOARD_CHANNEL_ID.")
+        logger.info("No leaderboard channel configured. Use /setleaderboardchannel or set LEADERBOARD_CHANNEL_ID.")
 
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
-    try:
-        # No global sync here; setup_hook already handled guild/global registration and cleanup.
-        synced = []
-        logger.info("Ready. (%d commands)", len(synced))
-    except Exception as e:
-        logger.exception("Error during on_ready: %s", e)
+    # Commands are already synced in setup_hook
+    logger.info("Bot is ready. (%d commands active)", len(bot.tree.get_commands()))
 
-# ─── Admin helper resolvers ─────────────────────────────────
-async def _extract_user_id_from_mention_or_id(s: str) -> Optional[int]:
-    """
-    Accepts formats: <@123>, <@!123>, raw numeric id '123'.
-    Returns int user_id or None.
-    """
-    try:
-        s = s.strip()
-        m = re.match(r"<@!?(\d+)>", s)
-        if m:
-            return int(m.group(1))
-        if s.isdigit():
-            return int(s)
-        return None
-    except Exception:
-        return None
-
-async def _find_single_trainer_id_by_display_name(name_like: str) -> Optional[int]:
-    """
-    Try to resolve a single trainer by display_name (case-insensitive).
-    Prefers exact (ILIKE) match; if multiple, returns None (ambiguous).
-    """
-    pool = await db_pool()
-    # First try exact case-insensitive match
-    rows = await pool.fetch(
-        "SELECT user_id FROM trainers WHERE display_name ILIKE $1",
-        name_like
-    )
-    if not rows:
-        # Try wildcard contains search
-        rows = await pool.fetch(
-            "SELECT user_id FROM trainers WHERE display_name ILIKE $1",
-            f"%{name_like}%"
-        )
-    if not rows:
-        return None
-    if len(rows) == 1:
-        return int(rows[0]["user_id"])
-    # Ambiguous
-    return None
-
-# ─── Slash commands ─────────────────────────────────────────
-
+# ─── Admin Commands ──────────────────────────────────────────
 @bot.tree.command(description="(Admin) Set this channel as the live leaderboard channel")
 async def setleaderboardchannel(inter: discord.Interaction):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -1241,8 +455,7 @@ async def setleaderboardchannel(inter: discord.Interaction):
     if not inter.channel:
         return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
 
-    pool = await db_pool()
-    await pool.execute("""
+    await (await db_pool()).execute("""
         INSERT INTO leaderboard_messages(channel_id, message_id)
         VALUES ($1, NULL)
         ON CONFLICT (channel_id) DO UPDATE SET message_id = leaderboard_messages.message_id
@@ -1251,6 +464,7 @@ async def setleaderboardchannel(inter: discord.Interaction):
     await inter.response.send_message(f"Leaderboard channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
     await _get_or_create_leaderboard_message(inter.channel.id)
     await update_leaderboard_now(reason="admin_set_channel")
+
 @bot.tree.command(description="(Admin) Set this channel as the Encyclopedia channel")
 async def setencyclopediachannel(inter: discord.Interaction):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -1258,8 +472,7 @@ async def setencyclopediachannel(inter: discord.Interaction):
     if not inter.channel:
         return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
 
-    pool = await db_pool()
-    await pool.execute("""
+    await (await db_pool()).execute("""
         INSERT INTO encyclopedia_channel(channel_id)
         VALUES ($1)
         ON CONFLICT (channel_id) DO UPDATE SET channel_id = EXCLUDED.channel_id
@@ -1267,14 +480,17 @@ async def setencyclopediachannel(inter: discord.Interaction):
 
     await inter.response.send_message(f"Encyclopedia channel set to {inter.channel.mention}.", ephemeral=True)
 
+# ─── User Commands ───────────────────────────────────────────
 @bot.tree.command(description="Register as a trainer")
 async def register(inter: discord.Interaction):
     pool = await db_pool()
+    # Only register if not already present
     if await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", inter.user.id):
         return await inter.response.send_message("Already registered!", ephemeral=True)
     await pool.execute(
         "INSERT INTO trainers(user_id, cash, trainer_points, facility_level, display_name) VALUES($1,$2,$3,$4,$5)",
-        inter.user.id, 20000, 5, 1, (getattr(inter.user, 'global_name', None) or getattr(inter.user, 'display_name', None) or inter.user.name)
+        inter.user.id, 20000, 5, 1,
+        getattr(inter.user, 'global_name', None) or getattr(inter.user, 'display_name', None) or inter.user.name
     )
     await inter.response.send_message(
         "Profile created! You received 20 000 cash and 5 trainer points.",
@@ -1286,15 +502,13 @@ async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if not row:
         return
-    can_spawn = await enforce_creature_cap(inter)
-    if not can_spawn:
+    if not await enforce_creature_cap(inter):
         return
     if row["cash"] < 10_000:
         return await inter.response.send_message("Not enough cash.", ephemeral=True)
 
-    await (await db_pool()).execute(
-        "UPDATE trainers SET cash = cash - 10000 WHERE user_id=$1", inter.user.id
-    )
+    # Deduct cost and proceed with spawn
+    await (await db_pool()).execute("UPDATE trainers SET cash = cash - 10000 WHERE user_id=$1", inter.user.id)
     await inter.response.defer(thinking=True)
 
     rarity = spawn_rarity()
@@ -1303,7 +517,7 @@ async def spawn(inter: discord.Interaction):
     max_hp = stats["HP"] * 5
 
     rec = await (await db_pool()).fetchrow(
-        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp)"
+        "INSERT INTO creatures(owner_id, name, rarity, descriptors, stats, current_hp)"
         "VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
         inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp
     )
@@ -1325,14 +539,13 @@ async def creatures(inter: discord.Interaction):
         return
     await inter.response.defer(ephemeral=True)
     rows = await (await db_pool()).fetch(
-        "SELECT id,name,rarity,descriptors,stats,current_hp FROM creatures "
-        "WHERE owner_id=$1 ORDER BY id", inter.user.id
+        "SELECT id, name, rarity, descriptors, stats, current_hp FROM creatures WHERE owner_id=$1 ORDER BY id",
+        inter.user.id
     )
     if not rows:
         return await inter.response.send_message("You own no creatures.", ephemeral=True)
 
     ids = [int(r["id"]) for r in rows]
-
     glyph_rows = await (await db_pool()).fetch(
         """
         SELECT creature_id,
@@ -1344,10 +557,8 @@ async def creatures(inter: discord.Interaction):
         ids
     )
     glyph_map = {int(r["creature_id"]): int(r["max_glyph"] or 0) for r in glyph_rows}
-
     left_map = await _battles_left_map(ids)
 
-    first = True
     for r in rows:
         st = json.loads(r["stats"])
         desc = ", ".join(r["descriptors"] or []) if (r["descriptors"] or []) else "None"
@@ -1365,28 +576,27 @@ async def creatures(inter: discord.Interaction):
             f"Overall: {overall}  |  Glyph: {glyph_disp}",
             f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**",
         ]
-        msg = "\n".join(lines)
-
-        await inter.followup.send(msg, ephemeral=True)
+        await inter.followup.send("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(description="See your creature's lifetime win/loss record")
 async def record(inter: discord.Interaction, creature_name: str):
     if not await ensure_registered(inter):
         return
-    row = await (await db_pool()).fetchrow("""
-        SELECT name, wins, losses, is_dead, died_at
-        FROM creature_records
-        WHERE owner_id=$1 AND name ILIKE $2
-    """, inter.user.id, creature_name)
+    row = await (await db_pool()).fetchrow(
+        "SELECT name, wins, losses, is_dead, died_at FROM creature_records WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id, creature_name
+    )
     if not row:
         return await inter.response.send_message("No record found for that creature name.", ephemeral=True)
     total = row["wins"] + row["losses"]
     wr = (row["wins"] / total * 100.0) if total > 0 else 0.0
     status = "💀 DEAD" if row["is_dead"] else "ALIVE"
     died_line = f"\nDied: {row['died_at']:%Y-%m-%d %H:%M %Z}" if row["is_dead"] and row["died_at"] else ""
-    msg = (f"**{row['name']} – Lifetime Record**\n"
-           f"Wins: **{row['wins']}** | Losses: **{row['losses']}** | Winrate: **{wr:.1f}%**\n"
-           f"Status: **{status}**{died_line}")
+    msg = (
+        f"**{row['name']} – Lifetime Record**\n"
+        f"Wins: **{row['wins']}** | Losses: **{row['losses']}** | Winrate: **{wr:.1f}%**\n"
+        f"Status: **{status}**{died_line}"
+    )
     await inter.response.send_message(msg, ephemeral=True)
 
 @bot.tree.command(description="Sell one of your creatures for cash (price depends on rarity)")
@@ -1394,27 +604,25 @@ async def sell(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
         return
-    c_row = await (await db_pool()).fetchrow(
-        "SELECT id, name, rarity FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
-    )
-    if not c_row:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
+    creature = await ensure_creature(inter, creature_name)
+    if not creature:
+        return
     st = active_battles.get(inter.user.id)
-    if st and st.creature_id == c_row["id"]:
+    if st and st.creature_id == creature["id"]:
         return await inter.response.send_message(
-            f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before selling.",
+            f"**{creature['name']}** is currently in a battle. Finish or cancel the battle before selling.",
             ephemeral=True
         )
-    rarity = c_row["rarity"]
+    rarity = creature["rarity"]
     price = SELL_PRICES.get(rarity, 0)
-    await _ensure_record(inter.user.id, c_row["id"], c_row["name"])
+    await _ensure_record(inter.user.id, creature["id"], creature["name"])
     async with (await db_pool()).acquire() as conn:
         async with conn.transaction():
-            await conn.execute("DELETE FROM creatures WHERE id=$1", c_row["id"])
+            await conn.execute("DELETE FROM creatures WHERE id=$1", creature["id"])
             await conn.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", price, inter.user.id)
     await inter.response.send_message(
-        f"Sold **{c_row['name']}** ({rarity}) for **{price}** cash.", ephemeral=True
+        f"Sold **{creature['name']}** ({rarity}) for **{price}** cash.",
+        ephemeral=True
     )
     asyncio.create_task(update_leaderboard_now(reason="sell"))
 
@@ -1422,22 +630,19 @@ async def sell(inter: discord.Interaction, creature_name: str):
 async def glyphs(inter: discord.Interaction, creature_name: str):
     if not await ensure_registered(inter):
         return
-    c_row = await (await db_pool()).fetchrow(
-        "SELECT id,name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
-    )
-    if not c_row:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
+    creature = await ensure_creature(inter, creature_name)
+    if not creature:
+        return
     pool = await db_pool()
     progress: Dict[int, Tuple[int, bool]] = {}
     async with pool.acquire() as conn:
         for t in range(1, 10):
-            row = await _get_progress(conn, c_row["id"], t)
+            row = await _get_progress(conn, creature["id"], t)
             wins = row["wins"] if row else 0
             glyph = (row["glyph_unlocked"] if row else False)
             progress[t] = (wins, glyph)
-    max_tier = await _max_unlocked_tier(c_row["id"])
-    lines = [f"**{c_row['name']} – Glyphs & Progress**"]
+    max_tier = await _max_unlocked_tier(creature["id"])
+    lines = [f"**{creature['name']} – Glyphs & Progress**"]
     for t in range(1, 10):
         wins, glyph = progress[t]
         lines.append(f"• Tier {t}: Wins {wins}/5 | Glyph: {'✅' if glyph else '❌'}")
@@ -1471,9 +676,10 @@ async def dailylimit(inter: discord.Interaction, creature_name: str, number: int
     if not rows:
         return await inter.response.send_message("No creature found by that name.", ephemeral=True)
 
-    exact = [r for r in rows if str(r["name"]).lower() == creature_name.lower()]
-    if len(rows) > 1 and len(exact) == 1:
-        rows = exact
+    # If multiple matches, attempt to narrow down to an exact match (case-insensitive)
+    exact_matches = [r for r in rows if str(r["name"]).lower() == creature_name.lower()]
+    if len(rows) > 1 and len(exact_matches) == 1:
+        rows = exact_matches
     if len(rows) != 1:
         preview_names = []
         for r in rows[:8]:
@@ -1528,121 +734,95 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if not await ensure_registered(inter):
         return
 
-    # Global battle gate: only one battle may run at a time
-    global current_battler_id
-    if battle_lock.locked() and (current_battler_id is not None) and (current_battler_id != inter.user.id):
-        await inter.response.send_message(
-            f"⚔ A battle is already in progress by <@{current_battler_id}>. Please try again shortly.",
-            ephemeral=True
-        )
+    creature = await ensure_creature(inter, creature_name)
+    if not creature:
         return
-    c_row = await (await db_pool()).fetchrow(
-        "SELECT id,name,stats,current_hp FROM creatures "
-        "WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
-    )
-    if not c_row:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
-
-    stats = json.loads(c_row["stats"])
-    max_hp = stats["HP"] * 5
-    if c_row["current_hp"] <= 0:
-        return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
-
-    allowed_tier = await _max_unlocked_tier(c_row["id"])
+    allowed_tier = await _max_unlocked_tier(creature["id"])
     if tier > allowed_tier:
-        need_prev = tier - 1
-        wins_prev = await _get_wins_for_tier(c_row["id"], need_prev)
+        prev_tier = tier - 1
+        wins_prev = await _get_wins_for_tier(creature["id"], prev_tier)
         return await inter.response.send_message(
-            f"Tier {tier} is locked for **{c_row['name']}**. Current unlock: **1..{allowed_tier}**. "
-            f"You need **5 wins at Tier {need_prev}** to unlock Tier {tier} (current: {wins_prev}/5).",
+            f"Tier {tier} is locked for **{creature['name']}**. Current unlock: **1..{allowed_tier}**. "
+            f"You need **5 wins at Tier {prev_tier}** to unlock Tier {tier} (current: {wins_prev}/5).",
             ephemeral=True
         )
-
-    allowed, count = await _can_start_battle_and_increment(c_row["id"])
+    # Enforce daily battle limit for this creature
+    allowed, count = await _can_start_battle_and_increment(creature["id"])
     if not allowed:
         return await inter.response.send_message(
-            f"Daily battle cap reached for **{c_row['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
+            f"Daily battle cap reached for **{creature['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
             "Try again after midnight Europe/London.", ephemeral=True
         )
 
-    await battle_lock.acquire()
-    current_battler_id = inter.user.id
-    try:
-        await inter.response.defer(thinking=True)
+    # Begin battle simulation (one battle at a time per user)
+    await inter.response.defer(thinking=True)
+    user_cre = {"name": creature["name"], "stats": json.loads(creature["stats"])}
+    rarity = rarity_for_tier(tier)
+    opp_name = await generate_creature_name(rarity)
+    extra = random.randint(*TIER_EXTRAS[tier])
+    opp_stats = allocate_stats(rarity, extra)
+    opp_cre = {"name": opp_name, "stats": opp_stats}
+    # Initialize battle state for this user
+    st = BattleState(
+        inter.user.id, creature["id"], tier,
+        user_cre, creature["current_hp"], creature["current_hp"] * 1,  # current HP and max HP (max is stats['HP']*5, but current HP is already full at start)
+        opp_cre, opp_stats["HP"] * 5, opp_stats["HP"] * 5,
+        logs=[]
+    )
+    active_battles[inter.user.id] = st
+    # Log battle start information
+    st.logs += [
+        f"Battle start! Tier {tier} (+{extra} pts) — Daily battle use for {user_cre['name']}: {count}/{DAILY_BATTLE_CAP}",
+        f"{user_cre['name']} vs {opp_cre['name']}",
+        f"Opponent rarity (tier table) → {rarity}",
+        "",
+        "Your creature:",
+        stat_block(user_cre["name"], st.user_current_hp, st.user_current_hp, user_cre["stats"]),
+        "Opponent:",
+        stat_block(opp_cre["name"], st.opp_current_hp, st.opp_current_hp, opp_stats),
+        "",
+        "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
+        "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
+        f"Daily cap: Each creature can start at most {DAILY_BATTLE_CAP} battles per Europe/London day.",
+    ]
+    max_tier = await _max_unlocked_tier(creature["id"])
+    st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
 
-        user_cre = {"name": c_row["name"], "stats": stats}
-        rarity = rarity_for_tier(tier)
-        name_only = await generate_creature_name(rarity)
-        extra = random.randint(*TIER_EXTRAS[tier])
-        opp_stats = allocate_stats(rarity, extra)
-        opp_cre = {"name": name_only, "stats": opp_stats}
-        st = BattleState(
-            inter.user.id, c_row["id"], tier,
-            user_cre, c_row["current_hp"], max_hp,
-            opp_cre, opp_stats["HP"] * 5, opp_stats["HP"] * 5,
-            logs=[]
-        )
-        active_battles[inter.user.id] = st
-        st.logs += [
-            f"Battle start! Tier {tier} (+{extra} pts) — Daily battle use for {user_cre['name']}: {count}/{DAILY_BATTLE_CAP}",
-            f"{user_cre['name']} vs {opp_cre['name']}",
-            f"Opponent rarity (tier table) → {rarity}",
-            "",
-            "Your creature:",
-            stat_block(user_cre["name"], st.user_current_hp, st.user_max_hp, stats),
-            "Opponent:",
-            stat_block(opp_cre["name"], st.opp_max_hp, st.opp_max_hp, opp_stats),
-            "",
-            "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
-            "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
-            f"Daily cap: Each creature can start at most {DAILY_BATTLE_CAP} battles per Europe/London day.",
-        ]
-        max_tier = await _max_unlocked_tier(c_row["id"])
-        st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
-
-    
-        # Public start (concise)
-        start_public = (
-            f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\n"
-            f"Opponent rarity: **{rarity}**"
-        )
-        await inter.followup.send(start_public, ephemeral=False)
-
-        # Drip-feed rounds privately
+    # Announce battle start publicly
+    start_msg = f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\nOpponent rarity: **{rarity}**"
+    await inter.followup.send(start_msg, ephemeral=False)
+    # Simulate rounds in private logs
+    st.next_log_idx = len(st.logs)
+    while st.user_current_hp > 0 and st.opp_current_hp > 0:
+        simulate_round(st)
+        new_logs = st.logs[st.next_log_idx:]
         st.next_log_idx = len(st.logs)
-        while st.user_current_hp > 0 and st.opp_current_hp > 0:
-            simulate_round(st)
-            new_logs = st.logs[st.next_log_idx:]
-            st.next_log_idx = len(st.logs)
-            if new_logs:
-                await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
-                await asyncio.sleep(0.2)
+        if new_logs:
+            await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
+            await asyncio.sleep(0.2)
 
-        await (await db_pool()).execute(
-            "UPDATE creatures SET current_hp=$1 WHERE id=$2",
-            max(st.user_current_hp, 0), st.creature_id
-        )
-
-        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-            winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
-            st.logs.append(f"Winner: {winner}")
-            summary = await finalize_battle(inter, st)
-            active_battles.pop(inter.user.id, None)
-            trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
-            pending = st.logs[st.next_log_idx:]
-            st.next_log_idx = len(st.logs)
-            if pending:
-                await send_chunks(inter, "\n".join(pending), ephemeral=True)
-                await asyncio.sleep(0.35)
-            await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
-    finally:
-        try:
-            current_battler_id = None
-            if battle_lock.locked():
-                battle_lock.release()
-        except Exception:
-            pass
+    # Battle ended: update creature's current HP in DB
+    await (await db_pool()).execute(
+        "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+        max(st.user_current_hp, 0), st.creature_id
+    )
+    # Determine winner and finalize battle outcome
+    if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+        winner_name = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
+        st.logs.append(f"Winner: {winner_name}")
+        outcome = await finalize_battle(inter, st)
+        # Remove active battle entry
+        active_battles.pop(inter.user.id, None)
+        trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
+        remaining_logs = st.logs[st.next_log_idx:]
+        st.next_log_idx = len(st.logs)
+        if remaining_logs:
+            await send_chunks(inter, "\n".join(remaining_logs), ephemeral=True)
+            await asyncio.sleep(0.35)
+        # Announce battle result publicly
+        await inter.followup.send(format_public_battle_summary(st, outcome, trainer_name), ephemeral=False)
+    # Ensure active battle entry is cleared in case of any errors
+    active_battles.pop(inter.user.id, None)
 
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):
@@ -1657,31 +837,29 @@ async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
     if amount <= 0:
         return await inter.response.send_message("Positive amounts only.", ephemeral=True)
 
-    tgt = (target or "").strip()
-    if tgt.lower() in ("me", "self"):
+    tgt = (target or "").strip().lower()
+    if tgt in ("me", "self"):
         user_id = inter.user.id
-    elif tgt.lower() == "all":
-        updated = await (await db_pool()).execute("UPDATE trainers SET cash = cash + $1", amount)
+    elif tgt == "all":
+        result = await (await db_pool()).execute("UPDATE trainers SET cash = cash + $1", amount)
         try:
-            count = int(str(updated).split()[-1])
+            updated_count = int(str(result).split()[-1])
         except Exception:
-            count = 0
-        return await inter.response.send_message(f"Added {amount} cash to **all** trainers ({count} rows).", ephemeral=True)
+            updated_count = 0
+        return await inter.response.send_message(f"Added {amount} cash to **all** trainers ({updated_count} records).", ephemeral=True)
     else:
-        user_id = await _extract_user_id_from_mention_or_id(tgt)
-        if user_id is None:
-            user_id = await _find_single_trainer_id_by_display_name(tgt)
+        # Resolve target user by mention, ID, or display name
+        user_id = await _extract_user_id_from_mention_or_id(target) or await _find_single_trainer_id_by_display_name(target)
         if user_id is None:
             return await inter.response.send_message(
-                "Couldn't uniquely resolve that trainer. Try a mention, raw ID, or an exact display name.", ephemeral=True
+                "Couldn't uniquely resolve that trainer. Try a mention, raw ID, or exact display name.",
+                ephemeral=True
             )
 
-    pool = await db_pool()
-    exists = await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id)
-    if not exists:
+    if not await (await db_pool()).fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id):
         return await inter.response.send_message("That user isn't registered.", ephemeral=True)
 
-    await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, user_id)
+    await (await db_pool()).execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, user_id)
     name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
     await inter.response.send_message(f"Added **{amount}** cash to **{name}**.", ephemeral=True)
 
@@ -1692,31 +870,28 @@ async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str 
     if amount <= 0:
         return await inter.response.send_message("Positive amounts only.", ephemeral=True)
 
-    tgt = (target or "").strip()
-    if tgt.lower() in ("me", "self"):
+    tgt = (target or "").strip().lower()
+    if tgt in ("me", "self"):
         user_id = inter.user.id
-    elif tgt.lower() == "all":
-        updated = await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + $1", amount)
+    elif tgt == "all":
+        result = await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + $1", amount)
         try:
-            count = int(str(updated).split()[-1])
+            updated_count = int(str(result).split()[-1])
         except Exception:
-            count = 0
-        return await inter.response.send_message(f"Added {amount} trainer points to **all** trainers ({count} rows).", ephemeral=True)
+            updated_count = 0
+        return await inter.response.send_message(f"Added {amount} trainer points to **all** trainers ({updated_count} records).", ephemeral=True)
     else:
-        user_id = await _extract_user_id_from_mention_or_id(tgt)
-        if user_id is None:
-            user_id = await _find_single_trainer_id_by_display_name(tgt)
+        user_id = await _extract_user_id_from_mention_or_id(target) or await _find_single_trainer_id_by_display_name(target)
         if user_id is None:
             return await inter.response.send_message(
-                "Couldn't uniquely resolve that trainer. Try a mention, raw ID, or an exact display name.", ephemeral=True
+                "Couldn't uniquely resolve that trainer. Try a mention, raw ID, or exact display name.",
+                ephemeral=True
             )
 
-    pool = await db_pool()
-    exists = await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id)
-    if not exists:
+    if not await (await db_pool()).fetchval("SELECT 1 FROM trainers WHERE user_id=$1", user_id):
         return await inter.response.send_message("That user isn't registered.", ephemeral=True)
 
-    await pool.execute("UPDATE trainers SET trainer_points = trainer_points + $1 WHERE user_id=$2", amount, user_id)
+    await (await db_pool()).execute("UPDATE trainers SET trainer_points = trainer_points + $1 WHERE user_id=$2", amount, user_id)
     name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
     await inter.response.send_message(f"Added **{amount}** trainer points to **{name}**.", ephemeral=True)
 
@@ -1738,9 +913,7 @@ async def trainerpoints(inter: discord.Interaction):
 async def train(inter: discord.Interaction, creature_name: str, stat: str, increase: int):
     stat = stat.upper()
     if stat not in PRIMARY_STATS:
-        return await inter.response.send_message(
-            f"Stat must be one of {', '.join(PRIMARY_STATS)}.", ephemeral=True
-        )
+        return await inter.response.send_message(f"Stat must be one of {', '.join(PRIMARY_STATS)}.", ephemeral=True)
     if increase <= 0:
         return await inter.response.send_message("Increase must be positive.", ephemeral=True)
 
@@ -1748,32 +921,29 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
     if not row or row["trainer_points"] < increase:
         return await inter.response.send_message("Not enough trainer points.", ephemeral=True)
 
-    c = await (await db_pool()).fetchrow(
-        "SELECT id,stats,current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
-    )
-    if not c:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
-
-    stats = json.loads(c["stats"])
+    creature = await ensure_creature(inter, creature_name)
+    if not creature:
+        return
+    stats = json.loads(creature["stats"])
     stats[stat] += increase
     new_max_hp = stats["HP"] * 5
-    new_cur_hp = c["current_hp"]
+    new_cur_hp = creature["current_hp"]
     if stat == "HP":
-        new_cur_hp += increase * 5
-        new_cur_hp = min(new_cur_hp, new_max_hp)
+        new_cur_hp = min(new_cur_hp + increase * 5, new_max_hp)
 
-    await (await db_pool()).execute(
-        "UPDATE creatures SET stats=$1,current_hp=$2 WHERE id=$3",
-        json.dumps(stats), new_cur_hp, c["id"]
-    )
-    await (await db_pool()).execute(
-        "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id=$2",
-        increase, inter.user.id
-    )
+    async with (await db_pool()).acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE creatures SET stats=$1, current_hp=$2 WHERE id=$3",
+                json.dumps(stats), new_cur_hp, creature["id"]
+            )
+            await conn.execute(
+                "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id=$2",
+                increase, inter.user.id
+            )
     display_inc = increase * 5 if stat == "HP" else increase
     await inter.response.send_message(
-        f"{c['id']} – {creature_name.title()} trained: +{display_inc} {stat}.",
+        f"{creature['id']} – {creature_name.title()} trained: +{display_inc} {stat}.",
         ephemeral=True
     )
 
@@ -1784,7 +954,7 @@ async def upgrade(inter: discord.Interaction):
         return
     level = row["facility_level"]
     current = FACILITY_LEVELS[level]
-    msg = [
+    msg_lines = [
         f"**Your Training Facility**",
         f"Level {level}: **{current['name']}**",
         f"Bonus trainer points/day: +{current['bonus']} (total daily = {daily_trainer_points_for(level)})",
@@ -1792,12 +962,12 @@ async def upgrade(inter: discord.Interaction):
         ""
     ]
     if level >= MAX_FACILITY_LEVEL:
-        msg.append("You're already at the **maximum level**. No further upgrades available.")
-        return await send_chunks(inter, "\n".join(msg), ephemeral=True)
+        msg_lines.append("You're already at the **maximum level**. No further upgrades available.")
+        return await send_chunks(inter, "\n".join(msg_lines), ephemeral=True)
 
     next_level = level + 1
     nxt = FACILITY_LEVELS[next_level]
-    msg += [
+    msg_lines += [
         f"**Next Upgrade → Level {next_level}: {nxt['name']}**",
         f"Cost: {nxt['cost']} cash",
         f"New bonus: +{nxt['bonus']} (daily total = {daily_trainer_points_for(next_level)})",
@@ -1805,7 +975,7 @@ async def upgrade(inter: discord.Interaction):
         "",
         "Type `/upgradeyes` to confirm the upgrade if you can afford it."
     ]
-    await send_chunks(inter, "\n".join(msg), ephemeral=True)
+    await send_chunks(inter, "\n".join(msg_lines), ephemeral=True)
 
 @bot.tree.command(description="Confirm upgrading your training facility (costs cash)")
 async def upgradeyes(inter: discord.Interaction):
@@ -1814,9 +984,7 @@ async def upgradeyes(inter: discord.Interaction):
         return
     level = row["facility_level"]
     if level >= MAX_FACILITY_LEVEL:
-        return await inter.response.send_message(
-            "You're already at the maximum facility level.", ephemeral=True
-        )
+        return await inter.response.send_message("You're already at the maximum facility level.", ephemeral=True)
 
     next_level = level + 1
     cost = FACILITY_LEVELS[next_level]["cost"]
@@ -1826,8 +994,7 @@ async def upgradeyes(inter: discord.Interaction):
             ephemeral=True
         )
 
-    pool = await db_pool()
-    await pool.execute(
+    await (await db_pool()).execute(
         "UPDATE trainers SET cash = cash - $1, facility_level = facility_level + 1 WHERE user_id=$2",
         cost, inter.user.id
     )
@@ -1841,42 +1008,35 @@ async def upgradeyes(inter: discord.Interaction):
 
 @bot.tree.command(description="Add one of your creatures to the Encyclopedia")
 async def enc(inter: discord.Interaction, creature_name: str):
-    # Ensure player exists
     if not await ensure_registered(inter):
         return
 
-    # Find creature by owner/name (case-insensitive)
-    c_row = await (await db_pool()).fetchrow(
-        "SELECT id, name, rarity, descriptors, stats, current_hp FROM creatures "
-        "WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
-    )
-    if not c_row:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
-
-    # Gate: Common/Uncommon cannot be added to the Encyclopedia
-    # unless they have >10 total wins OR have unlocked Glyph 3.
-    rarity_val = str(c_row["rarity"])
+    creature = await ensure_creature(inter, creature_name)
+    if not creature:
+        return
+    # Gate: Only allow Common/Uncommon if >10 wins or Glyph 3 unlocked
+    rarity_val = str(creature["rarity"])
     if rarity_val in ("Common", "Uncommon"):
-        pool = await db_pool()
-        async with pool.acquire() as conn:
+        conn = await (await db_pool()).acquire()
+        try:
             total_wins = await conn.fetchval(
-                "SELECT COALESCE(SUM(wins),0) FROM creature_progress WHERE creature_id=$1",
-                c_row["id"]
+                "SELECT COALESCE(SUM(wins), 0) FROM creature_progress WHERE creature_id=$1",
+                creature["id"]
             )
             glyph3_unlocked = await conn.fetchval(
                 "SELECT glyph_unlocked FROM creature_progress WHERE creature_id=$1 AND tier=3",
-                c_row["id"]
+                creature["id"]
             )
+        finally:
+            await (await db_pool()).release(conn)
         if (total_wins or 0) <= 10 and not bool(glyph3_unlocked):
             return await inter.response.send_message(
-                f"Encyclopedia entry denied for **{c_row['name']}** ({rarity_val}). "
+                f"Encyclopedia entry denied for **{creature['name']}** ({rarity_val}). "
                 "Common/Uncommon creatures must have **>10 total wins** or **Glyph 3 unlocked**.\n"
                 f"Current: Wins **{(total_wins or 0)}**, Glyph 3 {'✅' if glyph3_unlocked else '❌'}.",
                 ephemeral=True
             )
 
-    # Encyclopedia channel
     enc_chan_id = await _get_encyclopedia_channel_id()
     if not enc_chan_id:
         return await inter.response.send_message(
@@ -1888,21 +1048,16 @@ async def enc(inter: discord.Interaction, creature_name: str):
         return await inter.response.send_message("Failed to resolve Encyclopedia channel.", ephemeral=True)
 
     await inter.response.defer(thinking=True, ephemeral=True)
-
-    # Prepare data
-    name = c_row["name"]
-    rarity = c_row["rarity"]
-    traits = c_row["descriptors"] or []
-    stats = json.loads(c_row["stats"])
+    # Prepare data for encyclopedia entry
+    name = creature["name"]
+    rarity = creature["rarity"]
+    traits = creature["descriptors"] or []
+    stats = json.loads(creature["stats"])
     stats_block = _format_stats_block(stats)
-
-    # GPT bio + image
+    # Generate bio and image via OpenAI
     bio, image_url, image_bytes = await _gpt_generate_bio_and_image(name, rarity, traits, stats)
-    # Build embed
-    embed = discord.Embed(
-        title=f"{name} — {rarity}",
-        description=bio
-    )
+    # Build embed for the encyclopedia entry
+    embed = discord.Embed(title=f"{name} — {rarity}", description=bio)
     embed.add_field(name="Traits", value=", ".join(traits) if traits else "None", inline=False)
     embed.add_field(name="Stats", value=stats_block, inline=False)
     if image_url:
@@ -1916,6 +1071,7 @@ async def enc(inter: discord.Interaction, creature_name: str):
         file_to_send = None
 
     try:
+        # Post entry to encyclopedia channel
         if file_to_send:
             msg = await channel.send(embed=embed, file=file_to_send)
         else:
@@ -1928,18 +1084,18 @@ async def enc(inter: discord.Interaction, creature_name: str):
 
 @bot.tree.command(description="Show all commands and what they do")
 async def info(inter: discord.Interaction):
-    # Overview kept brief; the main goal is the dynamic command list.
-    caps_line = "• Passive income: 60 cash/hour | Creature cap: " + str(MAX_CREATURES) + " | Daily cap: " + str(DAILY_BATTLE_CAP) + "/creature/day (Europe/London)."
+    # Brief overview and dynamic command list
+    caps_line = f"• Passive income: 60 cash/hour | Creature cap: {MAX_CREATURES} | Daily cap: {DAILY_BATTLE_CAP}/creature/day (Europe/London)."
     header = (
         "**Game Overview**\n"
         "Collect, train, and battle creatures. Progress through tiers to unlock glyphs.\n"
         + caps_line + "\n"
     )
     try:
-        cmd_text = _build_command_list(bot)
+        command_list_text = _build_command_list(bot)
     except Exception:
-        cmd_text = "Failed to build command list."
-    content = header + "\n" + cmd_text
+        command_list_text = "Failed to build command list."
+    content = header + "\n" + command_list_text
     await send_chunks(inter, content, ephemeral=True)
 
 if __name__ == "__main__":

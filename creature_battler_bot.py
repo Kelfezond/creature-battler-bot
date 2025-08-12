@@ -146,6 +146,10 @@ CREATE TABLE IF NOT EXISTS creature_records (
 
 CREATE INDEX IF NOT EXISTS cr_rank_idx ON creature_records (wins DESC, losses ASC, name ASC);
 
+-- Persisted highest glyph tier (even if creature dies)
+ALTER TABLE creature_records
+  ADD COLUMN IF NOT EXISTS highest_glyph_tier INT NOT NULL DEFAULT 0;
+
 -- Store the message we keep editing for the live leaderboard
 CREATE TABLE IF NOT EXISTS leaderboard_messages (
   channel_id BIGINT PRIMARY KEY,
@@ -1011,12 +1015,7 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
             r.losses,
             r.is_dead,
             COALESCE(t.display_name, r.owner_id::text) AS trainer_name,
-            COALESCE((
-                SELECT MAX(cp.tier)
-                FROM creature_progress cp
-                WHERE cp.creature_id = r.creature_id
-                  AND cp.glyph_unlocked = TRUE
-            ), 0) AS max_glyph_tier
+            COALESCE(r.highest_glyph_tier, 0) AS max_glyph_tier
         FROM creature_records r
         LEFT JOIN trainers t ON t.user_id = r.owner_id
         ORDER BY max_glyph_tier DESC, r.wins DESC, r.losses ASC, r.name ASC
@@ -1064,6 +1063,18 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
         wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
         st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
         if unlocked_now:
+            # Persist lifetime highest glyph tier for leaderboard retention
+            try:
+                await pool.execute(
+                    """
+                    UPDATE creature_records
+                    SET highest_glyph_tier = GREATEST(COALESCE(highest_glyph_tier,0), $3)
+                    WHERE owner_id=$1 AND LOWER(name)=LOWER($2)
+                    """,
+                    st.user_id, st.user_creature['name'], st.tier
+                )
+            except Exception as _e:
+                logger.warning("Failed to bump highest_glyph_tier: %s", _e)
             st.logs.append(
                 f"🏅 **Tier {st.tier} Glyph unlocked!**" +
                 (f" {st.user_creature['name']} may now battle **Tier {st.tier + 1}**." if st.tier < 9 else "")

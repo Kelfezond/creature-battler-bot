@@ -1,3 +1,21 @@
+
+
+async def _max_glyph_for_trainer(user_id: int) -> int:
+    """Return the highest glyph tier unlocked by any of the user's creatures."""
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            """
+            SELECT COALESCE(MAX(cp.tier), 0)
+            FROM creature_progress cp
+            JOIN creatures c ON c.id = cp.creature_id
+            WHERE c.owner_id = $1 AND cp.glyph_unlocked = TRUE
+            """, user_id
+        )
+        try:
+            return int(val or 0)
+        except Exception:
+            return 0
 from __future__ import annotations
 import asyncio, json, logging, math, os, random, time, re
 

@@ -1,4 +1,4 @@
-
+from __future__ import annotations
 
 async def _max_glyph_for_trainer(user_id: int) -> int:
     """Return the highest glyph tier unlocked by any of the user's creatures."""
@@ -16,7 +16,7 @@ async def _max_glyph_for_trainer(user_id: int) -> int:
             return int(val or 0)
         except Exception:
             return 0
-from __future__ import annotations
+
 import asyncio, json, logging, math, os, random, time, re
 
 # Global battle lock
@@ -347,7 +347,6 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
         return False
     return True
 
-
 async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
@@ -396,10 +395,6 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
             logger.error("OpenAI error: %s", e)
     return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
 
-
-
-
-
 # ─── Name-only generator for battles ─────────────────────────
 
 async def generate_creature_name(rarity: str) -> str:
@@ -438,7 +433,6 @@ async def generate_creature_name(rarity: str) -> str:
             logger.error("OpenAI name-only error: %s", e)
     return f"Wild{_random.randint(1000,9999)}"
 
-
 # Robust extractor for Images API responses (dict or SDK object)
 def _extract_image_url(img_resp):
     # Newer SDK returns ImagesResponse with .data -> objects with .url
@@ -455,7 +449,6 @@ def _extract_image_url(img_resp):
         return img_resp["data"][0]["url"]
     except Exception:
         return None
-
 
 def _extract_image_bytes(img_resp):
     # Try SDK object path
@@ -495,7 +488,6 @@ def _safe_dump_response(resp) -> str:
         except Exception:
             return "<unprintable response>"
 
-
 # ─── Async helpers to isolate blocking calls + enforce timeouts ──────────────
 async def _to_thread(fn):
     loop = asyncio.get_running_loop()
@@ -503,7 +495,6 @@ async def _to_thread(fn):
 
 async def _with_timeout(coro, timeout: float = 15.0):
     return await asyncio.wait_for(coro, timeout=timeout)
-
 
 async def _gpt_json_object(prompt: str, *, temperature: float = 1.0, max_output_tokens: int = 512) -> dict | None:
     """
@@ -547,7 +538,6 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
     for chunk in chunks[1:]:
         await inter.followup.send(chunk, ephemeral=ephemeral)
 
-
 # ─── Command listing helper ─────────────────────────────────
 def _build_command_list(bot: commands.Bot) -> str:
     """
@@ -583,7 +573,6 @@ def _build_command_list(bot: commands.Bot) -> str:
             line = line[:177] + "…"
         lines.append(line)
     return "\n".join(lines) or "No commands registered."
-
 
 # ─── Battle cap helper ───────────────────────────────────────
 async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
@@ -757,7 +746,6 @@ async def _resolve_trainer_name_from_db(user_id: int) -> Optional[str]:
         )
     except Exception:
         return None
-
 
 async def _resolve_trainer_name(owner_id: int) -> str:
     """Resolve trainer display name without privileged member intent."""
@@ -1005,7 +993,6 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
         image_bytes = None
     return bio_text, image_url, image_bytes
 
-
 async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
     channel_id = await _get_leaderboard_channel_id()
     if not channel_id:
@@ -1139,7 +1126,6 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
 
     return {"player_won": player_won, "payout": payout, "wins": wins, "unlocked_now": unlocked_now, "gained_stat": gained_stat, "died": died}
 
-
 # ─── Public battle summary helper ───────────────────────────
 def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: str) -> str:
     winner = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
@@ -1164,7 +1150,6 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
 async def setup_hook():
-
 
     pool = await db_pool()
     async with pool.acquire() as conn:
@@ -1195,7 +1180,6 @@ async def setup_hook():
         await update_leaderboard_now(reason="startup")
     else:
         logger.info("No leaderboard channel configured yet. Use /setleaderboardchannel in the desired channel or set LEADERBOARD_CHANNEL_ID.")
-
 
 @bot.event
 async def on_ready():
@@ -1448,7 +1432,6 @@ async def glyphs(inter: discord.Interaction, creature_name: str):
         )
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-
 @bot.tree.command(description="(Admin) Reimburse daily battle usage for a creature by name")
 async def dailylimit(inter: discord.Interaction, creature_name: str, number: int):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -1526,7 +1509,6 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if not await ensure_registered(inter):
         return
 
-
     # Global battle gate: only one battle may run at a time
     global current_battler_id
     if battle_lock.locked() and (current_battler_id is not None) and (current_battler_id != inter.user.id):
@@ -1564,7 +1546,6 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             f"Daily battle cap reached for **{c_row['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
             "Try again after midnight Europe/London.", ephemeral=True
         )
-
 
     await battle_lock.acquire()
     current_battler_id = inter.user.id
@@ -1644,13 +1625,11 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         except Exception:
             pass
 
-
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if row:
         await inter.response.send_message(f"You have {row['cash']} cash.", ephemeral=True)
-
 
 @bot.tree.command(description="(Admin) Add cash to a player by name/mention/id, or 'all'")
 async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
@@ -1687,7 +1666,6 @@ async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
     name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
     await inter.response.send_message(f"Added **{amount}** cash to **{name}**.", ephemeral=True)
 
-
 @bot.tree.command(description="(Admin) Add trainer points to a player by name/mention/id, or 'all'")
 async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str = "me"):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -1722,7 +1700,6 @@ async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str 
     await pool.execute("UPDATE trainers SET trainer_points = trainer_points + $1 WHERE user_id=$2", amount, user_id)
     name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
     await inter.response.send_message(f"Added **{amount}** trainer points to **{name}**.", ephemeral=True)
-
 
 @bot.tree.command(description="Check your trainer points")
 async def trainerpoints(inter: discord.Interaction):
@@ -1843,8 +1820,6 @@ async def upgradeyes(inter: discord.Interaction):
         ephemeral=True
     )
 
-
-
 @bot.tree.command(description="Add one of your creatures to the Encyclopedia")
 async def enc(inter: discord.Interaction, creature_name: str):
     # Ensure player exists
@@ -1931,10 +1906,6 @@ async def enc(inter: discord.Interaction, creature_name: str):
         return await inter.followup.send("Failed to post to the Encyclopedia channel.", ephemeral=True)
 
     await inter.followup.send(f"Added **{name}** to the Encyclopedia: {msg.jump_url}", ephemeral=True)
-
-
-
-
 
 @bot.tree.command(description="Show all commands and what they do")
 async def info(inter: discord.Interaction):

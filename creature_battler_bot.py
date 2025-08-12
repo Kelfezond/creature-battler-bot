@@ -1301,18 +1301,65 @@ async def setencyclopediachannel(inter: discord.Interaction):
 
 @bot.tree.command(description="Register as a trainer")
 async def register(inter: discord.Interaction):
-    pool = await db_pool()
-    if await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", inter.user.id):
-        return await inter.response.send_message("Already registered!", ephemeral=True)
-    await pool.execute(
-        "INSERT INTO trainers(user_id, cash, trainer_points, facility_level, display_name) VALUES($1,$2,$3,$4,$5)",
-        inter.user.id, 20000, 5, 1, (getattr(inter.user, 'global_name', None) or getattr(inter.user, 'display_name', None) or inter.user.name)
-    )
-    await inter.response.send_message(
-        "Profile created! You received 20 000 cash and 5 trainer points.",
-        ephemeral=True
-    )
+    
+pool = await db_pool()
+if await pool.fetchval("SELECT 1 FROM trainers WHERE user_id=$1", inter.user.id):
+    return await inter.response.send_message("Already registered!", ephemeral=True)
 
+await pool.execute(
+    "INSERT INTO trainers(user_id, cash, trainer_points, facility_level, display_name) VALUES($1,$2,$3,$4,$5)",
+    inter.user.id, 20000, 5, 1,
+    (getattr(inter.user, 'global_name', None) or getattr(inter.user, 'display_name', None) or inter.user.name)
+)
+
+# Try to grant the 'Testers' role on registration
+try:
+    guild = inter.guild
+    # Fallback to configured guild if invoked outside a guild context
+    if guild is None and GUILD_ID:
+        try:
+            gid = int(GUILD_ID)
+            guild = (bot.get_guild(gid) or await bot.fetch_guild(gid))
+        except Exception:
+            guild = None
+
+    if guild is not None:
+        # Resolve the role by name (case-insensitive)
+        role = None
+        for r in getattr(guild, "roles", []):
+            if str(r.name).lower() == "testers":
+                role = r
+                break
+
+        if role is not None:
+            # Resolve the member object robustly without requiring privileged member intent
+            member = inter.user if isinstance(inter.user, discord.Member) else None
+            if member is None:
+                try:
+                    member = guild.get_member(inter.user.id) or await guild.fetch_member(inter.user.id)
+                except Exception:
+                    member = None
+
+            if member is not None:
+                try:
+                    await member.add_roles(role, reason="Auto-grant 'Testers' on /register")
+                except discord.Forbidden:
+                    logger.warning("Missing permissions to assign 'Testers' role.")
+                except Exception as e:
+                    logger.warning("Failed to add 'Testers' role: %s", e)
+            else:
+                logger.warning("Could not resolve member %s to add 'Testers' role.", inter.user.id)
+        else:
+            logger.warning("Role 'Testers' not found in guild %s.", getattr(guild, 'id', 'unknown'))
+    else:
+        logger.warning("No guild context available to add 'Testers' role for user %s.", inter.user.id)
+except Exception as e:
+    logger.warning("Unexpected error while assigning 'Testers' role: %s", e)
+
+await inter.response.send_message(
+    "Profile created! You received 20 000 cash and 5 trainer points.",
+    ephemeral=True
+)
 @bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
 async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)

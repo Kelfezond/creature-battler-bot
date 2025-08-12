@@ -1330,7 +1330,7 @@ async def creatures(inter: discord.Interaction):
     if not rows:
         return await inter.response.send_message("You own no creatures.", ephemeral=True)
 
-    # NEW: compute remaining battles for each creature (Europe/London day)
+    # Precompute lookups
     ids = [int(r["id"]) for r in rows]
 
     # Highest glyph per creature (max tier where glyph_unlocked = TRUE)
@@ -1345,23 +1345,40 @@ async def creatures(inter: discord.Interaction):
         ids
     )
     glyph_map = {int(r["creature_id"]): int(r["max_glyph"] or 0) for r in glyph_rows}
+
+    # Battles left per creature for today (Europe/London)
     left_map = await _battles_left_map(ids)
 
-    lines = []
-    for idx, r in enumerate(rows, 1):
+    # Send each creature as its own message, using newline formatting
+    first = True
+    for r in rows:
         st = json.loads(r["stats"])
-        desc = ", ".join(r["descriptors"] or []) or "None"
-        max_hp = st["HP"] * 5
-        left = left_map.get(int(r["id"]), DAILY_BATTLE_CAP)
-        g = glyph_map.get(int(r["id"]), 0)
-        glyph_disp = "-" if not g or g <= 0 else str(g)
-        overall = int(st.get('HP', 0) + st.get('AR', 0) + st.get('PATK', 0) + st.get('SATK', 0) + st.get('SPD', 0))
-        lines.append(
-            f"{idx}. **{r['name']}** ({r['rarity']}) – {desc} | "
-            f"HP:{r['current_hp']}/{max_hp} AR:{st['AR']} PATK:{st['PATK']} "
-            f"SATK:{st['SATK']} SPD:{st['SPD']} | Overall:{overall} | Glyph:{glyph_disp} | Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
+        desc = ", ".join(r["descriptors"] or []) if (r["descriptors"] or []) else "None"
+        max_hp = int(st.get("HP", 0)) * 5
+        left = int(left_map.get(int(r["id"]), DAILY_BATTLE_CAP))
+        g = int(glyph_map.get(int(r["id"]), 0))
+        glyph_disp = "-" if g <= 0 else str(g)
+        overall = int(st.get("HP", 0) + st.get("AR", 0) + st.get("PATK", 0) + st.get("SATK", 0) + st.get("SPD", 0))
+
+        msg = (
+            f"**{r['name']}** ({r['rarity']})
+"
+            f"{desc}
+"
+            f"HP: {r['current_hp']}/{max_hp}
+"
+            f"AR: {st.get('AR', 0)}  PATK: {st.get('PATK', 0)}  SATK: {st.get('SATK', 0)}  SPD: {st.get('SPD', 0)}
+"
+            f"Overall: {overall}  |  Glyph: {glyph_disp}
+"
+            f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**"
         )
-    await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+        if first and not inter.response.is_done():
+            await inter.response.send_message(msg, ephemeral=True)
+            first = False
+        else:
+            await inter.followup.send(msg, ephemeral=True)
 
 @bot.tree.command(description="See your creature's lifetime win/loss record")
 async def record(inter: discord.Interaction, creature_name: str):

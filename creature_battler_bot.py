@@ -1502,7 +1502,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if tier not in TIER_EXTRAS:
         return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
     if inter.user.id in active_battles:
-        return await inter.response.send_message("You already have an active battle – use /continue.", ephemeral=True)
+        return await inter.response.send_message("You already have an active battle in progress.", ephemeral=True)
     if not await ensure_registered(inter):
         return
 
@@ -1591,8 +1591,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
 
         # Drip-feed rounds privately
         st.next_log_idx = len(st.logs)
-        for _ in range(10):
-            if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+        while st.user_current_hp > 0 and st.opp_current_hp > 0:
             simulate_round(st)
             new_logs = st.logs[st.next_log_idx:]
             st.next_log_idx = len(st.logs)
@@ -1617,13 +1616,6 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
                 await send_chunks(inter, "\n".join(pending), ephemeral=True)
                 await asyncio.sleep(0.35)
             await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
-        else:
-            st.logs.append("Use /continue to proceed.")
-            await send_chunks(inter, "\n".join(st.logs[st.next_log_idx:]), ephemeral=True)
-            st.next_log_idx = len(st.logs)
-
-
-
     finally:
         try:
             current_battler_id = None
@@ -1631,49 +1623,6 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
                 battle_lock.release()
         except Exception:
             pass
-
-@bot.tree.command(name="continue", description="Continue your current battle")
-async def continue_battle(inter: discord.Interaction):
-    st = active_battles.get(inter.user.id)
-    if not st:
-        return await inter.response.send_message("No active battle.", ephemeral=True)
-
-    await inter.response.defer(thinking=True)
-    
-    st.next_log_idx = len(st.logs)
-    for _ in range(10):
-        if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
-        simulate_round(st)
-        new_logs = st.logs[st.next_log_idx:]
-        st.next_log_idx = len(st.logs)
-        if new_logs:
-            await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
-            await asyncio.sleep(0.2)
-
-    await (await db_pool()).execute(
-        "UPDATE creatures SET current_hp=$1 WHERE id=$2",
-        max(st.user_current_hp, 0), st.creature_id
-    )
-
-    battle_ended = st.user_current_hp <= 0 or st.opp_current_hp <= 0
-    if battle_ended:
-        winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
-        st.logs.append(f"Winner: {winner}")
-        summary = await finalize_battle(inter, st)
-        active_battles.pop(inter.user.id, None)
-        trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (getattr(inter.user, 'display_name', None) or inter.user.name)
-        pending = st.logs[st.next_log_idx:]
-        st.next_log_idx = len(st.logs)
-        if pending:
-            await send_chunks(inter, "\n".join(pending), ephemeral=True)
-            await asyncio.sleep(0.35)
-        await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
-        return
-
-    st.logs.append("Use /continue to proceed.")
-    new_logs = st.logs[st.next_log_idx:]
-    st.next_log_idx = len(st.logs)
-    await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
 
 
 @bot.tree.command(description="Check your cash")

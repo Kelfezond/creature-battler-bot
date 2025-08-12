@@ -1007,6 +1007,27 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
 
     pool = await db_pool()
     # UPDATED: pull highest obtained glyph tier for each creature via subquery
+    # Refresh lifetime highest glyphs from creature_progress so leaderboard never regresses to '-'
+    try:
+        await pool.execute(
+            """
+            UPDATE creature_records r
+            SET highest_glyph_tier = GREATEST(
+                COALESCE(r.highest_glyph_tier, 0),
+                COALESCE(g.max_tier, 0)
+            )
+            FROM (
+                SELECT cp.creature_id, MAX(cp.tier) AS max_tier
+                FROM creature_progress cp
+                WHERE cp.glyph_unlocked = TRUE
+                GROUP BY cp.creature_id
+            ) g
+            WHERE r.creature_id = g.creature_id
+            """
+        )
+    except Exception as e:
+        logger.warning("Failed to refresh highest_glyph_tier before leaderboard: %s", e)
+
     rows = await pool.fetch(
     """
         SELECT

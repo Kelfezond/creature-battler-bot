@@ -289,7 +289,6 @@ async def distribute_points():
             last_tp_grant = (SELECT d FROM today)
     """)
     logger.info("Distributed daily trainer points (catch-up safe)")
-@tasks.loop(hours=12)
 async def _catch_up_trainer_points_now():
     """Grant any missed daily trainer points since last_tp_grant without double-granting today."""
     await (await db_pool()).execute("""
@@ -303,6 +302,7 @@ async def _catch_up_trainer_points_now():
             last_tp_grant = COALESCE(t.last_tp_grant, (SELECT d FROM today))
     """)
 
+@tasks.loop(hours=12)
 async def regenerate_hp():
     await (await db_pool()).execute("""
         UPDATE creatures

@@ -28,6 +28,8 @@ import asyncpg
 import discord
 from discord.ext import commands, tasks
 from openai import OpenAI
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 # ─── Basic config & logging ──────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -94,6 +96,9 @@ CREATE TABLE IF NOT EXISTS trainers (
   trainer_points BIGINT DEFAULT 0,
   facility_level INT DEFAULT 1
 );
+
+ALTER TABLE trainers
+  ADD COLUMN IF NOT EXISTS last_tp_grant DATE;
 
 CREATE TABLE IF NOT EXISTS creatures (
   id SERIAL PRIMARY KEY,
@@ -271,19 +276,33 @@ async def distribute_cash():
     await (await db_pool()).execute("UPDATE trainers SET cash = cash + 60")
     logger.info("Distributed 60 cash to all trainers")
 
-@tasks.loop(hours=24)
+@tasks.loop(time=dtime(hour=0, tzinfo=ZoneInfo("Europe/London")), reconnect=True)
 async def distribute_points():
-    if distribute_points.current_loop == 0:
-        logger.info("Skipping first daily trainer-point distribution after restart")
-        return
     await (await db_pool()).execute("""
-        UPDATE trainers
-        SET trainer_points = trainer_points
-          + (5 + LEAST(GREATEST(facility_level - 1, 0), 5))
+        WITH today AS (
+          SELECT (now() AT TIME ZONE 'Europe/London')::date AS d
+        )
+        UPDATE trainers t
+        SET trainer_points = t.trainer_points
+          + ((5 + LEAST(GREATEST(t.facility_level - 1, 0), 5))
+             * GREATEST(1, (SELECT d FROM today) - COALESCE(t.last_tp_grant, (SELECT d FROM today) - 1))),
+            last_tp_grant = (SELECT d FROM today)
     """)
-    logger.info("Distributed daily trainer points with facility bonuses")
-
+    logger.info("Distributed daily trainer points (catch-up safe)")
 @tasks.loop(hours=12)
+async def _catch_up_trainer_points_now():
+    """Grant any missed daily trainer points since last_tp_grant without double-granting today."""
+    await (await db_pool()).execute("""
+        WITH today AS (
+          SELECT (now() AT TIME ZONE 'Europe/London')::date AS d
+        )
+        UPDATE trainers t
+        SET trainer_points = t.trainer_points
+          + ((5 + LEAST(GREATEST(t.facility_level - 1, 0), 5))
+             * GREATEST(0, (SELECT d FROM today) - COALESCE(t.last_tp_grant, (SELECT d FROM today)))),
+            last_tp_grant = COALESCE(t.last_tp_grant, (SELECT d FROM today))
+    """)
+
 async def regenerate_hp():
     await (await db_pool()).execute("""
         UPDATE creatures
@@ -1186,6 +1205,12 @@ async def setup_hook():
     pool = await db_pool()
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
+
+# Catch up missed daily trainer points immediately on startup
+try:
+    await _catch_up_trainer_points_now()
+except Exception as e:
+    logger.warning("Trainer-point catch-up failed on startup: %s", e)
 
     await _backfill_creature_records()
 

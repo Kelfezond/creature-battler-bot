@@ -1206,11 +1206,11 @@ async def setup_hook():
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
 
-# Catch up missed daily trainer points immediately on startup
-try:
-    await _catch_up_trainer_points_now()
-except Exception as e:
-    logger.warning("Trainer-point catch-up failed on startup: %s", e)
+    # Catch up missed daily trainer points immediately on startup
+    try:
+        await _catch_up_trainer_points_now()
+    except Exception as e:
+        logger.warning("Trainer-point catch-up failed on startup: %s", e)
 
     await _backfill_creature_records()
 

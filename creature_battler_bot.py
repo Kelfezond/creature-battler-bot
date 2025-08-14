@@ -1512,6 +1512,7 @@ async def spawn(inter: discord.Interaction):
     embed.set_footer(text="Legendary spawn chance: 0.5%")
     await inter.followup.send(embed=embed)
     asyncio.create_task(update_leaderboard_now(reason="spawn"))
+@bot.tree.command(description="List your creatures")
 async def creatures(inter: discord.Interaction):
     if not await ensure_registered(inter):
         return

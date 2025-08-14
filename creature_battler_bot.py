@@ -1631,6 +1631,56 @@ async def sell(inter: discord.Interaction, creature_name: str):
     )
     asyncio.create_task(update_leaderboard_now(reason="sell"))
 
+@bot.tree.command(description="Rename one of your creatures")
+async def rename(inter: discord.Interaction, creature_name: str, new_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    new_name = new_name.strip().title()
+    if not new_name:
+        return await inter.response.send_message("New name cannot be empty.", ephemeral=True)
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        c_row = await conn.fetchrow(
+            "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            inter.user.id, creature_name,
+        )
+        if not c_row:
+            return await inter.response.send_message("Creature not found.", ephemeral=True)
+        st = active_battles.get(inter.user.id)
+        if st and st.creature_id == c_row["id"]:
+            return await inter.response.send_message(
+                f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before renaming.",
+                ephemeral=True,
+            )
+        exists = await conn.fetchrow(
+            "SELECT 1 FROM creatures WHERE owner_id=$1 AND LOWER(name)=LOWER($2)",
+            inter.user.id, new_name,
+        )
+        if exists:
+            return await inter.response.send_message(
+                "You already have a creature with that name.", ephemeral=True
+            )
+        rec_exist = await conn.fetchrow(
+            "SELECT creature_id FROM creature_records WHERE owner_id=$1 AND LOWER(name)=LOWER($2)",
+            inter.user.id, new_name,
+        )
+        if rec_exist and int(rec_exist["creature_id"] or 0) != c_row["id"]:
+            return await inter.response.send_message(
+                "You already have a record with that name; choose another.", ephemeral=True
+            )
+        async with conn.transaction():
+            await conn.execute("UPDATE creatures SET name=$1 WHERE id=$2", new_name, c_row["id"])
+            await conn.execute(
+                "UPDATE creature_records SET name=$1 WHERE owner_id=$2 AND creature_id=$3",
+                new_name, inter.user.id, c_row["id"],
+            )
+    await _ensure_record(inter.user.id, c_row["id"], new_name)
+    await inter.response.send_message(
+        f"Renamed **{c_row['name']}** to **{new_name}**.", ephemeral=True
+    )
+    asyncio.create_task(update_leaderboard_now(reason="rename"))
+
 @bot.tree.command(description="Show glyphs and tier progress for a creature")
 async def glyphs(inter: discord.Interaction, creature_name: str):
     if not await ensure_registered(inter):

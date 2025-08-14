@@ -313,6 +313,11 @@ class BattleState:
     opp_current_hp: int
     opp_max_hp: int
     logs: List[str]
+    is_pvp: bool = False
+    opp_user_id: Optional[int] = None
+    opp_creature_id: Optional[int] = None
+    wager: int = 0
+    opp_trainer_name: Optional[str] = None
     next_log_idx: int = 0
     rounds: int = 0
 
@@ -1140,13 +1145,33 @@ async def update_leaderboard_periodic():
 # ─── Battle finalize (records + leaderboard) ─────────────────
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
     player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
+    pool = await db_pool()
+
+    if st.is_pvp:
+        await _ensure_record(st.user_id, st.creature_id, st.user_creature["name"])
+        await _ensure_record(st.opp_user_id, st.opp_creature_id, st.opp_creature["name"])
+        await _record_result(st.user_id, st.user_creature["name"], player_won)
+        await _record_result(st.opp_user_id, st.opp_creature["name"], not player_won)
+
+        if player_won:
+            await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", st.wager, st.user_id)
+            await pool.execute("UPDATE trainers SET cash = cash - $1 WHERE user_id=$2", st.wager, st.opp_user_id)
+        else:
+            await pool.execute("UPDATE trainers SET cash = cash - $1 WHERE user_id=$2", st.wager, st.user_id)
+            await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", st.wager, st.opp_user_id)
+
+        st.logs.append(
+            f"You {'won' if player_won else 'lost'} the PvP battle: {'+' if player_won else '-'}{st.wager} cash."
+        )
+        asyncio.create_task(update_leaderboard_now(reason="battle_finalize"))
+        return {"player_won": player_won, "payout": st.wager if player_won else -st.wager}
+
     wins = None
     unlocked_now = False
     gained_stat = None
     died = False
     win_cash, loss_cash = TIER_PAYOUTS[st.tier]
     payout = win_cash if player_won else loss_cash
-    pool = await db_pool()
 
     await _ensure_record(st.user_id, st.creature_id, st.user_creature["name"])
     await _record_result(st.user_id, st.user_creature["name"], player_won)
@@ -1158,7 +1183,6 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
         wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
         st.logs.append(f"Progress: Tier {st.tier} wins = {wins}/5.")
         if unlocked_now:
-            # Persist lifetime highest glyph tier for leaderboard retention
             try:
                 await pool.execute(
                     """
@@ -1175,34 +1199,21 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
                 (f" {st.user_creature['name']} may now battle **Tier {st.tier + 1}**." if st.tier < 9 else "")
             )
 
-        # ── NEW: Victory stat gain (+1 random stat) ─────────────────────────────
-        # Only on win, and only for the surviving creature (wins never roll death here).
         try:
-            # Choose a stat and apply +1 in memory first
             gained_stat = random.choice(PRIMARY_STATS)
-            new_stats = dict(st.user_creature["stats"])  # shallow copy
+            new_stats = dict(st.user_creature["stats"])
             new_stats[gained_stat] = int(new_stats.get(gained_stat, 0)) + 1
-
-            # Compute new HP values if HP increased
             new_max_hp = int(new_stats["HP"]) * 5
-            # st.user_current_hp at this point is the final HP after battle rounds
             new_cur_hp = st.user_current_hp
             if gained_stat == "HP":
-                # On HP gain, increase current HP by +5 but cap at new max
                 new_cur_hp = min(st.user_current_hp + 5, new_max_hp)
-
-            # Persist to DB
             await pool.execute(
                 "UPDATE creatures SET stats=$1, current_hp=$2 WHERE id=$3",
                 json.dumps(new_stats), new_cur_hp, st.creature_id
             )
-
-            # Update in-memory snapshot so future logs/logic reflect the change
             st.user_creature["stats"] = new_stats
             st.user_max_hp = new_max_hp
             st.user_current_hp = new_cur_hp
-
-            # Friendly log message
             if gained_stat == "HP":
                 st.logs.append(
                     f"✨ **{st.user_creature['name']}** gained **+1 HP** from the victory "
@@ -1210,14 +1221,12 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
                 )
             else:
                 st.logs.append(
-                    f"✨ **{st.user_creature['name']}** gained **+1 {gained_stat}** from the victory!"
+                    f"✨ **{st.user_creature['name']}** gained **+1 {gained_stat}** from the victory."
                 )
-                gained_stat = gained_stat
         except Exception as e:
             logger.error("Failed to apply victory stat gain: %s", e)
-        # ── End NEW ─────────────────────────────────────────────────────────────
 
-    if not player_won:
+    else:
         death_roll = random.random()
         pct = int(death_roll * 100)
         if death_roll < 0.5:
@@ -1234,24 +1243,34 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
 
 # ─── Public battle summary helper ───────────────────────────
 def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: str) -> str:
-    winner = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
-    loser = st.opp_creature["name"] if summary.get("player_won") else st.user_creature["name"]
-    lines = [
-        f"**Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs **{st.opp_creature['name']}** (Tier {st.tier})",
-        f"🏅 Winner: **{winner}**",
-        f"💰 Payout: **+{summary.get('payout', 0)}** cash to {trainer_name}",
-    ]
-    wins = summary.get("wins")
-    if wins is not None:
-        lines.append(f"📈 Progress: Tier {st.tier} wins = {wins}/5")
-    if summary.get("unlocked_now"):
-        lines.append(f"🔓 **Tier {st.tier+1} unlocked!**")
-    gained = summary.get("gained_stat")
-    if gained:
-        lines.append(f"✨ Victory bonus: **+1 {gained}** to {st.user_creature['name']}")
-    if summary.get("died"):
-        lines.append(f"💀 {st.user_creature['name']} died and was removed from your stable (kept on leaderboard).")
-    return "\n".join(lines)
+    if st.is_pvp:
+        opp_name = st.opp_trainer_name or "Opponent"
+        winner_trainer = trainer_name if summary.get("player_won") else opp_name
+        winner_cre = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
+        lines = [
+            f"**PvP Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs {opp_name}'s **{st.opp_creature['name']}**",
+            f"🏅 Winner: {winner_trainer}'s **{winner_cre}**",
+            f"💰 {winner_trainer} wins {abs(summary.get('payout',0))} cash!",
+        ]
+        return "\n".join(lines)
+    else:
+        winner = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
+        lines = [
+            f"**Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs **{st.opp_creature['name']}** (Tier {st.tier})",
+            f"🏅 Winner: **{winner}**",
+            f"💰 Payout: **+{summary.get('payout', 0)}** cash to {trainer_name}",
+        ]
+        wins = summary.get("wins")
+        if wins is not None:
+            lines.append(f"📈 Progress: Tier {st.tier} wins = {wins}/5")
+        if summary.get("unlocked_now"):
+            lines.append(f"🔓 **Tier {st.tier+1} unlocked!**")
+        gained = summary.get("gained_stat")
+        if gained:
+            lines.append(f"✨ Victory bonus: **+1 {gained}** to {st.user_creature['name']}")
+        if summary.get("died"):
+            lines.append(f"💀 {st.user_creature['name']} died and was removed from your stable (kept on leaderboard).")
+        return "\n".join(lines)
 
 
 async def _backfill_personalities():
@@ -1906,6 +1925,141 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
                 battle_lock.release()
         except Exception:
             pass
+
+@bot.tree.command(description="Challenge another trainer to a PvP battle")
+async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.User, wager: int):
+    if opponent.id == inter.user.id:
+        return await inter.response.send_message("You cannot challenge yourself.", ephemeral=True)
+    if wager <= 0:
+        return await inter.response.send_message("Wager must be positive.", ephemeral=True)
+    if inter.user.id in active_battles or opponent.id in active_battles:
+        return await inter.response.send_message("One of the participants is already in a battle.", ephemeral=True)
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    opp_tr = await pool.fetchrow("SELECT cash FROM trainers WHERE user_id=$1", opponent.id)
+    if not opp_tr:
+        return await inter.response.send_message("Opponent is not registered.", ephemeral=True)
+    if row["cash"] < wager:
+        return await inter.response.send_message("You don't have enough cash for this wager.", ephemeral=True)
+    if opp_tr["cash"] < wager:
+        return await inter.response.send_message(
+            f"Opponent only has {opp_tr['cash']} cash; reduce the wager below that.", ephemeral=True
+        )
+    c_row = await pool.fetchrow(
+        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id, creature_name
+    )
+    if not c_row:
+        return await inter.response.send_message("Creature not found.", ephemeral=True)
+    stats = json.loads(c_row["stats"])
+    max_hp = stats["HP"] * 5
+    if c_row["current_hp"] <= 0:
+        return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
+    opp_cre = await pool.fetchrow(
+        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND current_hp>0 ORDER BY id LIMIT 1",
+        opponent.id
+    )
+    if not opp_cre:
+        return await inter.response.send_message("Opponent has no available creature.", ephemeral=True)
+    opp_stats = json.loads(opp_cre["stats"])
+    opp_max_hp = opp_stats["HP"] * 5
+    opp_name = await _resolve_trainer_name_from_db(opponent.id) or (
+        getattr(opponent, 'display_name', None) or opponent.name
+    )
+
+    class PvPChallengeView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+
+        @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+        async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if interaction.user.id != opponent.id:
+                return await interaction.response.send_message("This challenge isn't for you.", ephemeral=True)
+            if inter.user.id in active_battles or opponent.id in active_battles:
+                return await interaction.response.send_message("One of the participants is already in a battle.", ephemeral=True)
+            global current_battler_id
+            if battle_lock.locked() and (current_battler_id not in (inter.user.id, opponent.id)):
+                return await interaction.response.send_message(
+                    "⚔ A battle is already in progress. Please try again later.", ephemeral=True
+                )
+            await battle_lock.acquire()
+            current_battler_id = inter.user.id
+            try:
+                await interaction.response.defer(thinking=True)
+                st = BattleState(
+                    inter.user.id, c_row["id"], 0,
+                    {"name": c_row["name"], "stats": stats}, c_row["current_hp"], max_hp,
+                    {"name": opp_cre["name"], "stats": opp_stats}, opp_cre["current_hp"], opp_max_hp,
+                    logs=[], is_pvp=True, opp_user_id=opponent.id, opp_creature_id=opp_cre["id"], wager=wager, opp_trainer_name=opp_name
+                )
+                active_battles[inter.user.id] = st
+                active_battles[opponent.id] = st
+                st.logs += [
+                    f"PvP battle start! Wager {wager} cash.",
+                    f"{st.user_creature['name']} vs {st.opp_creature['name']}",
+                    "",
+                    "Challenger:",
+                    stat_block(st.user_creature['name'], st.user_current_hp, st.user_max_hp, st.user_creature['stats']),
+                    "Opponent:",
+                    stat_block(st.opp_creature['name'], st.opp_current_hp, st.opp_max_hp, st.opp_creature['stats']),
+                ]
+                st.next_log_idx = len(st.logs)
+                await interaction.followup.send(
+                    f"**PvP Battle Start** — {st.user_creature['name']} vs {st.opp_creature['name']} (Wager {wager})",
+                    ephemeral=False
+                )
+                while st.user_current_hp > 0 and st.opp_current_hp > 0:
+                    simulate_round(st)
+                    new_logs = st.logs[st.next_log_idx:]
+                    st.next_log_idx = len(st.logs)
+                    if new_logs:
+                        await send_chunks(interaction, "\n".join(new_logs), ephemeral=False)
+                        await asyncio.sleep(0.2)
+                await pool.execute(
+                    "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+                    max(st.user_current_hp, 0), st.creature_id
+                )
+                await pool.execute(
+                    "UPDATE creatures SET current_hp=$1 WHERE id=$2",
+                    max(st.opp_current_hp, 0), st.opp_creature_id
+                )
+                winner = st.user_creature["name"] if st.opp_current_hp <= 0 else st.opp_creature["name"]
+                st.logs.append(f"Winner: {winner}")
+                summary = await finalize_battle(interaction, st)
+                active_battles.pop(inter.user.id, None)
+                active_battles.pop(opponent.id, None)
+                trainer_name = await _resolve_trainer_name_from_db(inter.user.id) or (
+                    getattr(inter.user, 'display_name', None) or inter.user.name
+                )
+                pending = st.logs[st.next_log_idx:]
+                st.next_log_idx = len(st.logs)
+                if pending:
+                    await send_chunks(interaction, "\n".join(pending), ephemeral=False)
+                    await asyncio.sleep(0.35)
+                await interaction.followup.send(
+                    format_public_battle_summary(st, summary, trainer_name), ephemeral=False
+                )
+            finally:
+                try:
+                    current_battler_id = None
+                    if battle_lock.locked():
+                        battle_lock.release()
+                except Exception:
+                    pass
+
+        @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+        async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if interaction.user.id != opponent.id:
+                return await interaction.response.send_message("This challenge isn't for you.", ephemeral=True)
+            await interaction.response.send_message("Challenge declined.", ephemeral=True)
+
+    view = PvPChallengeView()
+    await inter.response.send_message(
+        f"{opponent.mention}, {inter.user.mention} challenges you to a PvP battle wagering {wager} cash!",
+        view=view
+    )
 
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):

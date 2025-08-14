@@ -1163,8 +1163,62 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
         st.logs.append(
             f"You {'won' if player_won else 'lost'} the PvP battle: {'+' if player_won else '-'}{st.wager} cash."
         )
+
+        gained_stat = None
+        try:
+            winner_cre = st.user_creature if player_won else st.opp_creature
+            winner_id = st.creature_id if player_won else st.opp_creature_id
+            winner_cur_hp = st.user_current_hp if player_won else st.opp_current_hp
+            gained_stat = random.choice(PRIMARY_STATS)
+            new_stats = dict(winner_cre["stats"])
+            new_stats[gained_stat] = int(new_stats.get(gained_stat, 0)) + 1
+            new_max_hp = int(new_stats["HP"]) * 5
+            new_cur_hp = winner_cur_hp
+            if gained_stat == "HP":
+                new_cur_hp = min(winner_cur_hp + 5, new_max_hp)
+            await pool.execute(
+                "UPDATE creatures SET stats=$1, current_hp=$2 WHERE id=$3",
+                json.dumps(new_stats), new_cur_hp, winner_id,
+            )
+            winner_cre["stats"] = new_stats
+            if player_won:
+                st.user_max_hp = new_max_hp
+                st.user_current_hp = new_cur_hp
+            else:
+                st.opp_max_hp = new_max_hp
+                st.opp_current_hp = new_cur_hp
+            if gained_stat == "HP":
+                st.logs.append(
+                    f"✨ **{winner_cre['name']}** gained **+1 HP** from the victory (Max HP is now {new_max_hp}, current {new_cur_hp}/{new_max_hp})."
+                )
+            else:
+                st.logs.append(
+                    f"✨ **{winner_cre['name']}** gained **+1 {gained_stat}** from the victory."
+                )
+        except Exception as e:
+            logger.error("Failed to apply PvP victory stat gain: %s", e)
+
+        loser_cre = st.opp_creature if player_won else st.user_creature
+        loser_id = st.opp_creature_id if player_won else st.creature_id
+        loser_user = st.opp_user_id if player_won else st.user_id
+        death_roll = random.random()
+        pct = int(death_roll * 100)
+        loser_died = False
+        if death_roll < 0.5:
+            loser_died = True
+            await _record_death(loser_user, loser_cre["name"])
+            await pool.execute("DELETE FROM creatures WHERE id=$1", loser_id)
+            st.logs.append(f"💀 Death roll {pct} (<50): **{loser_cre['name']}** died (kept on leaderboard).")
+        else:
+            st.logs.append(f"🛡️ Death roll {pct} (≥50): **{loser_cre['name']}** survived the defeat.")
+
         asyncio.create_task(update_leaderboard_now(reason="battle_finalize"))
-        return {"player_won": player_won, "payout": st.wager if player_won else -st.wager}
+        return {
+            "player_won": player_won,
+            "payout": st.wager if player_won else -st.wager,
+            "gained_stat": gained_stat,
+            "loser_died": loser_died,
+        }
 
     wins = None
     unlocked_now = False
@@ -1247,11 +1301,17 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
         opp_name = st.opp_trainer_name or "Opponent"
         winner_trainer = trainer_name if summary.get("player_won") else opp_name
         winner_cre = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
+        loser_cre = st.opp_creature["name"] if summary.get("player_won") else st.user_creature["name"]
         lines = [
             f"**PvP Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs {opp_name}'s **{st.opp_creature['name']}**",
             f"🏅 Winner: {winner_trainer}'s **{winner_cre}**",
             f"💰 {winner_trainer} wins {abs(summary.get('payout',0))} cash!",
         ]
+        gained = summary.get("gained_stat")
+        if gained:
+            lines.append(f"✨ {winner_cre} gained +1 {gained}.")
+        if summary.get("loser_died"):
+            lines.append(f"💀 {loser_cre} died from the defeat.")
         return "\n".join(lines)
     else:
         winner = st.user_creature["name"] if summary.get("player_won") else st.opp_creature["name"]
@@ -1957,12 +2017,38 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
     max_hp = stats["HP"] * 5
     if c_row["current_hp"] <= 0:
         return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
-    opp_cre = await pool.fetchrow(
-        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND current_hp>0 ORDER BY id LIMIT 1",
+    opp_creatures = await pool.fetch(
+        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND current_hp>0",
         opponent.id
     )
-    if not opp_cre:
+    if not opp_creatures:
         return await inter.response.send_message("Opponent has no available creature.", ephemeral=True)
+
+    options = [discord.SelectOption(label=r["name"], value=str(r["id"])) for r in opp_creatures]
+
+    class OpponentSelectView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.selected = None
+
+        @discord.ui.select(placeholder="Select opponent's creature", options=options)
+        async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+            if interaction.user.id != inter.user.id:
+                return await interaction.response.send_message("This menu isn't for you.", ephemeral=True)
+            self.selected = next(r for r in opp_creatures if str(r["id"]) == select.values[0])
+            await interaction.response.send_message(
+                f"Challenged {opponent.mention}'s {self.selected['name']}!", ephemeral=True
+            )
+            self.stop()
+
+    select_view = OpponentSelectView()
+    await inter.response.send_message(
+        "Choose an opponent creature to challenge:", view=select_view, ephemeral=True
+    )
+    await select_view.wait()
+    if not select_view.selected:
+        return
+    opp_cre = select_view.selected
     opp_stats = json.loads(opp_cre["stats"])
     opp_max_hp = opp_stats["HP"] * 5
     opp_name = await _resolve_trainer_name_from_db(opponent.id) or (
@@ -2056,8 +2142,8 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
             await interaction.response.send_message("Challenge declined.", ephemeral=True)
 
     view = PvPChallengeView()
-    await inter.response.send_message(
-        f"{opponent.mention}, {inter.user.mention} challenges you to a PvP battle wagering {wager} cash!",
+    await inter.followup.send(
+        f"{opponent.mention}, {inter.user.mention} challenges you to a PvP battle wagering {wager} cash with your {opp_cre['name']}!",
         view=view
     )
 

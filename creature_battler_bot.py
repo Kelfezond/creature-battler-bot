@@ -113,6 +113,9 @@ CREATE TABLE IF NOT EXISTS creatures (
 ALTER TABLE creatures
   ADD COLUMN IF NOT EXISTS current_hp BIGINT;
 
+
+ALTER TABLE creatures
+  ADD COLUMN IF NOT EXISTS personality JSONB;
 ALTER TABLE trainers
   ADD COLUMN IF NOT EXISTS facility_level INT DEFAULT 1;
 
@@ -229,6 +232,58 @@ TIER_EXTRAS = {
     8: (220, 260), 9: (260, 300)
 }
 PRIMARY_STATS = ["HP", "AR", "PATK", "SATK", "SPD"]
+# ─── Personalities (stat-focused training bonus) ─────────────
+# Each personality boosts training for its listed stat(s) by 2× output (same TP cost).
+# We store: {"name": str, "stats": [..]}. Selection uses the given weights (sum ~100%).
+PERSONALITY_TYPES = [
+    # Singles (7.58% each)
+    {"name": "Goliath", "stats": ["HP"], "weight": 7.58},
+    {"name": "Stoic", "stats": ["AR"], "weight": 7.58},
+    {"name": "Aggressive", "stats": ["PATK"], "weight": 7.58},
+    {"name": "Pensive", "stats": ["SATK"], "weight": 7.58},
+    {"name": "Hyperactive", "stats": ["SPD"], "weight": 7.58},
+
+    # Duos (3.79% each)
+    {"name": "Immovable Goliath", "stats": ["HP","AR"], "weight": 3.79},
+    {"name": "Titan Mauler", "stats": ["HP","PATK"], "weight": 3.79},
+    {"name": "Contemplative Colossus", "stats": ["HP","SATK"], "weight": 3.79},
+    {"name": "Charging Colossus", "stats": ["HP","SPD"], "weight": 3.79},
+    {"name": "Stoic Bruiser", "stats": ["AR","PATK"], "weight": 3.79},
+    {"name": "Stoic Sage", "stats": ["AR","SATK"], "weight": 3.79},
+    {"name": "Disciplined Sprinter", "stats": ["AR","SPD"], "weight": 3.79},
+    {"name": "Calculating Predator", "stats": ["PATK","SATK"], "weight": 3.79},
+    {"name": "Hot-headed Charger", "stats": ["PATK","SPD"], "weight": 3.79},
+    {"name": "Quick-Witted Livewire", "stats": ["SATK","SPD"], "weight": 3.79},
+
+    # Trios (1.90% each)
+    {"name": "Iron Colossus", "stats": ["HP","AR","PATK"], "weight": 1.90},
+    {"name": "Sage Bastion", "stats": ["HP","AR","SATK"], "weight": 1.90},
+    {"name": "Restless Sentinel", "stats": ["HP","AR","SPD"], "weight": 1.90},
+    {"name": "War Architect", "stats": ["HP","PATK","SATK"], "weight": 1.90},
+    {"name": "Stampeding Titan", "stats": ["HP","PATK","SPD"], "weight": 1.90},
+    {"name": "Swift Savant", "stats": ["HP","SATK","SPD"], "weight": 1.90},
+    {"name": "Stoic War-Planner", "stats": ["AR","PATK","SATK"], "weight": 1.90},
+    {"name": "Regimented Charger", "stats": ["AR","PATK","SPD"], "weight": 1.90},
+    {"name": "Composed Whirlwind", "stats": ["AR","SATK","SPD"], "weight": 1.90},
+    {"name": "Lightning Daredevil", "stats": ["PATK","SATK","SPD"], "weight": 1.90},
+
+    # Quads (0.95% each) — note 'AR' not 'AP'
+    {"name": "Ascetic Overachiever", "stats": ["AR","PATK","SATK","SPD"], "weight": 0.95},
+    {"name": "Freewheeling Titan", "stats": ["HP","PATK","SATK","SPD"], "weight": 0.95},
+    {"name": "Gentle Mastermind", "stats": ["HP","AR","SATK","SPD"], "weight": 0.95},
+    {"name": "Pure Bruiser", "stats": ["HP","AR","PATK","SPD"], "weight": 0.95},
+    {"name": "Deliberate Dominator", "stats": ["HP","AR","PATK","SATK"], "weight": 0.95},
+
+    # Prodigy (0.45%)
+    {"name": "Prodigy", "stats": ["HP","AR","PATK","SATK","SPD"], "weight": 0.45},
+]
+
+def choose_personality() -> dict:
+    weights = [p.get("weight", 1.0) for p in PERSONALITY_TYPES]
+    choice = random.choices(PERSONALITY_TYPES, weights=weights, k=1)[0]
+    # store only needed fields
+    return {"name": choice["name"], "stats": list(choice["stats"])}
+    
 
 ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
 ACTION_WEIGHTS = [38, 22, 22, 18]
@@ -1198,6 +1253,26 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
         lines.append(f"💀 {st.user_creature['name']} died and was removed from your stable (kept on leaderboard).")
     return "\n".join(lines)
 
+
+async def _backfill_personalities():
+    """
+    Assign a random personality to any existing creature lacking one.
+    Uses the same odds as spawn.
+    """
+    pool = await db_pool()
+    rows = await pool.fetch("SELECT id FROM creatures WHERE personality IS NULL")
+    if not rows:
+        logger.info("No personality backfill needed.")
+        return
+    for r in rows:
+        pid = int(r["id"])
+        p = choose_personality()
+        try:
+            await pool.execute("UPDATE creatures SET personality=$1 WHERE id=$2", json.dumps(p), pid)
+        except Exception as e:
+            logger.warning("Failed to assign personality to creature %s: %s", pid, e)
+    logger.info("Backfilled personalities for %d creatures.", len(rows))
+
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
 async def setup_hook():
@@ -1213,6 +1288,12 @@ async def setup_hook():
         logger.warning("Trainer-point catch-up failed on startup: %s", e)
 
     await _backfill_creature_records()
+
+    # Backfill personalities for existing creatures
+    try:
+        await _backfill_personalities()
+    except Exception as e:
+        logger.warning("Personality backfill failed on startup: %s", e)
 
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
@@ -1407,12 +1488,14 @@ async def spawn(inter: discord.Interaction):
     stats = allocate_stats(rarity)
     max_hp = stats["HP"] * 5
 
+    personality = choose_personality()
+
     rec = await (await db_pool()).fetchrow(
-        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp)"
-        "VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
-        inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp
+        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp,personality)"
+        " VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+        inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp, json.dumps(personality)
     )
-    await _ensure_record(inter.user.id, rec["id"], meta["name"])
+    await _ensure_record(inter.user.id, rec["id"], meta["name"]) 
 
     embed = discord.Embed(
         title=f"{meta['name']} ({rarity})",
@@ -1420,17 +1503,21 @@ async def spawn(inter: discord.Interaction):
     )
     for s, v in stats.items():
         embed.add_field(name=s, value=str(v*5 if s == "HP" else v))
+    try:
+        _p = personality
+        pstats = '+'.join(_p.get('stats', []))
+        embed.add_field(name="Personality", value=f"{_p.get('name','?')} ({pstats})")
+    except Exception:
+        pass
     embed.set_footer(text="Legendary spawn chance: 0.5%")
     await inter.followup.send(embed=embed)
     asyncio.create_task(update_leaderboard_now(reason="spawn"))
-
-@bot.tree.command(description="List your creatures")
 async def creatures(inter: discord.Interaction):
     if not await ensure_registered(inter):
         return
     await inter.response.defer(ephemeral=True)
     rows = await (await db_pool()).fetch(
-        "SELECT id,name,rarity,descriptors,stats,current_hp FROM creatures "
+        "SELECT id,name,rarity,descriptors,stats,current_hp,personality FROM creatures "
         "WHERE owner_id=$1 ORDER BY id", inter.user.id
     )
     if not rows:
@@ -1456,6 +1543,7 @@ async def creatures(inter: discord.Interaction):
     for r in rows:
         st = json.loads(r["stats"])
         desc = ", ".join(r["descriptors"] or []) if (r["descriptors"] or []) else "None"
+        personality = r.get("personality") or {}
         max_hp = int(st.get("HP", 0)) * 5
         left = int(left_map.get(int(r["id"]), DAILY_BATTLE_CAP))
         g = int(glyph_map.get(int(r["id"]), 0))
@@ -1468,6 +1556,7 @@ async def creatures(inter: discord.Interaction):
             f"HP: {r['current_hp']}/{max_hp}",
             f"AR: {st.get('AR', 0)}  PATK: {st.get('PATK', 0)}  SATK: {st.get('SATK', 0)}  SPD: {st.get('SPD', 0)}",
             f"Overall: {overall}  |  Glyph: {glyph_disp}",
+            f"Personality: { (personality.get('name') + ' (' + ','.join(personality.get('stats', [])) + ')') if personality else '-' }",
             f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**",
         ]
         msg = "\n".join(lines)
@@ -1854,18 +1943,22 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         return await inter.response.send_message("Not enough trainer points.", ephemeral=True)
 
     c = await (await db_pool()).fetchrow(
-        "SELECT id,stats,current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        "SELECT id,stats,current_hp,personality FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
         inter.user.id, creature_name
     )
     if not c:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
     stats = json.loads(c["stats"])
-    stats[stat] += increase
+    personality = c.get("personality") or {}
+    pstats = set(personality.get("stats", []))
+    mult = 2 if stat in pstats else 1
+    effective = increase * mult
+    stats[stat] += effective
     new_max_hp = stats["HP"] * 5
     new_cur_hp = c["current_hp"]
     if stat == "HP":
-        new_cur_hp += increase * 5
+        new_cur_hp += effective * 5
         new_cur_hp = min(new_cur_hp, new_max_hp)
 
     await (await db_pool()).execute(
@@ -1876,9 +1969,9 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id=$2",
         increase, inter.user.id
     )
-    display_inc = increase * 5 if stat == "HP" else increase
+    display_inc = effective * 5 if stat == "HP" else effective
     await inter.response.send_message(
-        f"{c['id']} – {creature_name.title()} trained: +{display_inc} {stat}.",
+        f"{c['id']} – {creature_name.title()} trained: +{display_inc} {stat}{' (x2 personality bonus)' if mult == 2 else ''}.",
         ephemeral=True
     )
 

@@ -1273,6 +1273,24 @@ async def _backfill_personalities():
             logger.warning("Failed to assign personality to creature %s: %s", pid, e)
     logger.info("Backfilled personalities for %d creatures.", len(rows))
 
+
+# ─── Personality helpers ─────────────────────────────────────
+def _parse_personality(raw):
+    """
+    Accepts a DB value that may be a dict, JSON string, or None.
+    Returns a dict with keys: name (str), stats (list[str]) — or {}.
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    # Some drivers return JSON/JSONB columns as text
+    try:
+        obj = json.loads(raw) if isinstance(raw, str) else {}
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
 # ─── Bot events ──────────────────────────────────────────────
 @bot.event
 async def setup_hook():
@@ -1544,7 +1562,7 @@ async def creatures(inter: discord.Interaction):
     for r in rows:
         st = json.loads(r["stats"])
         desc = ", ".join(r["descriptors"] or []) if (r["descriptors"] or []) else "None"
-        personality = r.get("personality") or {}
+        personality = _parse_personality(r.get("personality"))
         max_hp = int(st.get("HP", 0)) * 5
         left = int(left_map.get(int(r["id"]), DAILY_BATTLE_CAP))
         g = int(glyph_map.get(int(r["id"]), 0))
@@ -1951,7 +1969,7 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
     stats = json.loads(c["stats"])
-    personality = c.get("personality") or {}
+    personality = _parse_personality(c.get("personality"))
     pstats = set(personality.get("stats", []))
     mult = 2 if stat in pstats else 1
     effective = increase * mult

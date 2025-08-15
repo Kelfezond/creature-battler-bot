@@ -348,6 +348,9 @@ async def distribute_cash():
 
 @tasks.loop(time=dtime(hour=0, tzinfo=ZoneInfo("Europe/London")), reconnect=True)
 async def distribute_points():
+    if distribute_points.current_loop == 0:
+        logger.info("Skipping first daily trainer point distribution after restart")
+        return
     await (await db_pool()).execute("""
         WITH today AS (
           SELECT (now() AT TIME ZONE 'Europe/London')::date AS d
@@ -355,7 +358,7 @@ async def distribute_points():
         UPDATE trainers t
         SET trainer_points = t.trainer_points
           + ((5 + LEAST(GREATEST(t.facility_level - 1, 0), 5))
-             * GREATEST(1, (SELECT d FROM today) - COALESCE(t.last_tp_grant, (SELECT d FROM today) - 1))),
+             * GREATEST(0, (SELECT d FROM today) - COALESCE(t.last_tp_grant, (SELECT d FROM today)))),
             last_tp_grant = (SELECT d FROM today)
     """)
     logger.info("Distributed daily trainer points (catch-up safe)")

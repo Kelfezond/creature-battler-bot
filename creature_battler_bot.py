@@ -2179,7 +2179,14 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
 
     class PvPChallengeView(discord.ui.View):
         def __init__(self):
-            super().__init__(timeout=60)
+            super().__init__(timeout=3600)
+
+        async def on_timeout(self):
+            try:
+                if self.message:
+                    await self.message.delete()
+            except Exception:
+                pass
 
         @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
         async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2264,10 +2271,11 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
             await interaction.response.send_message("Challenge declined.", ephemeral=True)
 
     view = PvPChallengeView()
-    await inter.followup.send(
+    challenge_msg = await inter.followup.send(
         f"{opponent.mention}, {inter.user.mention} challenges you to a PvP battle wagering {wager} cash with your {opp_cre['name']}! Their {c_row['name']} has an OVR of {int(challenger_ovr)}.",
         view=view
     )
+    view.message = challenge_msg
 
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):

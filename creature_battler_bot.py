@@ -369,7 +369,7 @@ async def _catch_up_trainer_points_now():
         SET trainer_points = t.trainer_points
           + ((5 + LEAST(GREATEST(t.facility_level - 1, 0), 5))
              * GREATEST(0, (SELECT d FROM today) - COALESCE(t.last_tp_grant, (SELECT d FROM today)))),
-            last_tp_grant = COALESCE(t.last_tp_grant, (SELECT d FROM today))
+            last_tp_grant = (SELECT d FROM today)
     """)
 
 @tasks.loop(hours=12)

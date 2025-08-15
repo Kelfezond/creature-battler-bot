@@ -158,11 +158,21 @@ CREATE INDEX IF NOT EXISTS cr_rank_idx ON creature_records (wins DESC, losses AS
 ALTER TABLE creature_records
   ADD COLUMN IF NOT EXISTS highest_glyph_tier INT NOT NULL DEFAULT 0;
 
+-- Aggregate trainer PvP records
+CREATE TABLE IF NOT EXISTS pvp_records (
+  user_id BIGINT PRIMARY KEY,
+  wins INT NOT NULL DEFAULT 0,
+  losses INT NOT NULL DEFAULT 0
+);
+
 -- Store the message we keep editing for the live leaderboard
 CREATE TABLE IF NOT EXISTS leaderboard_messages (
   channel_id BIGINT PRIMARY KEY,
-  message_id BIGINT
+  message_id BIGINT,
+  pvp_message_id BIGINT
 );
+ALTER TABLE leaderboard_messages
+  ADD COLUMN IF NOT EXISTS pvp_message_id BIGINT;
 
 -- Encyclopedia target channel
 CREATE TABLE IF NOT EXISTS encyclopedia_channel (
@@ -881,6 +891,21 @@ async def _record_result(owner_id: int, name: str, won: bool):
             owner_id, name
         )
 
+async def _record_pvp_result(user_id: int, won: bool):
+    """Record a PvP win/loss for a trainer."""
+    await (await db_pool()).execute(
+        """
+        INSERT INTO pvp_records(user_id, wins, losses)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id) DO UPDATE
+        SET wins = pvp_records.wins + $2,
+            losses = pvp_records.losses + $3
+        """,
+        user_id,
+        1 if won else 0,
+        0 if won else 1,
+    )
+
 async def _record_death(owner_id: int, name: str):
     await (await db_pool()).execute(
         "UPDATE creature_records SET is_dead=true, died_at=now() WHERE owner_id=$1 AND LOWER(name)=LOWER($2)",
@@ -932,6 +957,44 @@ async def _get_or_create_leaderboard_message(channel_id: int) -> Optional[discor
 
     return message
 
+async def _get_or_create_pvp_leaderboard_message(channel_id: int) -> Optional[discord.Message]:
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception as e:
+        logger.error("Failed to fetch leaderboard channel %s: %s", channel_id, e)
+        return None
+
+    pool = await db_pool()
+    msg_id = await pool.fetchval(
+        "SELECT pvp_message_id FROM leaderboard_messages WHERE channel_id=$1",
+        channel_id,
+    )
+
+    message: Optional[discord.Message] = None
+    if msg_id:
+        try:
+            message = await channel.fetch_message(int(msg_id))
+        except Exception:
+            message = None
+
+    if message is None:
+        try:
+            message = await channel.send("Initializing PvP leaderboard…")
+            await pool.execute(
+                """
+                INSERT INTO leaderboard_messages(channel_id, pvp_message_id)
+                VALUES ($1,$2)
+                ON CONFLICT (channel_id) DO UPDATE SET pvp_message_id=EXCLUDED.pvp_message_id
+                """,
+                channel_id,
+                message.id,
+            )
+        except Exception as e:
+            logger.error("Failed to create PvP leaderboard message: %s", e)
+            return None
+
+    return message
+
 # UPDATED: include glyph column
 
 def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optional[int]]]) -> str:
@@ -952,6 +1015,15 @@ def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optiona
         )
         lines.append(("- " if dead else "  ") + base_line)
     return "```diff\n" + "\n".join(lines) + "\n```"
+
+def _format_pvp_leaderboard_lines(rows: List[Tuple[str, int, int]]) -> str:
+    lines: List[str] = []
+    header = f"{'#':>3}. {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4}"
+    lines.append("  " + header)
+    for idx, (trainer, wins, losses) in enumerate(rows, start=1):
+        trainer = (trainer or "")[:TRAINER_W]
+        lines.append(f"  {idx:>3}. {trainer:<{TRAINER_W}} {wins:>4} {losses:>4}")
+    return "```\n" + "\n".join(lines) + "\n```"
 # ─── Encyclopedia helpers ────────────────────────────────────
 async def _get_encyclopedia_channel_id() -> Optional[int]:
     pool = await db_pool()
@@ -1081,7 +1153,8 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
     if not channel_id:
         return
     message = await _get_or_create_leaderboard_message(channel_id)
-    if message is None:
+    pvp_message = await _get_or_create_pvp_leaderboard_message(channel_id)
+    if message is None and pvp_message is None:
         return
 
     pool = await db_pool()
@@ -1123,7 +1196,7 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
     """
 )
     formatted: List[Tuple[str, int, int, bool, str, int]] = [
-        (r["name"], r["wins"], r["losses"], r["is_dead"], r["trainer_name"], r["max_glyph_tier"]) 
+        (r["name"], r["wins"], r["losses"], r["is_dead"], r["trainer_name"], r["max_glyph_tier"])
         for r in rows
     ]
     updated_ts = int(time.time())
@@ -1132,11 +1205,39 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
         f"Updated: <t:{updated_ts}:R>\n"
     )
     content = title + _format_leaderboard_lines(formatted)
-    try:
-        await message.edit(content=content)
-        logger.info("Leaderboard updated (%s).", reason)
-    except Exception as e:
-        logger.error("Failed to edit leaderboard message: %s", e)
+    if message is not None:
+        try:
+            await message.edit(content=content)
+            logger.info("Leaderboard updated (%s).", reason)
+        except Exception as e:
+            logger.error("Failed to edit leaderboard message: %s", e)
+
+    # PvP leaderboard
+    pvp_rows = await pool.fetch(
+        """
+        SELECT
+            COALESCE(t.display_name, pr.user_id::text) AS trainer_name,
+            pr.wins,
+            pr.losses
+        FROM pvp_records pr
+        LEFT JOIN trainers t ON t.user_id = pr.user_id
+        ORDER BY pr.wins DESC, pr.losses ASC, trainer_name ASC
+        LIMIT 20
+        """
+    )
+    pvp_formatted: List[Tuple[str, int, int]] = [
+        (r["trainer_name"], r["wins"], r["losses"]) for r in pvp_rows
+    ]
+    pvp_title = (
+        f"**Trainer PvP Leaderboard — Top 20 (Wins / Losses)**\n"
+        f"Updated: <t:{updated_ts}:R>\n"
+    )
+    pvp_content = pvp_title + _format_pvp_leaderboard_lines(pvp_formatted)
+    if pvp_message is not None:
+        try:
+            await pvp_message.edit(content=pvp_content)
+        except Exception as e:
+            logger.error("Failed to edit PvP leaderboard message: %s", e)
 
 @tasks.loop(minutes=5)
 async def update_leaderboard_periodic():
@@ -1152,6 +1253,8 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
         await _ensure_record(st.opp_user_id, st.opp_creature_id, st.opp_creature["name"])
         await _record_result(st.user_id, st.user_creature["name"], player_won)
         await _record_result(st.opp_user_id, st.opp_creature["name"], not player_won)
+        await _record_pvp_result(st.user_id, player_won)
+        await _record_pvp_result(st.opp_user_id, not player_won)
 
         if player_won:
             await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", st.wager, st.user_id)
@@ -1412,6 +1515,7 @@ async def setup_hook():
     chan_id = await _get_leaderboard_channel_id()
     if chan_id:
         await _get_or_create_leaderboard_message(chan_id)
+        await _get_or_create_pvp_leaderboard_message(chan_id)
         await update_leaderboard_now(reason="startup")
     else:
         logger.info("No leaderboard channel configured yet. Use /setleaderboardchannel in the desired channel or set LEADERBOARD_CHANNEL_ID.")
@@ -1477,14 +1581,18 @@ async def setleaderboardchannel(inter: discord.Interaction):
         return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
 
     pool = await db_pool()
-    await pool.execute("""
-        INSERT INTO leaderboard_messages(channel_id, message_id)
-        VALUES ($1, NULL)
-        ON CONFLICT (channel_id) DO UPDATE SET message_id = leaderboard_messages.message_id
-    """, inter.channel.id)
+    await pool.execute(
+        """
+        INSERT INTO leaderboard_messages(channel_id, message_id, pvp_message_id)
+        VALUES ($1, NULL, NULL)
+        ON CONFLICT (channel_id) DO NOTHING
+        """,
+        inter.channel.id,
+    )
 
     await inter.response.send_message(f"Leaderboard channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
     await _get_or_create_leaderboard_message(inter.channel.id)
+    await _get_or_create_pvp_leaderboard_message(inter.channel.id)
     await update_leaderboard_now(reason="admin_set_channel")
 @bot.tree.command(description="(Admin) Set this channel as the Encyclopedia channel")
 async def setencyclopediachannel(inter: discord.Interaction):

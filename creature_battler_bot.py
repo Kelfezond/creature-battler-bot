@@ -2123,6 +2123,7 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
         return await inter.response.send_message("Creature not found.", ephemeral=True)
     stats = json.loads(c_row["stats"])
     max_hp = stats["HP"] * 5
+    challenger_ovr = sum(stats.values())
     if c_row["current_hp"] <= 0:
         return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
     opp_creatures = await pool.fetch(
@@ -2131,6 +2132,16 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
     )
     if not opp_creatures:
         return await inter.response.send_message("Opponent has no available creature.", ephemeral=True)
+    min_ovr = challenger_ovr * 0.8
+    max_ovr = challenger_ovr * 1.2
+    opp_creatures = [
+        r for r in opp_creatures
+        if min_ovr <= sum(json.loads(r["stats"]).values()) <= max_ovr
+    ]
+    if not opp_creatures:
+        return await inter.response.send_message(
+            "Opponent has no creature within 20% OVR of your creature.", ephemeral=True
+        )
 
     options = [discord.SelectOption(label=r["name"], value=str(r["id"])) for r in opp_creatures]
 
@@ -2251,7 +2262,7 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
 
     view = PvPChallengeView()
     await inter.followup.send(
-        f"{opponent.mention}, {inter.user.mention} challenges you to a PvP battle wagering {wager} cash with your {opp_cre['name']}!",
+        f"{opponent.mention}, {inter.user.mention} challenges you to a PvP battle wagering {wager} cash with your {opp_cre['name']}! Their {c_row['name']} has an OVR of {int(challenger_ovr)}.",
         view=view
     )
 

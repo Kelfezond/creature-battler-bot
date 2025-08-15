@@ -158,6 +158,10 @@ CREATE INDEX IF NOT EXISTS cr_rank_idx ON creature_records (wins DESC, losses AS
 ALTER TABLE creature_records
   ADD COLUMN IF NOT EXISTS highest_glyph_tier INT NOT NULL DEFAULT 0;
 
+-- Store overall rating (sum of base stats)
+ALTER TABLE creature_records
+  ADD COLUMN IF NOT EXISTS ovr INT NOT NULL DEFAULT 0;
+
 -- Aggregate trainer PvP records
 CREATE TABLE IF NOT EXISTS pvp_records (
   user_id BIGINT PRIMARY KEY,
@@ -866,21 +870,47 @@ async def _resolve_trainer_name(owner_id: int) -> str:
 async def _backfill_creature_records():
     pool = await db_pool()
     await pool.execute("""
-        INSERT INTO creature_records (creature_id, owner_id, name)
-        SELECT c.id, c.owner_id, c.name
+        INSERT INTO creature_records (creature_id, owner_id, name, ovr)
+        SELECT c.id, c.owner_id, c.name,
+               COALESCE((c.stats->>'HP')::int,0) +
+               COALESCE((c.stats->>'AR')::int,0) +
+               COALESCE((c.stats->>'PATK')::int,0) +
+               COALESCE((c.stats->>'SATK')::int,0) +
+               COALESCE((c.stats->>'SPD')::int,0)
         FROM creatures c
         LEFT JOIN creature_records r
           ON r.owner_id = c.owner_id AND LOWER(r.name) = LOWER(c.name)
         WHERE r.owner_id IS NULL
     """)
+    await pool.execute("""
+        UPDATE creature_records r
+        SET ovr =
+            COALESCE((c.stats->>'HP')::int,0) +
+            COALESCE((c.stats->>'AR')::int,0) +
+            COALESCE((c.stats->>'PATK')::int,0) +
+            COALESCE((c.stats->>'SATK')::int,0) +
+            COALESCE((c.stats->>'SPD')::int,0)
+        FROM creatures c
+        WHERE r.creature_id = c.id
+    """)
     logger.info("Backfilled creature_records for existing creatures (if any missing).")
 
-async def _ensure_record(owner_id: int, creature_id: int, name: str):
+async def _ensure_record(owner_id: int, creature_id: int, name: str, ovr: Optional[int] = None):
+    if ovr is None:
+        row = await (await db_pool()).fetchrow("SELECT stats FROM creatures WHERE id=$1", creature_id)
+        if row:
+            try:
+                stats = json.loads(row["stats"])
+                ovr = int(sum(stats.values()))
+            except Exception:
+                ovr = 0
+        else:
+            ovr = 0
     await (await db_pool()).execute("""
-        INSERT INTO creature_records (creature_id, owner_id, name)
-        VALUES ($1,$2,$3)
+        INSERT INTO creature_records (creature_id, owner_id, name, ovr)
+        VALUES ($1,$2,$3,$4)
         ON CONFLICT (owner_id, name) DO NOTHING
-    """, creature_id, owner_id, name)
+    """, creature_id, owner_id, name, ovr)
 
 async def _record_result(owner_id: int, name: str, won: bool):
     if won:
@@ -998,22 +1028,27 @@ async def _get_or_create_pvp_leaderboard_message(channel_id: int) -> Optional[di
 
     return message
 
-# UPDATED: include glyph column
+# UPDATED: include glyph and OVR columns
 
-def _format_leaderboard_lines(rows: List[Tuple[str, int, int, bool, str, Optional[int]]]) -> str:
+def _format_leaderboard_lines(
+    rows: List[Tuple[str, int, int, bool, str, Optional[int], Optional[int]]]
+) -> str:
     """
-    Input rows: (name, wins, losses, is_dead, trainer_name, max_glyph_tier)
+    Input rows: (name, wins, losses, is_dead, trainer_name, max_glyph_tier, ovr)
     Use a diff code block; prefix '-' for dead to render red.
     """
     lines: List[str] = []
-    header = f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4} {'Glyph':>5} Status"
+    header = (
+        f"{'#':>3}. {'Name':<{NAME_W}} {'Trainer':<{TRAINER_W}} {'W':>4} {'L':>4} {'Glyph':>5} {'OVR':>5} Status"
+    )
     lines.append("  " + header)
-    for idx, (name, wins, losses, dead, trainer_name, glyph_tier) in enumerate(rows, start=1):
+    for idx, (name, wins, losses, dead, trainer_name, glyph_tier, ovr) in enumerate(rows, start=1):
         name = (name or "")[:NAME_W]
         trainer = (trainer_name or "")[:TRAINER_W]
         glyph_display = "-" if not glyph_tier or glyph_tier <= 0 else str(glyph_tier)
+        ovr_display = "-" if not ovr or ovr <= 0 else str(int(((ovr + 5) // 10) * 10))
         base_line = (
-            f"{idx:>3}. {name:<{NAME_W}} {trainer:<{TRAINER_W}} {wins:>4} {losses:>4} {glyph_display:>5} "
+            f"{idx:>3}. {name:<{NAME_W}} {trainer:<{TRAINER_W}} {wins:>4} {losses:>4} {glyph_display:>5} {ovr_display:>5} "
             f"{'💀 DEAD' if dead else ''}"
         )
         lines.append(("- " if dead else "  ") + base_line)
@@ -1191,20 +1226,29 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
             r.losses,
             r.is_dead,
             COALESCE(t.display_name, r.owner_id::text) AS trainer_name,
-            COALESCE(r.highest_glyph_tier, 0) AS max_glyph_tier
+            COALESCE(r.highest_glyph_tier, 0) AS max_glyph_tier,
+            COALESCE(r.ovr, 0) AS ovr
         FROM creature_records r
         LEFT JOIN trainers t ON t.user_id = r.owner_id
         ORDER BY max_glyph_tier DESC, r.wins DESC, r.losses ASC, r.name ASC
         LIMIT 20
     """
 )
-    formatted: List[Tuple[str, int, int, bool, str, int]] = [
-        (r["name"], r["wins"], r["losses"], r["is_dead"], r["trainer_name"], r["max_glyph_tier"])
+    formatted: List[Tuple[str, int, int, bool, str, int, int]] = [
+        (
+            r["name"],
+            r["wins"],
+            r["losses"],
+            r["is_dead"],
+            r["trainer_name"],
+            r["max_glyph_tier"],
+            r["ovr"],
+        )
         for r in rows
     ]
     updated_ts = int(time.time())
     title = (
-        f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph)**\n"
+        f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph / OVR)**\n"
         f"Updated: <t:{updated_ts}:R>\n"
     )
     content = title + _format_leaderboard_lines(formatted)
@@ -1252,8 +1296,18 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     pool = await db_pool()
 
     if st.is_pvp:
-        await _ensure_record(st.user_id, st.creature_id, st.user_creature["name"])
-        await _ensure_record(st.opp_user_id, st.opp_creature_id, st.opp_creature["name"])
+        await _ensure_record(
+            st.user_id,
+            st.creature_id,
+            st.user_creature["name"],
+            int(sum(st.user_creature.get("stats", {}).values())),
+        )
+        await _ensure_record(
+            st.opp_user_id,
+            st.opp_creature_id,
+            st.opp_creature["name"],
+            int(sum(st.opp_creature.get("stats", {}).values())),
+        )
         await _record_result(st.user_id, st.user_creature["name"], player_won)
         await _record_result(st.opp_user_id, st.opp_creature["name"], not player_won)
         await _record_pvp_result(st.user_id, player_won)
@@ -1333,7 +1387,12 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     win_cash, loss_cash = TIER_PAYOUTS[st.tier]
     payout = win_cash if player_won else loss_cash
 
-    await _ensure_record(st.user_id, st.creature_id, st.user_creature["name"])
+    await _ensure_record(
+        st.user_id,
+        st.creature_id,
+        st.user_creature["name"],
+        int(sum(st.user_creature.get("stats", {}).values())),
+    )
     await _record_result(st.user_id, st.user_creature["name"], player_won)
 
     await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", payout, st.user_id)
@@ -1694,6 +1753,7 @@ async def spawn(inter: discord.Interaction):
     rarity = spawn_rarity()
     meta = await generate_creature_meta(rarity)
     stats = allocate_stats(rarity)
+    ovr = int(sum(stats.values()))
     max_hp = stats["HP"] * 5
 
     personality = choose_personality()
@@ -1703,7 +1763,7 @@ async def spawn(inter: discord.Interaction):
         " VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
         inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp, json.dumps(personality)
     )
-    await _ensure_record(inter.user.id, rec["id"], meta["name"]) 
+    await _ensure_record(inter.user.id, rec["id"], meta["name"], ovr)
 
     embed = discord.Embed(
         title=f"{meta['name']} ({rarity})",

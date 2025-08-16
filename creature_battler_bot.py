@@ -352,19 +352,23 @@ async def distribute_cash():
 
 @tasks.loop(time=dtime(hour=0, tzinfo=ZoneInfo("Europe/London")), reconnect=True)
 async def distribute_points():
-    if distribute_points.current_loop == 0:
-        logger.info("Skipping first daily trainer point distribution after restart")
-        return
-    await (await db_pool()).execute("""
-        WITH today AS (
-          SELECT (now() AT TIME ZONE 'Europe/London')::date AS d
-        )
-        UPDATE trainers t
-        SET trainer_points = t.trainer_points
-          + ((5 + LEAST(GREATEST(t.facility_level - 1, 0), 5))
-             * GREATEST(0, (SELECT d FROM today) - COALESCE(t.last_tp_grant, (SELECT d FROM today)))),
-            last_tp_grant = (SELECT d FROM today)
-    """)
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        today = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+        last = await conn.fetchval("SELECT last_tp_grant FROM trainers ORDER BY user_id LIMIT 1")
+        if last == today:
+            logger.info("Trainer points already granted for %s; skipping", today)
+            return
+        await conn.execute("""
+            WITH today AS (
+              SELECT $1::date AS d
+            )
+            UPDATE trainers t
+            SET trainer_points = t.trainer_points
+              + ((5 + LEAST(GREATEST(t.facility_level - 1, 0), 5))
+                 * GREATEST(0, (SELECT d FROM today) - COALESCE(t.last_tp_grant, (SELECT d FROM today)))),
+                last_tp_grant = (SELECT d FROM today)
+        """, today)
     logger.info("Distributed daily trainer points (catch-up safe)")
 async def _catch_up_trainer_points_now():
     """Grant any missed daily trainer points since last_tp_grant without double-granting today."""

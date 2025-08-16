@@ -116,8 +116,6 @@ ALTER TABLE creatures
 
 ALTER TABLE creatures
   ADD COLUMN IF NOT EXISTS personality JSONB;
-ALTER TABLE trainers
-  ADD COLUMN IF NOT EXISTS facility_level INT DEFAULT 1;
 
 -- store display names for leaderboards
 ALTER TABLE trainers

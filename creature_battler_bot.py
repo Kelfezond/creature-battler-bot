@@ -1377,21 +1377,33 @@ async def update_shop_now(reason: str = "manual") -> None:
         ORDER BY ct.listed_at
         """
     )
-    content_lines: List[str] = ["**Creature Shop**"]
+    updated_ts = int(time.time())
+    embed = discord.Embed(
+        title="Creature Shop",
+        description=f"Updated: <t:{updated_ts}:R>",
+    )
     if not rows:
-        content_lines.append("_No creatures currently for sale._")
+        embed.add_field(
+            name="No listings",
+            value="_No creatures currently for sale._",
+            inline=False,
+        )
     else:
         for r in rows:
             stats = json.loads(r["stats"]) if r["stats"] else {}
             ovr = int(sum(stats.values()))
             personality = _parse_personality(r.get("personality"))
             p_name = personality.get("name") if personality else "-"
-            content_lines.append(
-                f"{r['name']} — Trainer: {r['trainer_name']} — {r['rarity']} — OVR {ovr} — Personality: {p_name} — Price: {r['price']}"
+            embed.add_field(
+                name=r["name"],
+                value=(
+                    f"Trainer: {r['trainer_name']} — {r['rarity']} "
+                    f"— OVR {ovr} — Personality: {p_name} — Price: {r['price']}"
+                ),
+                inline=False,
             )
-    content = "\n".join(content_lines)
     try:
-        await message.edit(content=content)
+        await message.edit(content=None, embed=embed)
         logger.info("Shop updated (%s).", reason)
     except Exception as e:
         logger.error("Failed to edit shop message: %s", e)

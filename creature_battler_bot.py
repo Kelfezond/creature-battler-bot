@@ -1403,7 +1403,7 @@ async def update_shop_now(reason: str = "manual") -> None:
                 inline=False,
             )
     try:
-        await message.edit(content=None, embed=embed)
+        await message.edit(content=None, embed=embed, view=ShopView())
         logger.info("Shop updated (%s).", reason)
     except Exception as e:
         logger.error("Failed to edit shop message: %s", e)
@@ -2166,6 +2166,48 @@ async def buy(inter: discord.Interaction, creature_name: str):
     )
     asyncio.create_task(update_shop_now(reason="buy"))
     asyncio.create_task(update_leaderboard_now(reason="buy"))
+
+class SellModal(discord.ui.Modal, title="Sell Creature"):
+    creature_name = discord.ui.TextInput(label="Creature Name")
+    price = discord.ui.TextInput(label="Price")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            price_val = int(self.price.value)
+        except ValueError:
+            return await interaction.response.send_message("Price must be an integer.", ephemeral=True)
+        await sell.callback(interaction, self.creature_name.value, price_val)
+
+
+class WithdrawModal(discord.ui.Modal, title="Withdraw Listing"):
+    creature_name = discord.ui.TextInput(label="Creature Name")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await withdraw.callback(interaction, self.creature_name.value)
+
+
+class BuyModal(discord.ui.Modal, title="Buy Creature"):
+    creature_name = discord.ui.TextInput(label="Creature Name")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await buy.callback(interaction, self.creature_name.value)
+
+
+class ShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Sell", style=discord.ButtonStyle.blurple)
+    async def sell_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SellModal())
+
+    @discord.ui.button(label="Withdraw", style=discord.ButtonStyle.gray)
+    async def withdraw_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WithdrawModal())
+
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green)
+    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BuyModal())
 
 @bot.tree.command(description="Rename one of your creatures")
 async def rename(inter: discord.Interaction, creature_name: str, new_name: str):

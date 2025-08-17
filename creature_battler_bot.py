@@ -1999,8 +1999,8 @@ async def record(inter: discord.Interaction, creature_name: str):
            f"Status: **{status}**{died_line}")
     await inter.response.send_message(msg, ephemeral=True)
 
-@bot.tree.command(description="Sell one of your creatures for cash (price depends on rarity)")
-async def sell(inter: discord.Interaction, creature_name: str):
+@bot.tree.command(description="Quickly sell one of your creatures for cash (price depends on rarity)")
+async def quicksell(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
         return
@@ -2026,12 +2026,12 @@ async def sell(inter: discord.Interaction, creature_name: str):
     await inter.response.send_message(
         f"Sold **{c_row['name']}** ({rarity}) for **{price}** cash.", ephemeral=True
     )
-    asyncio.create_task(update_leaderboard_now(reason="sell"))
-    asyncio.create_task(update_shop_now(reason="sell"))
+    asyncio.create_task(update_leaderboard_now(reason="quicksell"))
+    asyncio.create_task(update_shop_now(reason="quicksell"))
 
 
 @bot.tree.command(description="List one of your creatures for sale in the shop")
-async def trade(inter: discord.Interaction, creature_name: str, price: int):
+async def sell(inter: discord.Interaction, creature_name: str, price: int):
     if price <= 0:
         return await inter.response.send_message("Price must be positive.", ephemeral=True)
     row = await ensure_registered(inter)
@@ -2048,7 +2048,7 @@ async def trade(inter: discord.Interaction, creature_name: str, price: int):
     st = active_battles.get(inter.user.id)
     if st and st.creature_id == c_row["id"]:
         return await inter.response.send_message(
-            f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before trading.",
+            f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before selling.",
             ephemeral=True,
         )
     listed = await pool.fetchval(
@@ -2067,7 +2067,41 @@ async def trade(inter: discord.Interaction, creature_name: str, price: int):
     await inter.response.send_message(
         f"Listed **{c_row['name']}** for **{price}** cash in the shop.", ephemeral=True
     )
-    asyncio.create_task(update_shop_now(reason="trade"))
+    asyncio.create_task(update_shop_now(reason="sell"))
+
+
+@bot.tree.command(description="Withdraw one of your creatures from the shop")
+async def withdraw(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    c_row = await pool.fetchrow(
+        "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id,
+        creature_name,
+    )
+    if not c_row:
+        return await inter.response.send_message("Creature not found.", ephemeral=True)
+    st = active_battles.get(inter.user.id)
+    if st and st.creature_id == c_row["id"]:
+        return await inter.response.send_message(
+            f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before withdrawing.",
+            ephemeral=True,
+        )
+    deleted = await pool.fetchrow(
+        "DELETE FROM creature_shop WHERE creature_id=$1 RETURNING price",
+        c_row["id"],
+    )
+    if not deleted:
+        return await inter.response.send_message(
+            f"{c_row['name']} is not listed in the shop.", ephemeral=True
+        )
+    await inter.response.send_message(
+        f"Withdrew **{c_row['name']}** from the shop (was listed for {deleted['price']} cash).",
+        ephemeral=True,
+    )
+    asyncio.create_task(update_shop_now(reason="withdraw"))
 
 
 @bot.tree.command(description="Buy a creature from the shop")

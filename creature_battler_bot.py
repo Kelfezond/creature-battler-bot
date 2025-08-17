@@ -49,6 +49,8 @@ logger.info("Using TEXT_MODEL=%s, IMAGE_MODEL=%s", TEXT_MODEL, IMAGE_MODEL)
 
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
+# Optional: channel where the live creature shop is posted/updated.
+SHOP_CHANNEL_ID_ENV = os.getenv("SHOP_CHANNEL_ID")
 
 # Admin allow-list for privileged commands (e.g., /cashadd, /setleaderboardchannel)
 def _parse_admin_ids(raw: Optional[str]) -> set[int]:
@@ -175,6 +177,19 @@ CREATE TABLE IF NOT EXISTS leaderboard_messages (
 );
 ALTER TABLE leaderboard_messages
   ADD COLUMN IF NOT EXISTS pvp_message_id BIGINT;
+
+-- Store creature shop listings
+CREATE TABLE IF NOT EXISTS creature_shop (
+  creature_id INT PRIMARY KEY REFERENCES creatures(id) ON DELETE CASCADE,
+  price BIGINT NOT NULL,
+  listed_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Store the message we keep editing for the live creature shop
+CREATE TABLE IF NOT EXISTS shop_messages (
+  channel_id BIGINT PRIMARY KEY,
+  message_id BIGINT
+);
 
 -- Encyclopedia target channel
 CREATE TABLE IF NOT EXISTS encyclopedia_channel (
@@ -1292,6 +1307,100 @@ async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
 async def update_leaderboard_periodic():
     await update_leaderboard_now(reason="periodic")
 
+
+async def _get_shop_channel_id() -> Optional[int]:
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM shop_messages LIMIT 1")
+    if chan:
+        return int(chan)
+    if SHOP_CHANNEL_ID_ENV:
+        try:
+            return int(SHOP_CHANNEL_ID_ENV)
+        except Exception:
+            logger.error("SHOP_CHANNEL_ID env was set but not an integer.")
+    return None
+
+
+async def _get_or_create_shop_message(channel_id: int) -> Optional[discord.Message]:
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception as e:
+        logger.error("Failed to fetch shop channel %s: %s", channel_id, e)
+        return None
+
+    pool = await db_pool()
+    msg_id = await pool.fetchval(
+        "SELECT message_id FROM shop_messages WHERE channel_id=$1", channel_id
+    )
+
+    message: Optional[discord.Message] = None
+    if msg_id:
+        try:
+            message = await channel.fetch_message(int(msg_id))
+        except Exception:
+            message = None
+
+    if message is None:
+        try:
+            message = await channel.send("Initializing shop…")
+            await pool.execute(
+                """
+                INSERT INTO shop_messages(channel_id, message_id)
+                VALUES ($1,$2)
+                ON CONFLICT (channel_id) DO UPDATE SET message_id=EXCLUDED.message_id
+                """,
+                channel_id,
+                message.id,
+            )
+        except Exception as e:
+            logger.error("Failed to create shop message: %s", e)
+            return None
+
+    return message
+
+
+async def update_shop_now(reason: str = "manual") -> None:
+    channel_id = await _get_shop_channel_id()
+    if not channel_id:
+        return
+    message = await _get_or_create_shop_message(channel_id)
+    if message is None:
+        return
+    pool = await db_pool()
+    rows = await pool.fetch(
+        """
+        SELECT c.name, c.stats, c.rarity, c.personality, ct.price,
+               COALESCE(t.display_name, c.owner_id::text) AS trainer_name
+        FROM creature_shop ct
+        JOIN creatures c ON c.id = ct.creature_id
+        LEFT JOIN trainers t ON t.user_id = c.owner_id
+        ORDER BY ct.listed_at
+        """
+    )
+    content_lines: List[str] = ["**Creature Shop**"]
+    if not rows:
+        content_lines.append("_No creatures currently for sale._")
+    else:
+        for r in rows:
+            stats = json.loads(r["stats"]) if r["stats"] else {}
+            ovr = int(sum(stats.values()))
+            personality = _parse_personality(r.get("personality"))
+            p_name = personality.get("name") if personality else "-"
+            content_lines.append(
+                f"{r['name']} — Trainer: {r['trainer_name']} — {r['rarity']} — OVR {ovr} — Personality: {p_name} — Price: {r['price']}"
+            )
+    content = "\n".join(content_lines)
+    try:
+        await message.edit(content=content)
+        logger.info("Shop updated (%s).", reason)
+    except Exception as e:
+        logger.error("Failed to edit shop message: %s", e)
+
+
+@tasks.loop(minutes=5)
+async def update_shop_periodic():
+    await update_shop_now(reason="periodic")
+
 # ─── Battle finalize (records + leaderboard) ─────────────────
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
     player_won = st.opp_current_hp <= 0 and st.user_current_hp > 0
@@ -1572,7 +1681,7 @@ async def setup_hook():
         await bot.tree.sync()
         logger.info("Synced globally")
 
-    for loop in (distribute_cash, distribute_points, regenerate_hp, update_leaderboard_periodic):
+    for loop in (distribute_cash, distribute_points, regenerate_hp, update_leaderboard_periodic, update_shop_periodic):
         if not loop.is_running():
             loop.start()
 
@@ -1583,6 +1692,13 @@ async def setup_hook():
         await update_leaderboard_now(reason="startup")
     else:
         logger.info("No leaderboard channel configured yet. Use /setleaderboardchannel in the desired channel or set LEADERBOARD_CHANNEL_ID.")
+
+    shop_chan = await _get_shop_channel_id()
+    if shop_chan:
+        await _get_or_create_shop_message(shop_chan)
+        await update_shop_now(reason="startup")
+    else:
+        logger.info("No shop channel configured yet. Use /setshopchannel in the desired channel or set SHOP_CHANNEL_ID.")
 
 @bot.event
 async def on_ready():
@@ -1658,6 +1774,23 @@ async def setleaderboardchannel(inter: discord.Interaction):
     await _get_or_create_leaderboard_message(inter.channel.id)
     await _get_or_create_pvp_leaderboard_message(inter.channel.id)
     await update_leaderboard_now(reason="admin_set_channel")
+
+@bot.tree.command(description="(Admin) Set this channel as the creature shop channel")
+async def setshopchannel(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute("DELETE FROM shop_messages")
+    await pool.execute(
+        "INSERT INTO shop_messages(channel_id, message_id) VALUES($1, NULL)",
+        inter.channel.id,
+    )
+    await inter.response.send_message(f"Shop channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
+    await _get_or_create_shop_message(inter.channel.id)
+    await update_shop_now(reason="admin_set_channel")
 @bot.tree.command(description="(Admin) Set this channel as the Encyclopedia channel")
 async def setencyclopediachannel(inter: discord.Interaction):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -1882,6 +2015,111 @@ async def sell(inter: discord.Interaction, creature_name: str):
         f"Sold **{c_row['name']}** ({rarity}) for **{price}** cash.", ephemeral=True
     )
     asyncio.create_task(update_leaderboard_now(reason="sell"))
+    asyncio.create_task(update_shop_now(reason="sell"))
+
+
+@bot.tree.command(description="List one of your creatures for sale in the shop")
+async def trade(inter: discord.Interaction, creature_name: str, price: int):
+    if price <= 0:
+        return await inter.response.send_message("Price must be positive.", ephemeral=True)
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    c_row = await pool.fetchrow(
+        "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        inter.user.id,
+        creature_name,
+    )
+    if not c_row:
+        return await inter.response.send_message("Creature not found.", ephemeral=True)
+    st = active_battles.get(inter.user.id)
+    if st and st.creature_id == c_row["id"]:
+        return await inter.response.send_message(
+            f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before trading.",
+            ephemeral=True,
+        )
+    listed = await pool.fetchval(
+        "SELECT 1 FROM creature_shop WHERE creature_id=$1",
+        c_row["id"],
+    )
+    if listed:
+        return await inter.response.send_message(
+            f"{c_row['name']} is already listed in the shop.", ephemeral=True
+        )
+    await pool.execute(
+        "INSERT INTO creature_shop(creature_id, price) VALUES($1,$2)",
+        c_row["id"],
+        price,
+    )
+    await inter.response.send_message(
+        f"Listed **{c_row['name']}** for **{price}** cash in the shop.", ephemeral=True
+    )
+    asyncio.create_task(update_shop_now(reason="trade"))
+
+
+@bot.tree.command(description="Buy a creature from the shop")
+async def buy(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    c_row = await pool.fetchrow(
+        """
+        SELECT c.id, c.name, c.owner_id, c.stats, ct.price,
+               COALESCE(t.display_name, c.owner_id::text) AS trainer_name
+        FROM creature_shop ct
+        JOIN creatures c ON c.id = ct.creature_id
+        LEFT JOIN trainers t ON t.user_id = c.owner_id
+        WHERE LOWER(c.name) = LOWER($1)
+        """,
+        creature_name,
+    )
+    if not c_row:
+        return await inter.response.send_message("That creature is not for sale.", ephemeral=True)
+    if c_row["owner_id"] == inter.user.id:
+        return await inter.response.send_message("You cannot buy your own creature.", ephemeral=True)
+    count = await pool.fetchval(
+        "SELECT COUNT(*) FROM creatures WHERE owner_id=$1",
+        inter.user.id,
+    )
+    if int(count or 0) >= MAX_CREATURES:
+        return await inter.response.send_message(
+            f"You already have the maximum of {MAX_CREATURES} creatures.", ephemeral=True
+        )
+    price = int(c_row["price"])
+    if row["cash"] < price:
+        return await inter.response.send_message("You don't have enough cash.", ephemeral=True)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM creature_shop WHERE creature_id=$1",
+                c_row["id"],
+            )
+            await conn.execute(
+                "UPDATE creatures SET owner_id=$1 WHERE id=$2",
+                inter.user.id,
+                c_row["id"],
+            )
+            await conn.execute(
+                "UPDATE trainers SET cash = cash - $1 WHERE user_id=$2",
+                price,
+                inter.user.id,
+            )
+            await conn.execute(
+                "UPDATE trainers SET cash = cash + $1 WHERE user_id=$2",
+                price,
+                c_row["owner_id"],
+            )
+
+    await _ensure_record(inter.user.id, c_row["id"], c_row["name"])
+    await inter.response.send_message(
+        f"You bought **{c_row['name']}** from {c_row['trainer_name']} for {price} cash.",
+        ephemeral=True,
+    )
+    asyncio.create_task(update_shop_now(reason="buy"))
+    asyncio.create_task(update_leaderboard_now(reason="buy"))
 
 @bot.tree.command(description="Rename one of your creatures")
 async def rename(inter: discord.Interaction, creature_name: str, new_name: str):
@@ -1932,6 +2170,7 @@ async def rename(inter: discord.Interaction, creature_name: str, new_name: str):
         f"Renamed **{c_row['name']}** to **{new_name}**.", ephemeral=True
     )
     asyncio.create_task(update_leaderboard_now(reason="rename"))
+    asyncio.create_task(update_shop_now(reason="rename"))
 
 @bot.tree.command(description="Show glyphs and tier progress for a creature")
 async def glyphs(inter: discord.Interaction, creature_name: str):
@@ -2059,6 +2298,16 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if not c_row:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
+    listed = await (await db_pool()).fetchval(
+        "SELECT 1 FROM creature_shop WHERE creature_id=$1",
+        c_row["id"],
+    )
+    if listed:
+        return await inter.response.send_message(
+            f"{c_row['name']} is listed in the shop and cannot battle.",
+            ephemeral=True,
+        )
+
     stats = json.loads(c_row["stats"])
     max_hp = stats["HP"] * 5
     if c_row["current_hp"] <= 0:
@@ -2182,18 +2431,29 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
         )
     c_row = await pool.fetchrow(
         "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
+        inter.user.id,
+        creature_name,
     )
     if not c_row:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
+    listed = await pool.fetchval(
+        "SELECT 1 FROM creature_shop WHERE creature_id=$1",
+        c_row["id"],
+    )
+    if listed:
+        return await inter.response.send_message(
+            f"{c_row['name']} is listed in the shop and cannot battle.",
+            ephemeral=True,
+        )
     stats = json.loads(c_row["stats"])
     max_hp = stats["HP"] * 5
     challenger_ovr = sum(stats.values())
     if c_row["current_hp"] <= 0:
         return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
     opp_creatures = await pool.fetch(
-        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND current_hp>0",
-        opponent.id
+        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND current_hp>0 AND "
+        "NOT EXISTS (SELECT 1 FROM creature_shop cs WHERE cs.creature_id = creatures.id)",
+        opponent.id,
     )
     if not opp_creatures:
         return await inter.response.send_message("Opponent has no available creature.", ephemeral=True)
@@ -2444,11 +2704,21 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         return await inter.response.send_message("Not enough trainer points.", ephemeral=True)
 
     c = await (await db_pool()).fetchrow(
-        "SELECT id,stats,current_hp,personality FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+        "SELECT id,name,stats,current_hp,personality FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
         inter.user.id, creature_name
     )
     if not c:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
+
+    listed = await (await db_pool()).fetchval(
+        "SELECT 1 FROM creature_shop WHERE creature_id=$1",
+        c["id"],
+    )
+    if listed:
+        return await inter.response.send_message(
+            f"{c['name']} is listed in the shop and cannot be trained.",
+            ephemeral=True,
+        )
 
     stats = json.loads(c["stats"])
     personality = _parse_personality(c.get("personality"))

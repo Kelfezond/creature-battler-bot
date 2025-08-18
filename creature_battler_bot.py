@@ -3150,27 +3150,51 @@ class ControlsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Creatures", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(
+        label="Creatures",
+        style=discord.ButtonStyle.secondary,
+        custom_id="controls_creatures",
+    )
     async def btn_creatures(self, interaction: discord.Interaction, button: discord.ui.Button):
         await creatures.callback(interaction)
 
-    @discord.ui.button(label="Trainer Points", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(
+        label="Trainer Points",
+        style=discord.ButtonStyle.secondary,
+        custom_id="controls_tp",
+    )
     async def btn_tp(self, interaction: discord.Interaction, button: discord.ui.Button):
         await trainerpoints.callback(interaction)
 
-    @discord.ui.button(label="Cash", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(
+        label="Cash",
+        style=discord.ButtonStyle.secondary,
+        custom_id="controls_cash",
+    )
     async def btn_cash(self, interaction: discord.Interaction, button: discord.ui.Button):
         await cash.callback(interaction)
 
-    @discord.ui.button(label="Upgrade", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="Upgrade",
+        style=discord.ButtonStyle.primary,
+        custom_id="controls_upgrade",
+    )
     async def btn_upgrade(self, interaction: discord.Interaction, button: discord.ui.Button):
         await upgrade.callback(interaction)
 
-    @discord.ui.button(label="Train", style=discord.ButtonStyle.success)
+    @discord.ui.button(
+        label="Train",
+        style=discord.ButtonStyle.success,
+        custom_id="controls_train",
+    )
     async def btn_train(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(TrainModal())
 
-    @discord.ui.button(label="Rename", style=discord.ButtonStyle.success)
+    @discord.ui.button(
+        label="Rename",
+        style=discord.ButtonStyle.success,
+        custom_id="controls_rename",
+    )
     async def btn_rename(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RenameModal())
 

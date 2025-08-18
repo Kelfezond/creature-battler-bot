@@ -1412,6 +1412,11 @@ async def _get_or_create_controls_message(channel_id: int) -> Optional[discord.M
                 description="Use the buttons below to manage your trainer and creatures.",
             )
             message = await channel.send(embed=embed, view=controls_view)
+            # Explicitly register the persistent view so the buttons continue
+            # working even after the bot restarts. Without this, the message
+            # would remain but future interaction callbacks would fail with
+            # "This interaction failed" because the view was not re-bound.
+            bot.add_view(controls_view, message_id=message.id)
             await pool.execute(
                 """
                 INSERT INTO controls_messages(channel_id, message_id)

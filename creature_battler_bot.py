@@ -2640,15 +2640,14 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
     )
     if not opp_creatures:
         return await inter.response.send_message("Opponent has no available creature.", ephemeral=True)
-    min_ovr = challenger_ovr * 0.8
-    max_ovr = challenger_ovr * 1.2
     opp_creatures = [
-        r for r in opp_creatures
-        if min_ovr <= sum(json.loads(r["stats"]).values()) <= max_ovr
+        r
+        for r in opp_creatures
+        if abs(sum(json.loads(r["stats"]).values()) - challenger_ovr) <= 50
     ]
     if not opp_creatures:
         return await inter.response.send_message(
-            "Opponent has no creature within 20% OVR of your creature.", ephemeral=True
+            "Opponent has no creature within 50 OVR of your creature.", ephemeral=True
         )
 
     options = [discord.SelectOption(label=r["name"], value=str(r["id"])) for r in opp_creatures]

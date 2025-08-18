@@ -174,6 +174,14 @@ CREATE TABLE IF NOT EXISTS pvp_records (
 ALTER TABLE pvp_records
   ADD COLUMN IF NOT EXISTS last_battle_at TIMESTAMPTZ;
 
+-- Per-creature PvP cooldowns
+CREATE TABLE IF NOT EXISTS pvp_cooldowns (
+  creature_id INT PRIMARY KEY REFERENCES creatures(id) ON DELETE CASCADE,
+  last_battle_at TIMESTAMPTZ
+);
+ALTER TABLE pvp_cooldowns
+  ADD COLUMN IF NOT EXISTS last_battle_at TIMESTAMPTZ;
+
 -- Store the message we keep editing for the live leaderboard
 CREATE TABLE IF NOT EXISTS leaderboard_messages (
   channel_id BIGINT PRIMARY KEY,
@@ -216,6 +224,7 @@ async def db_pool() -> asyncpg.Pool:
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5
 DAILY_BATTLE_CAP = 2  # <— used for display of remaining battles
+PVP_COOLDOWN_HOURS = 12
 
 SELL_PRICES: Dict[str, int] = {
     "Common": 1_000,
@@ -748,6 +757,36 @@ async def _battles_left_map(creature_ids: List[int]) -> Dict[int, int]:
         left = max(0, DAILY_BATTLE_CAP - int(r["count"]))
         result[int(r["creature_id"])] = left
     return result
+
+# ─── PvP cooldown helpers ────────────────────────────────────
+async def _pvp_ready_map(creature_ids: List[int]) -> Dict[int, bool]:
+    """Return {creature_id: bool} indicating PvP availability per creature."""
+    result: Dict[int, bool] = {cid: True for cid in creature_ids}
+    if not creature_ids:
+        return result
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT creature_id, last_battle_at FROM pvp_cooldowns WHERE creature_id = ANY($1::int[])",
+            creature_ids,
+        )
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        last = r["last_battle_at"]
+        if last is not None and now - last < timedelta(hours=PVP_COOLDOWN_HOURS):
+            result[int(r["creature_id"])] = False
+    return result
+
+async def _record_pvp_battle(creature_id: int):
+    """Record the timestamp of a PvP battle for a creature."""
+    await (await db_pool()).execute(
+        """
+        INSERT INTO pvp_cooldowns(creature_id, last_battle_at)
+        VALUES ($1, now())
+        ON CONFLICT (creature_id) DO UPDATE SET last_battle_at = EXCLUDED.last_battle_at
+        """,
+        creature_id,
+    )
 
 # ─── Progress / Glyphs helpers ───────────────────────────────
 async def _get_progress(conn: asyncpg.Connection, creature_id: int, tier: int) -> Optional[asyncpg.Record]:
@@ -1513,6 +1552,8 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
         await _record_result(st.opp_user_id, st.opp_creature["name"], not player_won)
         await _record_pvp_result(st.user_id, player_won)
         await _record_pvp_result(st.opp_user_id, not player_won)
+        await _record_pvp_battle(st.creature_id)
+        await _record_pvp_battle(st.opp_creature_id)
 
         if player_won:
             await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", st.wager, st.user_id)
@@ -2060,6 +2101,7 @@ async def creatures(inter: discord.Interaction):
     glyph_map = {int(r["creature_id"]): int(r["max_glyph"] or 0) for r in glyph_rows}
 
     left_map = await _battles_left_map(ids)
+    pvp_ready_map = await _pvp_ready_map(ids)
 
     first = True
     for r in rows:
@@ -2072,8 +2114,8 @@ async def creatures(inter: discord.Interaction):
         glyph_disp = "-" if g <= 0 else str(g)
         overall = int(st.get("HP", 0) + st.get("AR", 0) + st.get("PATK", 0) + st.get("SATK", 0) + st.get("SPD", 0))
 
-        ready = r["not_listed"] and r["current_hp"] > 0 and left > 0
-        pvp_icon = "✅" if ready else "❌"
+        pvp_ready = r["not_listed"] and r["current_hp"] > 0 and pvp_ready_map.get(int(r["id"]), True)
+        pvp_icon = "✅" if pvp_ready else "❌"
 
         lines = [
             f"**{r['name']}** ({r['rarity']})",
@@ -2650,6 +2692,10 @@ async def pvp(inter: discord.Interaction):
     max_hp = stats["HP"] * 5
     challenger_ovr = sum(stats.values())
 
+    ready_map = await _pvp_ready_map([int(c_row["id"])])
+    if not ready_map.get(int(c_row["id"]), True):
+        return await inter.followup.send("That creature must wait before engaging in PvP again.", ephemeral=True)
+
     opp_rows = await pool.fetch(
         """
         SELECT c.id, c.name, c.owner_id, c.stats, c.current_hp, t.display_name
@@ -2661,11 +2707,11 @@ async def pvp(inter: discord.Interaction):
         """,
         inter.user.id,
     )
-    left_map = await _battles_left_map([int(r["id"]) for r in opp_rows])
+    pvp_map = await _pvp_ready_map([int(r["id"]) for r in opp_rows])
     opp_rows = [
         r
         for r in opp_rows
-        if left_map.get(int(r["id"]), 0) > 0
+        if pvp_map.get(int(r["id"]), True)
         and abs(sum(json.loads(r["stats"]).values()) - challenger_ovr) <= 50
     ]
     if not opp_rows:
@@ -2692,19 +2738,12 @@ async def pvp(inter: discord.Interaction):
             return await modal_inter.response.send_message(
                 f"Opponent only has {opp_tr['cash']} cash; reduce the wager.", ephemeral=True
             )
-        now = datetime.now(timezone.utc)
-        cd_rows = await pool.fetch(
-            "SELECT user_id, last_battle_at FROM pvp_records WHERE user_id = ANY($1)",
-            [[inter.user.id, opponent_id]],
-        )
-        cd = {r["user_id"]: r["last_battle_at"] for r in cd_rows}
-        for uid in (inter.user.id, opponent_id):
-            last = cd.get(uid)
-            if last and now - last < timedelta(hours=12):
-                who = "You" if uid == inter.user.id else "Opponent"
-                return await modal_inter.response.send_message(
-                    f"{who} must wait before engaging in another PvP battle.", ephemeral=True
-                )
+        ready_map = await _pvp_ready_map([int(c_row["id"]), int(opp_row["id"])])
+        if not all(ready_map.values()):
+            return await modal_inter.response.send_message(
+                "One of the creatures must wait before another PvP battle.",
+                ephemeral=True,
+            )
         opponent_user = bot.get_user(opponent_id) or await bot.fetch_user(opponent_id)
         opp_stats = json.loads(opp_row["stats"])
         opp_max_hp = opp_stats["HP"] * 5
@@ -2730,6 +2769,12 @@ async def pvp(inter: discord.Interaction):
                     return await interaction.response.send_message("This challenge isn't for you.", ephemeral=True)
                 if inter.user.id in active_battles or opponent_id in active_battles:
                     return await interaction.response.send_message("One of the participants is already in a battle.", ephemeral=True)
+                ready_map = await _pvp_ready_map([int(c_row["id"]), int(opp_row["id"])])
+                if not all(ready_map.values()):
+                    return await interaction.response.send_message(
+                        "One of the creatures must wait before another PvP battle.",
+                        ephemeral=True,
+                    )
                 global current_battler_id
                 if battle_lock.locked() and (current_battler_id not in (inter.user.id, opponent_id)):
                     return await interaction.response.send_message(

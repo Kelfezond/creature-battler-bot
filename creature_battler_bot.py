@@ -2114,7 +2114,10 @@ async def creatures(inter: discord.Interaction):
         glyph_disp = "-" if g <= 0 else str(g)
         overall = int(st.get("HP", 0) + st.get("AR", 0) + st.get("PATK", 0) + st.get("SATK", 0) + st.get("SPD", 0))
 
-        pvp_ready = r["not_listed"] and r["current_hp"] > 0 and pvp_ready_map.get(int(r["id"]), True)
+        # For PvP battles, creatures are fully healed at the start, so current HP
+        # shouldn't restrict eligibility. Only check that the creature isn't
+        # listed in the shop and respects the PvP cooldown map.
+        pvp_ready = r["not_listed"] and pvp_ready_map.get(int(r["id"]), True)
         pvp_icon = "✅" if pvp_ready else "❌"
 
         lines = [
@@ -2702,7 +2705,6 @@ async def pvp(inter: discord.Interaction):
         FROM creatures c
         JOIN trainers t ON t.user_id = c.owner_id
         WHERE c.owner_id <> $1
-          AND c.current_hp > 0
           AND NOT EXISTS (SELECT 1 FROM creature_shop cs WHERE cs.creature_id = c.id)
         """,
         inter.user.id,

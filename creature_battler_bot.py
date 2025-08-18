@@ -28,7 +28,7 @@ import asyncpg
 import discord
 from discord.ext import commands, tasks
 from openai import OpenAI
-from datetime import time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
 # ─── Basic config & logging ──────────────────────────────────
@@ -168,8 +168,11 @@ ALTER TABLE creature_records
 CREATE TABLE IF NOT EXISTS pvp_records (
   user_id BIGINT PRIMARY KEY,
   wins INT NOT NULL DEFAULT 0,
-  losses INT NOT NULL DEFAULT 0
+  losses INT NOT NULL DEFAULT 0,
+  last_battle_at TIMESTAMPTZ
 );
+ALTER TABLE pvp_records
+  ADD COLUMN IF NOT EXISTS last_battle_at TIMESTAMPTZ;
 
 -- Store the message we keep editing for the live leaderboard
 CREATE TABLE IF NOT EXISTS leaderboard_messages (
@@ -953,11 +956,12 @@ async def _record_pvp_result(user_id: int, won: bool):
     """Record a PvP win/loss for a trainer."""
     await (await db_pool()).execute(
         """
-        INSERT INTO pvp_records(user_id, wins, losses)
-        VALUES ($1, $2, $3)
+        INSERT INTO pvp_records(user_id, wins, losses, last_battle_at)
+        VALUES ($1, $2, $3, now())
         ON CONFLICT (user_id) DO UPDATE
         SET wins = pvp_records.wins + $2,
-            losses = pvp_records.losses + $3
+            losses = pvp_records.losses + $3,
+            last_battle_at = now()
         """,
         user_id,
         1 if won else 0,
@@ -2597,7 +2601,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             pass
 
 @bot.tree.command(description="Challenge another trainer to a PvP battle")
-async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.User, wager: int):
+async def pvp(inter: discord.Interaction, opponent: discord.User, wager: int):
     if opponent.id == inter.user.id:
         return await inter.response.send_message("You cannot challenge yourself.", ephemeral=True)
     if wager <= 0:
@@ -2617,44 +2621,62 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
         return await inter.response.send_message(
             f"Opponent only has {opp_tr['cash']} cash; reduce the wager below that.", ephemeral=True
         )
-    c_row = await pool.fetchrow(
-        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+    now = datetime.now(timezone.utc)
+    cd_rows = await pool.fetch(
+        "SELECT user_id, last_battle_at FROM pvp_records WHERE user_id = ANY($1)",
+        [[inter.user.id, opponent.id]],
+    )
+    cd = {r["user_id"]: r["last_battle_at"] for r in cd_rows}
+    for uid in (inter.user.id, opponent.id):
+        last = cd.get(uid)
+        if last and now - last < timedelta(hours=12):
+            who = "You" if uid == inter.user.id else "Opponent"
+            return await inter.response.send_message(
+                f"{who} must wait before engaging in another PvP battle.", ephemeral=True
+            )
+    my_creatures = await pool.fetch(
+        "SELECT id,name,stats FROM creatures WHERE owner_id=$1 AND NOT EXISTS (SELECT 1 FROM creature_shop cs WHERE cs.creature_id = creatures.id)",
         inter.user.id,
-        creature_name,
     )
-    if not c_row:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
-    listed = await pool.fetchval(
-        "SELECT 1 FROM creature_shop WHERE creature_id=$1",
-        c_row["id"],
-    )
-    if listed:
-        return await inter.response.send_message(
-            f"{c_row['name']} is listed in the shop and cannot battle.",
-            ephemeral=True,
-        )
+    if not my_creatures:
+        return await inter.response.send_message("You have no creatures.", ephemeral=True)
+    my_options = [discord.SelectOption(label=r["name"], value=str(r["id"])) for r in my_creatures]
+
+    class ChallengerSelect(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.selected = None
+
+        @discord.ui.select(placeholder="Select your creature", options=my_options)
+        async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+            if interaction.user.id != inter.user.id:
+                return await interaction.response.send_message("This menu isn't for you.", ephemeral=True)
+            self.selected = next(r for r in my_creatures if str(r["id"]) == select.values[0])
+            await interaction.response.defer()
+            self.stop()
+
+    my_view = ChallengerSelect()
+    await inter.response.send_message("Choose your creature:", view=my_view, ephemeral=True)
+    await my_view.wait()
+    if not my_view.selected:
+        return
+    c_row = my_view.selected
     stats = json.loads(c_row["stats"])
     max_hp = stats["HP"] * 5
     challenger_ovr = sum(stats.values())
-    if c_row["current_hp"] <= 0:
-        return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
     opp_creatures = await pool.fetch(
-        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND current_hp>0 AND "
-        "NOT EXISTS (SELECT 1 FROM creature_shop cs WHERE cs.creature_id = creatures.id)",
+        "SELECT id,name,stats FROM creatures WHERE owner_id=$1 AND NOT EXISTS (SELECT 1 FROM creature_shop cs WHERE cs.creature_id = creatures.id)",
         opponent.id,
     )
-    if not opp_creatures:
-        return await inter.response.send_message("Opponent has no available creature.", ephemeral=True)
     opp_creatures = [
         r
         for r in opp_creatures
         if abs(sum(json.loads(r["stats"]).values()) - challenger_ovr) <= 50
     ]
     if not opp_creatures:
-        return await inter.response.send_message(
+        return await inter.followup.send(
             "Opponent has no creature within 50 OVR of your creature.", ephemeral=True
         )
-
     options = [discord.SelectOption(label=r["name"], value=str(r["id"])) for r in opp_creatures]
 
     class OpponentSelectView(discord.ui.View):
@@ -2673,7 +2695,7 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
             self.stop()
 
     select_view = OpponentSelectView()
-    await inter.response.send_message(
+    await inter.followup.send(
         "Choose an opponent creature to challenge:", view=select_view, ephemeral=True
     )
     await select_view.wait()
@@ -2712,10 +2734,12 @@ async def pvp(inter: discord.Interaction, creature_name: str, opponent: discord.
             current_battler_id = inter.user.id
             try:
                 await interaction.response.defer(thinking=True)
+                await pool.execute("UPDATE creatures SET current_hp=$1 WHERE id=$2", max_hp, c_row["id"])
+                await pool.execute("UPDATE creatures SET current_hp=$1 WHERE id=$2", opp_max_hp, opp_cre["id"])
                 st = BattleState(
                     inter.user.id, c_row["id"], 0,
-                    {"name": c_row["name"], "stats": stats}, c_row["current_hp"], max_hp,
-                    {"name": opp_cre["name"], "stats": opp_stats}, opp_cre["current_hp"], opp_max_hp,
+                    {"name": c_row["name"], "stats": stats}, max_hp, max_hp,
+                    {"name": opp_cre["name"], "stats": opp_stats}, opp_max_hp, opp_max_hp,
                     logs=[], is_pvp=True, opp_user_id=opponent.id, opp_creature_id=opp_cre["id"], wager=wager, opp_trainer_name=opp_name
                 )
                 active_battles[inter.user.id] = st

@@ -51,6 +51,8 @@ logger.info("Using TEXT_MODEL=%s, IMAGE_MODEL=%s", TEXT_MODEL, IMAGE_MODEL)
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 # Optional: channel where the live creature shop is posted/updated.
 SHOP_CHANNEL_ID_ENV = os.getenv("SHOP_CHANNEL_ID")
+# Optional: channel where interactive controls are posted.
+CONTROLS_CHANNEL_ID_ENV = os.getenv("CONTROLS_CHANNEL_ID")
 
 # Admin allow-list for privileged commands (e.g., /cashadd, /setleaderboardchannel)
 def _parse_admin_ids(raw: Optional[str]) -> set[int]:
@@ -194,6 +196,12 @@ CREATE TABLE IF NOT EXISTS shop_messages (
 -- Encyclopedia target channel
 CREATE TABLE IF NOT EXISTS encyclopedia_channel (
   channel_id BIGINT PRIMARY KEY
+);
+
+-- Controls channel and message
+CREATE TABLE IF NOT EXISTS controls_messages (
+  channel_id BIGINT PRIMARY KEY,
+  message_id BIGINT
 );
 """
 
@@ -1321,6 +1329,63 @@ async def _get_shop_channel_id() -> Optional[int]:
     return None
 
 
+async def _get_controls_channel_id() -> Optional[int]:
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM controls_messages LIMIT 1")
+    if chan:
+        return int(chan)
+    if CONTROLS_CHANNEL_ID_ENV:
+        try:
+            return int(CONTROLS_CHANNEL_ID_ENV)
+        except Exception:
+            logger.error("CONTROLS_CHANNEL_ID env was set but not an integer.")
+    return None
+
+
+async def _get_or_create_controls_message(channel_id: int) -> Optional[discord.Message]:
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception as e:
+        logger.error("Failed to fetch controls channel %s: %s", channel_id, e)
+        return None
+
+    pool = await db_pool()
+    msg_id = await pool.fetchval(
+        "SELECT message_id FROM controls_messages WHERE channel_id=$1", channel_id
+    )
+
+    embed = discord.Embed(
+        title="Controls",
+        description="Use the buttons below to manage your trainer and creatures.",
+    )
+
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(int(msg_id))
+            await msg.edit(embed=embed, view=controls_view)
+            return msg
+        except Exception:
+            msg = None
+    else:
+        msg = None
+
+    try:
+        msg = await channel.send(embed=embed, view=controls_view)
+        await pool.execute(
+            """
+            INSERT INTO controls_messages(channel_id, message_id)
+            VALUES ($1,$2)
+            ON CONFLICT (channel_id) DO UPDATE SET message_id=EXCLUDED.message_id
+            """,
+            channel_id,
+            msg.id,
+        )
+        return msg
+    except Exception as e:
+        logger.error("Failed to create controls message: %s", e)
+        return None
+
+
 async def _get_or_create_shop_message(channel_id: int) -> Optional[discord.Message]:
     try:
         channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
@@ -1714,8 +1779,20 @@ async def setup_hook():
 
 @bot.event
 async def on_ready():
+    global _controls_message_posted
     logger.info("Logged in as %s", bot.user)
     try:
+        # Register persistent view for controls
+        bot.add_view(controls_view)
+        if not _controls_message_posted:
+            chan_id = await _get_controls_channel_id()
+            if chan_id:
+                await _get_or_create_controls_message(chan_id)
+                _controls_message_posted = True
+            else:
+                logger.info(
+                    "No controls channel configured yet. Use /setcontrolchannel in the desired channel or set CONTROLS_CHANNEL_ID."
+                )
         # No global sync here; setup_hook already handled guild/global registration and cleanup.
         synced = []
         logger.info("Ready. (%d commands)", len(synced))
@@ -1818,6 +1895,27 @@ async def setencyclopediachannel(inter: discord.Interaction):
     """, inter.channel.id)
 
     await inter.response.send_message(f"Encyclopedia channel set to {inter.channel.mention}.", ephemeral=True)
+
+@bot.tree.command(description="(Admin) Set this channel as the controls channel")
+async def setcontrolchannel(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute("DELETE FROM controls_messages")
+    await pool.execute(
+        "INSERT INTO controls_messages(channel_id, message_id) VALUES($1, NULL)",
+        inter.channel.id,
+    )
+    await inter.response.send_message(
+        f"Controls channel set to {inter.channel.mention}. Initializing…",
+        ephemeral=True,
+    )
+    await _get_or_create_controls_message(inter.channel.id)
+    global _controls_message_posted
+    _controls_message_posted = True
 
 @bot.tree.command(description="Register as a trainer")
 async def register(inter: discord.Interaction):
@@ -2209,8 +2307,8 @@ class ShopView(discord.ui.View):
     async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(BuyModal())
 
-@bot.tree.command(description="Rename one of your creatures")
-async def rename(inter: discord.Interaction, creature_name: str, new_name: str):
+async def _rename_creature(inter: discord.Interaction, creature_name: str, new_name: str):
+    """Core logic for renaming a creature."""
     row = await ensure_registered(inter)
     if not row:
         return
@@ -2259,6 +2357,11 @@ async def rename(inter: discord.Interaction, creature_name: str, new_name: str):
     )
     asyncio.create_task(update_leaderboard_now(reason="rename"))
     asyncio.create_task(update_shop_now(reason="rename"))
+
+
+@bot.tree.command(description="Rename one of your creatures")
+async def rename(inter: discord.Interaction):
+    await inter.response.send_modal(RenameModal())
 
 @bot.tree.command(description="Show glyphs and tier progress for a creature")
 async def glyphs(inter: discord.Interaction, creature_name: str):
@@ -2777,8 +2880,8 @@ async def trainerpoints(inter: discord.Interaction):
             ephemeral=True
         )
 
-@bot.tree.command(description="Train a creature stat")
-async def train(inter: discord.Interaction, creature_name: str, stat: str, increase: int):
+async def _train_creature(inter: discord.Interaction, creature_name: str, stat: str, increase: int):
+    """Core logic for training a creature."""
     stat = stat.upper()
     if stat not in PRIMARY_STATS:
         return await inter.response.send_message(
@@ -2833,6 +2936,11 @@ async def train(inter: discord.Interaction, creature_name: str, stat: str, incre
         f"{c['id']} – {creature_name.title()} trained: +{display_inc} {stat}{' (x2 personality bonus)' if mult == 2 else ''}.",
         ephemeral=True
     )
+
+
+@bot.tree.command(description="Train a creature stat")
+async def train(inter: discord.Interaction):
+    await inter.response.send_modal(TrainModal())
 
 @bot.tree.command(description="Show and confirm upgrading your training facility")
 async def upgrade(inter: discord.Interaction):
@@ -2982,6 +3090,62 @@ async def enc(inter: discord.Interaction, creature_name: str):
         return await inter.followup.send("Failed to post to the Encyclopedia channel.", ephemeral=True)
 
     await inter.followup.send(f"Added **{name}** to the Encyclopedia: {msg.jump_url}", ephemeral=True)
+
+
+# ─── Interactive controls (modals & buttons) ──────────────────
+
+class RenameModal(discord.ui.Modal, title="Rename Creature"):
+    creature_name: discord.ui.TextInput = discord.ui.TextInput(label="Current Name")
+    new_name: discord.ui.TextInput = discord.ui.TextInput(label="New Name")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _rename_creature(interaction, self.creature_name.value, self.new_name.value)
+
+
+class TrainModal(discord.ui.Modal, title="Train Creature"):
+    creature_name: discord.ui.TextInput = discord.ui.TextInput(label="Creature Name")
+    stat: discord.ui.TextInput = discord.ui.TextInput(label="Stat")
+    amount: discord.ui.TextInput = discord.ui.TextInput(label="Increase Amount")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            inc = int(self.amount.value)
+        except ValueError:
+            return await interaction.response.send_message("Amount must be an integer.", ephemeral=True)
+        await _train_creature(interaction, self.creature_name.value, self.stat.value, inc)
+
+
+class ControlsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Creatures", style=discord.ButtonStyle.secondary)
+    async def btn_creatures(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await creatures(interaction)
+
+    @discord.ui.button(label="Trainer Points", style=discord.ButtonStyle.secondary)
+    async def btn_tp(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await trainerpoints(interaction)
+
+    @discord.ui.button(label="Cash", style=discord.ButtonStyle.secondary)
+    async def btn_cash(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await cash(interaction)
+
+    @discord.ui.button(label="Upgrade", style=discord.ButtonStyle.primary)
+    async def btn_upgrade(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await upgrade(interaction)
+
+    @discord.ui.button(label="Train", style=discord.ButtonStyle.success)
+    async def btn_train(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TrainModal())
+
+    @discord.ui.button(label="Rename", style=discord.ButtonStyle.success)
+    async def btn_rename(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RenameModal())
+
+
+controls_view = ControlsView()
+_controls_message_posted = False
 
 @bot.tree.command(description="Show all commands and what they do")
 async def info(inter: discord.Interaction):

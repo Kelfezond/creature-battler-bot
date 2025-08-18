@@ -1387,6 +1387,10 @@ async def _get_or_create_controls_message(channel_id: int) -> Optional[discord.M
         logger.error("Failed to fetch controls channel %s: %s", channel_id, e)
         return None
 
+    global controls_view
+    if controls_view is None:
+        controls_view = ControlsView()
+
     pool = await db_pool()
     msg_id = await pool.fetchval(
         "SELECT message_id FROM controls_messages WHERE channel_id=$1",
@@ -3131,8 +3135,7 @@ class ControlsView(discord.ui.View):
     async def btn_rename(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RenameModal())
 
-
-controls_view = ControlsView()
+controls_view: Optional[ControlsView] = None
 
 @bot.tree.command(description="Show all commands and what they do")
 async def info(inter: discord.Interaction):

@@ -193,6 +193,12 @@ CREATE TABLE IF NOT EXISTS shop_messages (
   message_id BIGINT
 );
 
+-- Store the message we keep posting for the controls
+CREATE TABLE IF NOT EXISTS controls_messages (
+  channel_id BIGINT PRIMARY KEY,
+  message_id BIGINT
+);
+
 -- Encyclopedia target channel
 CREATE TABLE IF NOT EXISTS encyclopedia_channel (
   channel_id BIGINT PRIMARY KEY
@@ -1361,6 +1367,63 @@ async def _get_or_create_shop_message(channel_id: int) -> Optional[discord.Messa
     return message
 
 
+async def _get_controls_channel_id() -> Optional[int]:
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM controls_messages LIMIT 1")
+    if chan:
+        return int(chan)
+    if CONTROLS_CHANNEL_ID_ENV:
+        try:
+            return int(CONTROLS_CHANNEL_ID_ENV)
+        except Exception:
+            logger.error("CONTROLS_CHANNEL_ID env was set but not an integer.")
+    return None
+
+
+async def _get_or_create_controls_message(channel_id: int) -> Optional[discord.Message]:
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception as e:
+        logger.error("Failed to fetch controls channel %s: %s", channel_id, e)
+        return None
+
+    pool = await db_pool()
+    msg_id = await pool.fetchval(
+        "SELECT message_id FROM controls_messages WHERE channel_id=$1",
+        channel_id,
+    )
+
+    message: Optional[discord.Message] = None
+    if msg_id:
+        try:
+            message = await channel.fetch_message(int(msg_id))
+            bot.add_view(controls_view, message_id=message.id)
+        except Exception:
+            message = None
+
+    if message is None:
+        try:
+            embed = discord.Embed(
+                title="Controls",
+                description="Use the buttons below to manage your trainer and creatures.",
+            )
+            message = await channel.send(embed=embed, view=controls_view)
+            await pool.execute(
+                """
+                INSERT INTO controls_messages(channel_id, message_id)
+                VALUES ($1,$2)
+                ON CONFLICT (channel_id) DO UPDATE SET message_id=EXCLUDED.message_id
+                """,
+                channel_id,
+                message.id,
+            )
+        except Exception as e:
+            logger.error("Failed to create controls message: %s", e)
+            return None
+
+    return message
+
+
 async def update_shop_now(reason: str = "manual") -> None:
     channel_id = await _get_shop_channel_id()
     if not channel_id:
@@ -1714,25 +1777,16 @@ async def setup_hook():
     else:
         logger.info("No shop channel configured yet. Use /setshopchannel in the desired channel or set SHOP_CHANNEL_ID.")
 
+    controls_chan = await _get_controls_channel_id()
+    if controls_chan:
+        await _get_or_create_controls_message(controls_chan)
+    else:
+        logger.info("No controls channel configured yet. Use /setcontrolchannel in the desired channel or set CONTROLS_CHANNEL_ID.")
+
 @bot.event
 async def on_ready():
-    global _controls_message_posted
     logger.info("Logged in as %s", bot.user)
     try:
-        # Register persistent view for controls
-        bot.add_view(controls_view)
-        if CONTROLS_CHANNEL_ID_ENV and not _controls_message_posted:
-            try:
-                chan_id = int(CONTROLS_CHANNEL_ID_ENV)
-                channel = bot.get_channel(chan_id) or await bot.fetch_channel(chan_id)
-                embed = discord.Embed(
-                    title="Controls",
-                    description="Use the buttons below to manage your trainer and creatures.",
-                )
-                await channel.send(embed=embed, view=controls_view)
-                _controls_message_posted = True
-            except Exception as e:
-                logger.error("Failed to post controls message: %s", e)
         # No global sync here; setup_hook already handled guild/global registration and cleanup.
         synced = []
         logger.info("Ready. (%d commands)", len(synced))
@@ -1820,6 +1874,21 @@ async def setshopchannel(inter: discord.Interaction):
     await inter.response.send_message(f"Shop channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
     await _get_or_create_shop_message(inter.channel.id)
     await update_shop_now(reason="admin_set_channel")
+@bot.tree.command(description="(Admin) Set this channel as the controls channel")
+async def setcontrolchannel(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute("DELETE FROM controls_messages")
+    await pool.execute(
+        "INSERT INTO controls_messages(channel_id, message_id) VALUES($1, NULL)",
+        inter.channel.id,
+    )
+    await inter.response.send_message(f"Controls channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
+    await _get_or_create_controls_message(inter.channel.id)
 @bot.tree.command(description="(Admin) Set this channel as the Encyclopedia channel")
 async def setencyclopediachannel(inter: discord.Interaction):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -3064,7 +3133,6 @@ class ControlsView(discord.ui.View):
 
 
 controls_view = ControlsView()
-_controls_message_posted = False
 
 @bot.tree.command(description="Show all commands and what they do")
 async def info(inter: discord.Interaction):

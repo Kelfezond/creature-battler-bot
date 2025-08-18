@@ -2072,17 +2072,18 @@ async def creatures(inter: discord.Interaction):
         glyph_disp = "-" if g <= 0 else str(g)
         overall = int(st.get("HP", 0) + st.get("AR", 0) + st.get("PATK", 0) + st.get("SATK", 0) + st.get("SPD", 0))
 
-        ready = bool(r.get("not_listed")) and r["current_hp"] > 0 and left > 0
-        ready_icon = "✅" if ready else "❌"
+        ready = r["not_listed"] and r["current_hp"] > 0 and left > 0
+        pvp_icon = "✅" if ready else "❌"
 
         lines = [
-            f"{ready_icon} **{r['name']}** ({r['rarity']})",
+            f"**{r['name']}** ({r['rarity']})",
             f"{desc}",
             f"HP: {r['current_hp']}/{max_hp}",
             f"AR: {st.get('AR', 0)}  PATK: {st.get('PATK', 0)}  SATK: {st.get('SATK', 0)}  SPD: {st.get('SPD', 0)}",
             f"Overall: {overall}  |  Glyph: {glyph_disp}",
             f"Personality: { (personality.get('name') + ' (' + ','.join(personality.get('stats', [])) + ')') if personality else '-' }",
             f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**",
+            f"PvP: {pvp_icon}",
         ]
         msg = "\n".join(lines)
 

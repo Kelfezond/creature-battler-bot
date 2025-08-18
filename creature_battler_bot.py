@@ -2950,7 +2950,7 @@ async def upgrade(inter: discord.Interaction):
     ]
     if level >= MAX_FACILITY_LEVEL:
         msg.append("You're already at the **maximum level**. No further upgrades available.")
-        return await send_chunks(inter, "\n".join(msg), ephemeral=True)
+        return await inter.response.send_message("\n".join(msg), ephemeral=True)
 
     next_level = level + 1
     nxt = FACILITY_LEVELS[next_level]
@@ -2960,12 +2960,20 @@ async def upgrade(inter: discord.Interaction):
         f"New bonus: +{nxt['bonus']} (daily total = {daily_trainer_points_for(next_level)})",
         f"Description: {nxt['desc']}",
         "",
-        "Type `/upgradeyes` to confirm the upgrade if you can afford it."
+        "Confirm upgrade?"
     ]
-    await send_chunks(inter, "\n".join(msg), ephemeral=True)
+    await inter.response.send_message(
+        "\n".join(msg),
+        ephemeral=True,
+        view=UpgradeConfirmView(inter.user.id),
+    )
 
 @bot.tree.command(description="Confirm upgrading your training facility (costs cash)")
 async def upgradeyes(inter: discord.Interaction):
+    await _do_upgrade(inter)
+
+
+async def _do_upgrade(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if not row:
         return
@@ -2977,24 +2985,56 @@ async def upgradeyes(inter: discord.Interaction):
 
     next_level = level + 1
     cost = FACILITY_LEVELS[next_level]["cost"]
+
     if row["cash"] < cost:
         return await inter.response.send_message(
             f"Not enough cash. You need {cost} but only have {row['cash']}.",
-            ephemeral=True
+            ephemeral=True,
         )
 
     pool = await db_pool()
     await pool.execute(
         "UPDATE trainers SET cash = cash - $1, facility_level = facility_level + 1 WHERE user_id=$2",
-        cost, inter.user.id
+        cost,
+        inter.user.id,
     )
     new_bonus = FACILITY_LEVELS[next_level]["bonus"]
     await inter.response.send_message(
-        f"✅ Upgraded to **Level {next_level} – {FACILITY_LEVELS[next_level]['name']}**!\n"
+        f"✅ Upgraded to **Level {next_level} – {FACILITY_LEVELS[next_level]['name']}**!\n",
         f"Your facility now grants **+{new_bonus} trainer points/day** "
         f"(total {daily_trainer_points_for(next_level)}/day).",
-        ephemeral=True
+        ephemeral=True,
     )
+
+
+class UpgradeConfirmView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("This isn't your confirmation.", ephemeral=True)
+        await _do_upgrade(interaction)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("This isn't your confirmation.", ephemeral=True)
+        await interaction.response.send_message("Upgrade canceled.", ephemeral=True)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
 
 @bot.tree.command(description="Add one of your creatures to the Encyclopedia")
 async def enc(inter: discord.Interaction, creature_name: str):

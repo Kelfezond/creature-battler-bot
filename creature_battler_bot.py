@@ -3113,19 +3113,19 @@ class ControlsView(discord.ui.View):
 
     @discord.ui.button(label="Creatures", style=discord.ButtonStyle.secondary)
     async def btn_creatures(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await creatures(interaction)
+        await creatures.callback(interaction)
 
     @discord.ui.button(label="Trainer Points", style=discord.ButtonStyle.secondary)
     async def btn_tp(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await trainerpoints(interaction)
+        await trainerpoints.callback(interaction)
 
     @discord.ui.button(label="Cash", style=discord.ButtonStyle.secondary)
     async def btn_cash(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await cash(interaction)
+        await cash.callback(interaction)
 
     @discord.ui.button(label="Upgrade", style=discord.ButtonStyle.primary)
     async def btn_upgrade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await upgrade(interaction)
+        await upgrade.callback(interaction)
 
     @discord.ui.button(label="Train", style=discord.ButtonStyle.success)
     async def btn_train(self, interaction: discord.Interaction, button: discord.ui.Button):

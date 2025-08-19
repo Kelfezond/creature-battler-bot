@@ -51,6 +51,8 @@ logger.info("Using TEXT_MODEL=%s, IMAGE_MODEL=%s", TEXT_MODEL, IMAGE_MODEL)
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 # Optional: channel where the live creature shop is posted/updated.
 SHOP_CHANNEL_ID_ENV = os.getenv("SHOP_CHANNEL_ID")
+# Optional: channel where the item store is posted/updated.
+ITEM_STORE_CHANNEL_ID_ENV = os.getenv("ITEM_STORE_CHANNEL_ID")
 # Optional: channel where interactive controls are posted.
 CONTROLS_CHANNEL_ID_ENV = os.getenv("CONTROLS_CHANNEL_ID")
 
@@ -207,6 +209,20 @@ CREATE TABLE IF NOT EXISTS shop_messages (
   message_id BIGINT
 );
 
+-- Store the message we keep editing for the item store
+CREATE TABLE IF NOT EXISTS item_store_messages (
+  channel_id BIGINT PRIMARY KEY,
+  message_id BIGINT
+);
+
+-- Per-trainer inventory of items
+CREATE TABLE IF NOT EXISTS trainer_items (
+  user_id BIGINT NOT NULL,
+  item_name TEXT NOT NULL,
+  quantity INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, item_name)
+);
+
 -- Store the message we keep posting for the controls
 CREATE TABLE IF NOT EXISTS controls_messages (
   channel_id BIGINT PRIMARY KEY,
@@ -236,6 +252,9 @@ SELL_PRICES: Dict[str, int] = {
     "Epic": 20_000,
     "Legendary": 50_000,
 }
+
+SMALL_HEALING_INJECTOR = "Small Healing Injector"
+SMALL_HEALING_INJECTOR_PRICE = 26_000
 
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -1425,6 +1444,57 @@ async def _get_or_create_shop_message(channel_id: int) -> Optional[discord.Messa
     return message
 
 
+async def _get_item_store_channel_id() -> Optional[int]:
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM item_store_messages LIMIT 1")
+    if chan:
+        return int(chan)
+    if ITEM_STORE_CHANNEL_ID_ENV:
+        try:
+            return int(ITEM_STORE_CHANNEL_ID_ENV)
+        except Exception:
+            logger.error("ITEM_STORE_CHANNEL_ID env was set but not an integer.")
+    return None
+
+
+async def _get_or_create_item_store_message(channel_id: int) -> Optional[discord.Message]:
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception as e:
+        logger.error("Failed to fetch item store channel %s: %s", channel_id, e)
+        return None
+
+    pool = await db_pool()
+    msg_id = await pool.fetchval(
+        "SELECT message_id FROM item_store_messages WHERE channel_id=$1", channel_id
+    )
+
+    message: Optional[discord.Message] = None
+    if msg_id:
+        try:
+            message = await channel.fetch_message(int(msg_id))
+        except Exception:
+            message = None
+
+    if message is None:
+        try:
+            message = await channel.send("Initializing item store…")
+            await pool.execute(
+                """
+                INSERT INTO item_store_messages(channel_id, message_id)
+                VALUES ($1,$2)
+                ON CONFLICT (channel_id) DO UPDATE SET message_id=EXCLUDED.message_id
+                """,
+                channel_id,
+                message.id,
+            )
+        except Exception as e:
+            logger.error("Failed to create item store message: %s", e)
+            return None
+
+    return message
+
+
 async def _get_controls_channel_id() -> Optional[int]:
     pool = await db_pool()
     chan = await pool.fetchval("SELECT channel_id FROM controls_messages LIMIT 1")
@@ -1544,6 +1614,30 @@ async def update_shop_now(reason: str = "manual") -> None:
 @tasks.loop(minutes=5)
 async def update_shop_periodic():
     await update_shop_now(reason="periodic")
+
+
+async def update_item_store_now(reason: str = "manual") -> None:
+    channel_id = await _get_item_store_channel_id()
+    if not channel_id:
+        return
+    message = await _get_or_create_item_store_message(channel_id)
+    if message is None:
+        return
+    updated_ts = int(time.time())
+    embed = discord.Embed(
+        title="Item Store",
+        description=f"Updated: <t:{updated_ts}:R>",
+    )
+    embed.add_field(
+        name=SMALL_HEALING_INJECTOR,
+        value=f"Price: {SMALL_HEALING_INJECTOR_PRICE}",
+        inline=False,
+    )
+    try:
+        await message.edit(content=None, embed=embed, view=ItemStoreView())
+        logger.info("Item store updated (%s).", reason)
+    except Exception as e:
+        logger.error("Failed to edit item store message: %s", e)
 
 # ─── Battle finalize (records + leaderboard) ─────────────────
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
@@ -1846,6 +1940,13 @@ async def setup_hook():
     else:
         logger.info("No shop channel configured yet. Use /setshopchannel in the desired channel or set SHOP_CHANNEL_ID.")
 
+    item_chan = await _get_item_store_channel_id()
+    if item_chan:
+        await _get_or_create_item_store_message(item_chan)
+        await update_item_store_now(reason="startup")
+    else:
+        logger.info("No item store channel configured yet. Use /setitemstore in the desired channel or set ITEM_STORE_CHANNEL_ID.")
+
     controls_chan = await _get_controls_channel_id()
     if controls_chan:
         await _get_or_create_controls_message(controls_chan)
@@ -1943,6 +2044,26 @@ async def setshopchannel(inter: discord.Interaction):
     await inter.response.send_message(f"Shop channel set to {inter.channel.mention}. Initializing…", ephemeral=True)
     await _get_or_create_shop_message(inter.channel.id)
     await update_shop_now(reason="admin_set_channel")
+
+@bot.tree.command(description="(Admin) Set this channel as the item store channel")
+async def setitemstore(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute("DELETE FROM item_store_messages")
+    await pool.execute(
+        "INSERT INTO item_store_messages(channel_id, message_id) VALUES($1, NULL)",
+        inter.channel.id,
+    )
+    await inter.response.send_message(
+        f"Item store channel set to {inter.channel.mention}. Initializing…",
+        ephemeral=True,
+    )
+    await _get_or_create_item_store_message(inter.channel.id)
+    await update_item_store_now(reason="admin_set_channel")
 @bot.tree.command(description="(Admin) Set this channel as the controls channel")
 async def setcontrolchannel(inter: discord.Interaction):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -2337,6 +2458,36 @@ async def buy(inter: discord.Interaction, creature_name: str):
     asyncio.create_task(update_shop_now(reason="buy"))
     asyncio.create_task(update_leaderboard_now(reason="buy"))
 
+
+async def _buy_item(inter: discord.Interaction, quantity: int):
+    if quantity <= 0:
+        return await inter.response.send_message("Quantity must be positive.", ephemeral=True)
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    cost = SMALL_HEALING_INJECTOR_PRICE * quantity
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        cash = await conn.fetchval("SELECT cash FROM trainers WHERE user_id=$1", inter.user.id)
+        if cash is None or cash < cost:
+            return await inter.response.send_message("You don't have enough cash.", ephemeral=True)
+        await conn.execute("UPDATE trainers SET cash = cash - $1 WHERE user_id=$2", cost, inter.user.id)
+        await conn.execute(
+            """
+            INSERT INTO trainer_items(user_id, item_name, quantity)
+            VALUES ($1,$2,$3)
+            ON CONFLICT (user_id, item_name)
+            DO UPDATE SET quantity = trainer_items.quantity + EXCLUDED.quantity
+            """,
+            inter.user.id,
+            SMALL_HEALING_INJECTOR,
+            quantity,
+        )
+    await inter.response.send_message(
+        f"Purchased {quantity} {SMALL_HEALING_INJECTOR}(s).", ephemeral=True
+    )
+    asyncio.create_task(update_item_store_now(reason="buy"))
+
 class SellModal(discord.ui.Modal, title="Sell Creature"):
     creature_name = discord.ui.TextInput(label="Creature Name")
     price = discord.ui.TextInput(label="Price")
@@ -2378,6 +2529,26 @@ class ShopView(discord.ui.View):
     @discord.ui.button(label="Buy", style=discord.ButtonStyle.green)
     async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(BuyModal())
+
+
+class BuyItemModal(discord.ui.Modal, title="Buy Item"):
+    quantity = discord.ui.TextInput(label="Quantity")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            qty = int(self.quantity.value)
+        except ValueError:
+            return await interaction.response.send_message("Quantity must be an integer.", ephemeral=True)
+        await _buy_item(interaction, qty)
+
+
+class ItemStoreView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green)
+    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BuyItemModal())
 
 async def _rename_creature(inter: discord.Interaction, creature_name: str, new_name: str):
     """Core logic for renaming a creature."""
@@ -3282,8 +3453,74 @@ class RenameCreatureModal(discord.ui.Modal):
         await _rename_creature(interaction, self.creature_name, self.new_name.value)
 
 
+async def _use_small_healing_injector(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        c_row = await conn.fetchrow(
+            "SELECT id, name, stats, current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            inter.user.id,
+            creature_name,
+        )
+        if not c_row:
+            return await inter.response.send_message("Creature not found.", ephemeral=True)
+        qty = await conn.fetchval(
+            "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            SMALL_HEALING_INJECTOR,
+        )
+        if not qty or int(qty) <= 0:
+            return await inter.response.send_message("You don't have any Small Healing Injectors.", ephemeral=True)
+        stats = json.loads(c_row["stats"])
+        max_hp = int(stats.get("HP", 0)) * 5
+        heal_amount = max(1, math.floor(max_hp * 0.25))
+        new_hp = min(int(c_row["current_hp"]) + heal_amount, max_hp)
+        healed = new_hp - int(c_row["current_hp"])
+        await conn.execute("UPDATE creatures SET current_hp=$1 WHERE id=$2", new_hp, c_row["id"])
+        await conn.execute(
+            "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            SMALL_HEALING_INJECTOR,
+        )
+    await inter.response.send_message(
+        f"Healed **{c_row['name']}** for {healed} HP.", ephemeral=True
+    )
+
+
+async def _show_item_menu(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    qty = await (await db_pool()).fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        SMALL_HEALING_INJECTOR,
+    )
+    qty = int(qty or 0)
+    if qty <= 0:
+        return await inter.response.send_message("You have no items.", ephemeral=True)
+    await inter.response.send_message(
+        f"Choose an item for {creature_name}:",
+        ephemeral=True,
+        view=UseItemView(creature_name, qty),
+    )
+
+
+class UseItemView(discord.ui.View):
+    def __init__(self, creature_name: str, qty: int):
+        super().__init__(timeout=None)
+        self.creature_name = creature_name
+        self.use_injector.label = f"{SMALL_HEALING_INJECTOR} ({qty})"
+
+    @discord.ui.button(label="Use", style=discord.ButtonStyle.primary)
+    async def use_injector(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _use_small_healing_injector(interaction, self.creature_name)
+
+
 class CreatureView(discord.ui.View):
-    """View with a rename button for a single creature."""
+    """View with rename and item buttons for a single creature."""
 
     def __init__(self, creature_name: str):
         super().__init__(timeout=None)
@@ -3292,6 +3529,10 @@ class CreatureView(discord.ui.View):
     @discord.ui.button(label="Rename", style=discord.ButtonStyle.success)
     async def btn_rename(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RenameCreatureModal(self.creature_name))
+
+    @discord.ui.button(label="Item", style=discord.ButtonStyle.primary)
+    async def btn_item(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _show_item_menu(interaction, self.creature_name)
 
 
 class TrainModal(discord.ui.Modal, title="Train Creature"):

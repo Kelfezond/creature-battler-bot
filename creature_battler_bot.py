@@ -121,6 +121,9 @@ ALTER TABLE creatures
 ALTER TABLE creatures
   ADD COLUMN IF NOT EXISTS personality JSONB;
 
+ALTER TABLE creatures
+  ADD COLUMN IF NOT EXISTS last_hp_regen TIMESTAMPTZ;
+
 -- store display names for leaderboards
 ALTER TABLE trainers
   ADD COLUMN IF NOT EXISTS display_name TEXT;
@@ -418,15 +421,27 @@ async def _catch_up_trainer_points_now():
 
 @tasks.loop(hours=12)
 async def regenerate_hp():
-    await (await db_pool()).execute("""
-        UPDATE creatures
-        SET current_hp = LEAST(
-            COALESCE(current_hp, (stats->>'HP')::int * 5)
-            + CEIL((stats->>'HP')::numeric * 1.0),
-            (stats->>'HP')::int * 5
+    now = datetime.now(timezone.utc)
+    await (await db_pool()).execute(
+        """
+        WITH regen AS (
+            SELECT id,
+                   FLOOR(EXTRACT(EPOCH FROM ($1 - COALESCE(last_hp_regen, $1 - INTERVAL '12 hours'))) / 43200) AS cycles
+            FROM creatures
         )
-    """)
-    logger.info("Regenerated 20%% HP for all creatures")
+        UPDATE creatures c
+        SET current_hp = LEAST(
+                COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
+                + CEIL((c.stats->>'HP')::numeric * 1.0) * r.cycles,
+                (c.stats->>'HP')::int * 5
+            ),
+            last_hp_regen = CASE WHEN r.cycles > 0 THEN $1 ELSE c.last_hp_regen END
+        FROM regen r
+        WHERE c.id = r.id AND r.cycles > 0
+        """,
+        now,
+    )
+    logger.info("Regenerated HP for creatures needing it")
 
 # ─── Utility functions ───────────────────────────────────────
 def roll_d100() -> int: return random.randint(1, 100)
@@ -2046,8 +2061,8 @@ async def spawn(inter: discord.Interaction):
     personality = choose_personality()
 
     rec = await (await db_pool()).fetchrow(
-        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp,personality)"
-        " VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp,personality,last_hp_regen)"
+        " VALUES($1,$2,$3,$4,$5,$6,$7, now()) RETURNING id",
         inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp, json.dumps(personality)
     )
     await _ensure_record(inter.user.id, rec["id"], meta["name"], ovr)

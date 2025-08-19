@@ -2147,7 +2147,7 @@ async def creatures(inter: discord.Interaction):
         ]
         msg = "\n".join(lines)
 
-        await inter.followup.send(msg, ephemeral=True)
+        await inter.followup.send(msg, ephemeral=True, view=CreatureView(r["name"]))
 
 @bot.tree.command(description="See your creature's lifetime win/loss record")
 async def record(inter: discord.Interaction, creature_name: str):
@@ -3269,6 +3269,31 @@ class RenameModal(discord.ui.Modal, title="Rename Creature"):
         await _rename_creature(interaction, self.creature_name.value, self.new_name.value)
 
 
+class RenameCreatureModal(discord.ui.Modal):
+    """Modal that only asks for a new name for a specific creature."""
+
+    def __init__(self, creature_name: str):
+        super().__init__(title=f"Rename {creature_name}")
+        self.creature_name = creature_name
+        self.new_name: discord.ui.TextInput = discord.ui.TextInput(label="New Name")
+        self.add_item(self.new_name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _rename_creature(interaction, self.creature_name, self.new_name.value)
+
+
+class CreatureView(discord.ui.View):
+    """View with a rename button for a single creature."""
+
+    def __init__(self, creature_name: str):
+        super().__init__(timeout=None)
+        self.creature_name = creature_name
+
+    @discord.ui.button(label="Rename", style=discord.ButtonStyle.success)
+    async def btn_rename(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RenameCreatureModal(self.creature_name))
+
+
 class TrainModal(discord.ui.Modal, title="Train Creature"):
     creature_name: discord.ui.TextInput = discord.ui.TextInput(label="Creature Name")
     stat: discord.ui.TextInput = discord.ui.TextInput(label="Stat")
@@ -3323,14 +3348,6 @@ class ControlsView(discord.ui.View):
     )
     async def btn_upgrade(self, interaction: discord.Interaction, button: discord.ui.Button):
         await upgrade.callback(interaction)
-
-    @discord.ui.button(
-        label="Rename",
-        style=discord.ButtonStyle.success,
-        custom_id="controls_rename",
-    )
-    async def btn_rename(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RenameModal())
 
 controls_view: Optional[ControlsView] = None
 

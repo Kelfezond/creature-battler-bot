@@ -3000,12 +3000,12 @@ async def trainerpoints(inter: discord.Interaction):
         level = row["facility_level"]
         bonus = facility_bonus(level)
         daily = 5 + bonus
-        await inter.response.send_message(
+        msg = (
             f"You have {row['trainer_points']} points. "
             f"Facility Level {level} ({FACILITY_LEVELS[level]['name']}) gives +{bonus} extra per day "
-            f"(total {daily}/day).",
-            ephemeral=True
+            f"(total {daily}/day)."
         )
+        await inter.response.send_message(msg, ephemeral=True, view=TrainerPointsView())
 
 async def _train_creature(inter: discord.Interaction, creature_name: str, stat: str, increase: int):
     """Core logic for training a creature."""
@@ -3282,6 +3282,12 @@ class TrainModal(discord.ui.Modal, title="Train Creature"):
         await _train_creature(interaction, self.creature_name.value, self.stat.value, inc)
 
 
+class TrainerPointsView(discord.ui.View):
+    @discord.ui.button(label="Train", style=discord.ButtonStyle.success)
+    async def btn_train(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TrainModal())
+
+
 class ControlsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -3317,14 +3323,6 @@ class ControlsView(discord.ui.View):
     )
     async def btn_upgrade(self, interaction: discord.Interaction, button: discord.ui.Button):
         await upgrade.callback(interaction)
-
-    @discord.ui.button(
-        label="Train",
-        style=discord.ButtonStyle.success,
-        custom_id="controls_train",
-    )
-    async def btn_train(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(TrainModal())
 
     @discord.ui.button(
         label="Rename",

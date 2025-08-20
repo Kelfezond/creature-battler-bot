@@ -537,7 +537,7 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
         return False
     return True
 
-async def generate_creature_meta(rarity: str) -> Dict[str, Any]:
+async def generate_creature_meta(rarity: str) -> Dict[str, Any] | None:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
     used_names = [r["name"].lower() for r in rows]
@@ -564,7 +564,7 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
                     input=prompt,
                     max_output_tokens=MAX_OUTPUT_TOKENS,
                 )),
-                timeout=20.0
+                timeout=30.0
             )
             text = (getattr(resp, 'output_text', '') or '').strip()
             if not text:
@@ -583,7 +583,7 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
             logger.warning("generate_creature_meta timed out; retrying…")
         except Exception as e:
             logger.error("OpenAI error: %s", e)
-    return {"name": f"Wild{random.randint(1000,9999)}", "descriptors": []}
+    return None
 
 # ─── Name-only generator for battles ─────────────────────────
 
@@ -2224,6 +2224,15 @@ async def spawn(inter: discord.Interaction):
 
     rarity = spawn_rarity()
     meta = await generate_creature_meta(rarity)
+    if not meta:
+        await (await db_pool()).execute(
+            "UPDATE trainers SET cash = cash + 10000 WHERE user_id=$1", inter.user.id
+        )
+        await inter.followup.send(
+            "Creature generation timed out. 10,000 cash has been reimbursed.",
+            ephemeral=True,
+        )
+        return
     stats = allocate_stats(rarity)
     ovr = int(sum(stats.values()))
     max_hp = stats["HP"] * 5

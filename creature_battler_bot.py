@@ -257,6 +257,8 @@ SMALL_HEALING_INJECTOR = "Small Healing Injector"
 SMALL_HEALING_INJECTOR_PRICE = 26_000
 LARGE_HEALING_INJECTOR = "Large Healing Injector"
 LARGE_HEALING_INJECTOR_PRICE = 34_000
+FULL_HEALING_INJECTOR = "Full Healing Injector"
+FULL_HEALING_INJECTOR_PRICE = 45_000
 
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -1640,6 +1642,11 @@ async def update_item_store_now(reason: str = "manual") -> None:
         value=f"Price: {LARGE_HEALING_INJECTOR_PRICE}",
         inline=False,
     )
+    embed.add_field(
+        name=FULL_HEALING_INJECTOR,
+        value=f"Price: {FULL_HEALING_INJECTOR_PRICE}",
+        inline=False,
+    )
     try:
         await message.edit(content=None, embed=embed, view=ItemStoreView())
         logger.info("Item store updated (%s).", reason)
@@ -2476,6 +2483,9 @@ async def _buy_item(inter: discord.Interaction, item_name: str, quantity: int):
     elif item_key == LARGE_HEALING_INJECTOR.lower():
         item_const = LARGE_HEALING_INJECTOR
         price = LARGE_HEALING_INJECTOR_PRICE
+    elif item_key == FULL_HEALING_INJECTOR.lower():
+        item_const = FULL_HEALING_INJECTOR
+        price = FULL_HEALING_INJECTOR_PRICE
     else:
         return await inter.response.send_message("Unknown item.", ephemeral=True)
     row = await ensure_registered(inter)
@@ -3542,6 +3552,41 @@ async def _use_large_healing_injector(inter: discord.Interaction, creature_name:
     )
 
 
+async def _use_full_healing_injector(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        c_row = await conn.fetchrow(
+            "SELECT id, name, stats, current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            inter.user.id,
+            creature_name,
+        )
+        if not c_row:
+            return await inter.response.send_message("Creature not found.", ephemeral=True)
+        qty = await conn.fetchval(
+            "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            FULL_HEALING_INJECTOR,
+        )
+        if not qty or int(qty) <= 0:
+            return await inter.response.send_message("You don't have any Full Healing Injectors.", ephemeral=True)
+        stats = json.loads(c_row["stats"])
+        max_hp = int(stats.get("HP", 0)) * 5
+        new_hp = max_hp
+        healed = new_hp - int(c_row["current_hp"])
+        await conn.execute("UPDATE creatures SET current_hp=$1 WHERE id=$2", new_hp, c_row["id"])
+        await conn.execute(
+            "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            FULL_HEALING_INJECTOR,
+        )
+    await inter.response.send_message(
+        f"Healed **{c_row['name']}** for {healed} HP.", ephemeral=True
+    )
+
+
 async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
@@ -3557,25 +3602,33 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         inter.user.id,
         LARGE_HEALING_INJECTOR,
     )
+    qty_full = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        FULL_HEALING_INJECTOR,
+    )
     qty_small = int(qty_small or 0)
     qty_large = int(qty_large or 0)
-    if qty_small <= 0 and qty_large <= 0:
+    qty_full = int(qty_full or 0)
+    if qty_small <= 0 and qty_large <= 0 and qty_full <= 0:
         return await inter.response.send_message("You have no items.", ephemeral=True)
     await inter.response.send_message(
         f"Choose an item for {creature_name}:",
         ephemeral=True,
-        view=UseItemView(creature_name, qty_small, qty_large),
+        view=UseItemView(creature_name, qty_small, qty_large, qty_full),
     )
 
 
 class UseItemView(discord.ui.View):
-    def __init__(self, creature_name: str, small_qty: int, large_qty: int):
+    def __init__(self, creature_name: str, small_qty: int, large_qty: int, full_qty: int):
         super().__init__(timeout=None)
         self.creature_name = creature_name
         self.use_small.label = f"{SMALL_HEALING_INJECTOR} ({small_qty})"
         self.use_small.disabled = small_qty <= 0
         self.use_large.label = f"{LARGE_HEALING_INJECTOR} ({large_qty})"
         self.use_large.disabled = large_qty <= 0
+        self.use_full.label = f"{FULL_HEALING_INJECTOR} ({full_qty})"
+        self.use_full.disabled = full_qty <= 0
 
     @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_small(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3584,6 +3637,10 @@ class UseItemView(discord.ui.View):
     @discord.ui.button(label=LARGE_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_large(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _use_large_healing_injector(interaction, self.creature_name)
+
+    @discord.ui.button(label=FULL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
+    async def use_full(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _use_full_healing_injector(interaction, self.creature_name)
 
 
 class CreatureView(discord.ui.View):

@@ -2570,19 +2570,19 @@ class ItemStoreView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green, row=0)
     async def buy_small(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
             BuyItemModal(SMALL_HEALING_INJECTOR, SMALL_HEALING_INJECTOR_PRICE)
         )
 
-    @discord.ui.button(label=LARGE_HEALING_INJECTOR, style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green, row=1)
     async def buy_large(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
             BuyItemModal(LARGE_HEALING_INJECTOR, LARGE_HEALING_INJECTOR_PRICE)
         )
 
-    @discord.ui.button(label=FULL_HEALING_INJECTOR, style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green, row=2)
     async def buy_full(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
             BuyItemModal(FULL_HEALING_INJECTOR, FULL_HEALING_INJECTOR_PRICE)

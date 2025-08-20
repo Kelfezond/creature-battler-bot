@@ -259,6 +259,8 @@ LARGE_HEALING_INJECTOR = "Large Healing Injector"
 LARGE_HEALING_INJECTOR_PRICE = 34_000
 FULL_HEALING_INJECTOR = "Full Healing Injector"
 FULL_HEALING_INJECTOR_PRICE = 45_000
+EXHAUSTION_ELIMINATOR = "Exhaustion Eliminator"
+EXHAUSTION_ELIMINATOR_PRICE = 60_000
 
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -1647,6 +1649,11 @@ async def update_item_store_now(reason: str = "manual") -> None:
         value=f"Price: {FULL_HEALING_INJECTOR_PRICE}",
         inline=False,
     )
+    embed.add_field(
+        name=EXHAUSTION_ELIMINATOR,
+        value=f"Price: {EXHAUSTION_ELIMINATOR_PRICE}",
+        inline=False,
+    )
     try:
         await message.edit(content=None, embed=embed, view=ItemStoreView())
         logger.info("Item store updated (%s).", reason)
@@ -2486,6 +2493,9 @@ async def _buy_item(inter: discord.Interaction, item_name: str, quantity: int):
     elif item_key == FULL_HEALING_INJECTOR.lower():
         item_const = FULL_HEALING_INJECTOR
         price = FULL_HEALING_INJECTOR_PRICE
+    elif item_key == EXHAUSTION_ELIMINATOR.lower():
+        item_const = EXHAUSTION_ELIMINATOR
+        price = EXHAUSTION_ELIMINATOR_PRICE
     else:
         return await inter.response.send_message("Unknown item.", ephemeral=True)
     row = await ensure_registered(inter)
@@ -3587,6 +3597,63 @@ async def _use_full_healing_injector(inter: discord.Interaction, creature_name: 
     )
 
 
+async def _use_exhaustion_eliminator(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        c_row = await conn.fetchrow(
+            "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            inter.user.id,
+            creature_name,
+        )
+        if not c_row:
+            return await inter.response.send_message("Creature not found.", ephemeral=True)
+        qty = await conn.fetchval(
+            "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            EXHAUSTION_ELIMINATOR,
+        )
+        if not qty or int(qty) <= 0:
+            return await inter.response.send_message("You don't have any Exhaustion Eliminators.", ephemeral=True)
+        async with conn.transaction():
+            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+            row_cap = await conn.fetchrow(
+                "SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE",
+                c_row["id"],
+                day,
+            )
+            if not row_cap or int(row_cap["count"]) <= 0:
+                return await inter.response.send_message(
+                    f"**{c_row['name']}** already has 2/2 battles remaining today.",
+                    ephemeral=True,
+                )
+            current = int(row_cap["count"])
+            new_count = current - 1
+            if new_count == 0:
+                await conn.execute(
+                    "DELETE FROM battle_caps WHERE creature_id=$1 AND day=$2",
+                    c_row["id"],
+                    day,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2",
+                    c_row["id"],
+                    day,
+                    new_count,
+                )
+            await conn.execute(
+                "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+                inter.user.id,
+                EXHAUSTION_ELIMINATOR,
+            )
+    await inter.response.send_message(
+        f"Restored one daily battle for **{c_row['name']}**.", ephemeral=True
+    )
+
+
 async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
@@ -3607,20 +3674,38 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         inter.user.id,
         FULL_HEALING_INJECTOR,
     )
+    qty_exhaust = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        EXHAUSTION_ELIMINATOR,
+    )
     qty_small = int(qty_small or 0)
     qty_large = int(qty_large or 0)
     qty_full = int(qty_full or 0)
-    if qty_small <= 0 and qty_large <= 0 and qty_full <= 0:
+    qty_exhaust = int(qty_exhaust or 0)
+    if (
+        qty_small <= 0
+        and qty_large <= 0
+        and qty_full <= 0
+        and qty_exhaust <= 0
+    ):
         return await inter.response.send_message("You have no items.", ephemeral=True)
     await inter.response.send_message(
         f"Choose an item for {creature_name}:",
         ephemeral=True,
-        view=UseItemView(creature_name, qty_small, qty_large, qty_full),
+        view=UseItemView(creature_name, qty_small, qty_large, qty_full, qty_exhaust),
     )
 
 
 class UseItemView(discord.ui.View):
-    def __init__(self, creature_name: str, small_qty: int, large_qty: int, full_qty: int):
+    def __init__(
+        self,
+        creature_name: str,
+        small_qty: int,
+        large_qty: int,
+        full_qty: int,
+        exhaust_qty: int,
+    ):
         super().__init__(timeout=None)
         self.creature_name = creature_name
         self.use_small.label = f"{SMALL_HEALING_INJECTOR} ({small_qty})"
@@ -3629,6 +3714,8 @@ class UseItemView(discord.ui.View):
         self.use_large.disabled = large_qty <= 0
         self.use_full.label = f"{FULL_HEALING_INJECTOR} ({full_qty})"
         self.use_full.disabled = full_qty <= 0
+        self.use_exhaust.label = f"{EXHAUSTION_ELIMINATOR} ({exhaust_qty})"
+        self.use_exhaust.disabled = exhaust_qty <= 0
 
     @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_small(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3641,6 +3728,10 @@ class UseItemView(discord.ui.View):
     @discord.ui.button(label=FULL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_full(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _use_full_healing_injector(interaction, self.creature_name)
+
+    @discord.ui.button(label=EXHAUSTION_ELIMINATOR, style=discord.ButtonStyle.primary)
+    async def use_exhaust(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _use_exhaustion_eliminator(interaction, self.creature_name)
 
 
 class CreatureView(discord.ui.View):

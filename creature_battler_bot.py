@@ -255,18 +255,25 @@ SELL_PRICES: Dict[str, int] = {
 
 SMALL_HEALING_INJECTOR = "Small Healing Injector"
 SMALL_HEALING_INJECTOR_PRICE = 26_000
+SMALL_HEALING_INJECTOR_DESC = "Heals a creature for 25% of its max HP."
 LARGE_HEALING_INJECTOR = "Large Healing Injector"
 LARGE_HEALING_INJECTOR_PRICE = 34_000
+LARGE_HEALING_INJECTOR_DESC = "Heals a creature for 50% of its max HP."
 FULL_HEALING_INJECTOR = "Full Healing Injector"
 FULL_HEALING_INJECTOR_PRICE = 45_000
+FULL_HEALING_INJECTOR_DESC = "Fully restores a creature's HP."
 STAT_TRAINER = "Stat Trainer"
 STAT_TRAINER_PRICE = 52_500
+STAT_TRAINER_DESC = "Train one stat by +1 (HP +5)."
 PREMIUM_STAT_TRAINER = "Premium Stat Trainer"
 PREMIUM_STAT_TRAINER_PRICE = 235_000
+PREMIUM_STAT_TRAINER_DESC = "Train all stats by +1."
 EXHAUSTION_ELIMINATOR = "Exhaustion Eliminator"
 EXHAUSTION_ELIMINATOR_PRICE = 60_000
+EXHAUSTION_ELIMINATOR_DESC = "Restores one daily battle use."
 GENETIC_RESHUFFLER = "Genetic Reshuffler"
 GENETIC_RESHUFFLER_PRICE = 35_000
+GENETIC_RESHUFFLER_DESC = "Randomizes a creature's personality."
 
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -1642,37 +1649,37 @@ async def update_item_store_now(reason: str = "manual") -> None:
     )
     embed.add_field(
         name=SMALL_HEALING_INJECTOR,
-        value=f"Price: {SMALL_HEALING_INJECTOR_PRICE}",
+        value=f"Price: {SMALL_HEALING_INJECTOR_PRICE}\n{SMALL_HEALING_INJECTOR_DESC}",
         inline=False,
     )
     embed.add_field(
         name=LARGE_HEALING_INJECTOR,
-        value=f"Price: {LARGE_HEALING_INJECTOR_PRICE}",
+        value=f"Price: {LARGE_HEALING_INJECTOR_PRICE}\n{LARGE_HEALING_INJECTOR_DESC}",
         inline=False,
     )
     embed.add_field(
         name=FULL_HEALING_INJECTOR,
-        value=f"Price: {FULL_HEALING_INJECTOR_PRICE}",
+        value=f"Price: {FULL_HEALING_INJECTOR_PRICE}\n{FULL_HEALING_INJECTOR_DESC}",
         inline=False,
     )
     embed.add_field(
         name=STAT_TRAINER,
-        value=f"Price: {STAT_TRAINER_PRICE}",
+        value=f"Price: {STAT_TRAINER_PRICE}\n{STAT_TRAINER_DESC}",
         inline=False,
     )
     embed.add_field(
         name=PREMIUM_STAT_TRAINER,
-        value=f"Price: {PREMIUM_STAT_TRAINER_PRICE}",
+        value=f"Price: {PREMIUM_STAT_TRAINER_PRICE}\n{PREMIUM_STAT_TRAINER_DESC}",
         inline=False,
     )
     embed.add_field(
         name=GENETIC_RESHUFFLER,
-        value=f"Price: {GENETIC_RESHUFFLER_PRICE}",
+        value=f"Price: {GENETIC_RESHUFFLER_PRICE}\n{GENETIC_RESHUFFLER_DESC}",
         inline=False,
     )
     embed.add_field(
         name=EXHAUSTION_ELIMINATOR,
-        value=f"Price: {EXHAUSTION_ELIMINATOR_PRICE}",
+        value=f"Price: {EXHAUSTION_ELIMINATOR_PRICE}\n{EXHAUSTION_ELIMINATOR_DESC}",
         inline=False,
     )
     try:

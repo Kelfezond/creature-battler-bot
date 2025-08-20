@@ -460,11 +460,13 @@ async def _catch_up_trainer_points_now():
 @tasks.loop(hours=12)
 async def regenerate_hp():
     now = datetime.now(timezone.utc)
+    # Pre-calc 12 hours ago to avoid relying on SQL interval arithmetic on placeholders
+    now_minus_12h = now - timedelta(hours=12)
     await (await db_pool()).execute(
         """
         WITH regen AS (
             SELECT id,
-                   FLOOR(EXTRACT(EPOCH FROM ($1 - COALESCE(last_hp_regen, $1 - INTERVAL '12 hours'))) / 43200) AS cycles
+                   FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - COALESCE(last_hp_regen, $2::timestamptz))) / 43200) AS cycles
             FROM creatures
         )
         UPDATE creatures c
@@ -478,6 +480,7 @@ async def regenerate_hp():
         WHERE c.id = r.id AND r.cycles > 0
         """,
         now,
+        now_minus_12h,
     )
     logger.info("Regenerated HP for creatures needing it")
 

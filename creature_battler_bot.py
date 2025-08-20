@@ -255,13 +255,10 @@ SELL_PRICES: Dict[str, int] = {
 
 SMALL_HEALING_INJECTOR = "Small Healing Injector"
 SMALL_HEALING_INJECTOR_PRICE = 26_000
-SMALL_HEALING_INJECTOR_DESC = "Heals a creature for 25% of its max HP."
 LARGE_HEALING_INJECTOR = "Large Healing Injector"
 LARGE_HEALING_INJECTOR_PRICE = 34_000
-LARGE_HEALING_INJECTOR_DESC = "Heals a creature for 50% of its max HP."
 FULL_HEALING_INJECTOR = "Full Healing Injector"
 FULL_HEALING_INJECTOR_PRICE = 45_000
-FULL_HEALING_INJECTOR_DESC = "Fully restores a creature's HP."
 
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -1637,18 +1634,18 @@ async def update_item_store_now(reason: str = "manual") -> None:
     )
     embed.add_field(
         name=SMALL_HEALING_INJECTOR,
-        value=f"{SMALL_HEALING_INJECTOR_DESC}\nPrice: {SMALL_HEALING_INJECTOR_PRICE}",
-        inline=True,
+        value=f"Price: {SMALL_HEALING_INJECTOR_PRICE}",
+        inline=False,
     )
     embed.add_field(
         name=LARGE_HEALING_INJECTOR,
-        value=f"{LARGE_HEALING_INJECTOR_DESC}\nPrice: {LARGE_HEALING_INJECTOR_PRICE}",
-        inline=True,
+        value=f"Price: {LARGE_HEALING_INJECTOR_PRICE}",
+        inline=False,
     )
     embed.add_field(
         name=FULL_HEALING_INJECTOR,
-        value=f"{FULL_HEALING_INJECTOR_DESC}\nPrice: {FULL_HEALING_INJECTOR_PRICE}",
-        inline=True,
+        value=f"Price: {FULL_HEALING_INJECTOR_PRICE}",
+        inline=False,
     )
     try:
         await message.edit(content=None, embed=embed, view=ItemStoreView())
@@ -2476,11 +2473,21 @@ async def buy(inter: discord.Interaction, creature_name: str):
     asyncio.create_task(update_leaderboard_now(reason="buy"))
 
 
-async def _buy_item(
-    inter: discord.Interaction, item_const: str, price: int, quantity: int
-):
+async def _buy_item(inter: discord.Interaction, item_name: str, quantity: int):
     if quantity <= 0:
         return await inter.response.send_message("Quantity must be positive.", ephemeral=True)
+    item_key = item_name.strip().lower()
+    if item_key == SMALL_HEALING_INJECTOR.lower():
+        item_const = SMALL_HEALING_INJECTOR
+        price = SMALL_HEALING_INJECTOR_PRICE
+    elif item_key == LARGE_HEALING_INJECTOR.lower():
+        item_const = LARGE_HEALING_INJECTOR
+        price = LARGE_HEALING_INJECTOR_PRICE
+    elif item_key == FULL_HEALING_INJECTOR.lower():
+        item_const = FULL_HEALING_INJECTOR
+        price = FULL_HEALING_INJECTOR_PRICE
+    else:
+        return await inter.response.send_message("Unknown item.", ephemeral=True)
     row = await ensure_registered(inter)
     if not row:
         return
@@ -2550,43 +2557,25 @@ class ShopView(discord.ui.View):
         await interaction.response.send_modal(BuyModal())
 
 
-class BuyItemModal(discord.ui.Modal):
-    def __init__(self, item_const: str, price: int):
-        super().__init__(title=f"Buy {item_const}")
-        self.item_const = item_const
-        self.price = price
-        self.quantity: discord.ui.TextInput = discord.ui.TextInput(label="Quantity")
-        self.add_item(self.quantity)
+class BuyItemModal(discord.ui.Modal, title="Buy Item"):
+    item_name = discord.ui.TextInput(label="Item Name")
+    quantity = discord.ui.TextInput(label="Quantity")
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             qty = int(self.quantity.value)
         except ValueError:
             return await interaction.response.send_message("Quantity must be an integer.", ephemeral=True)
-        await _buy_item(interaction, self.item_const, self.price, qty)
+        await _buy_item(interaction, self.item_name.value, qty)
 
 
 class ItemStoreView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Buy Small", style=discord.ButtonStyle.green, row=0)
-    async def buy_small(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            BuyItemModal(SMALL_HEALING_INJECTOR, SMALL_HEALING_INJECTOR_PRICE)
-        )
-
-    @discord.ui.button(label="Buy Large", style=discord.ButtonStyle.green, row=0)
-    async def buy_large(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            BuyItemModal(LARGE_HEALING_INJECTOR, LARGE_HEALING_INJECTOR_PRICE)
-        )
-
-    @discord.ui.button(label="Buy Full", style=discord.ButtonStyle.green, row=0)
-    async def buy_full(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            BuyItemModal(FULL_HEALING_INJECTOR, FULL_HEALING_INJECTOR_PRICE)
-        )
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green)
+    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BuyItemModal())
 
 async def _rename_creature(inter: discord.Interaction, creature_name: str, new_name: str):
     """Core logic for renaming a creature."""

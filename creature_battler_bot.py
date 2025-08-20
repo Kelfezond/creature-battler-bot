@@ -259,6 +259,8 @@ LARGE_HEALING_INJECTOR = "Large Healing Injector"
 LARGE_HEALING_INJECTOR_PRICE = 34_000
 FULL_HEALING_INJECTOR = "Full Healing Injector"
 FULL_HEALING_INJECTOR_PRICE = 45_000
+STAT_TRAINER = "Stat Trainer"
+STAT_TRAINER_PRICE = 52_500
 EXHAUSTION_ELIMINATOR = "Exhaustion Eliminator"
 EXHAUSTION_ELIMINATOR_PRICE = 60_000
 
@@ -1650,6 +1652,11 @@ async def update_item_store_now(reason: str = "manual") -> None:
         inline=False,
     )
     embed.add_field(
+        name=STAT_TRAINER,
+        value=f"Price: {STAT_TRAINER_PRICE}",
+        inline=False,
+    )
+    embed.add_field(
         name=EXHAUSTION_ELIMINATOR,
         value=f"Price: {EXHAUSTION_ELIMINATOR_PRICE}",
         inline=False,
@@ -2493,6 +2500,9 @@ async def _buy_item(inter: discord.Interaction, item_name: str, quantity: int):
     elif item_key == FULL_HEALING_INJECTOR.lower():
         item_const = FULL_HEALING_INJECTOR
         price = FULL_HEALING_INJECTOR_PRICE
+    elif item_key == STAT_TRAINER.lower():
+        item_const = STAT_TRAINER
+        price = STAT_TRAINER_PRICE
     elif item_key == EXHAUSTION_ELIMINATOR.lower():
         item_const = EXHAUSTION_ELIMINATOR
         price = EXHAUSTION_ELIMINATOR_PRICE
@@ -3654,6 +3664,65 @@ async def _use_exhaustion_eliminator(inter: discord.Interaction, creature_name: 
     )
 
 
+async def _use_stat_trainer(inter: discord.Interaction, creature_name: str, stat: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    stat = stat.upper().strip()
+    if stat not in PRIMARY_STATS:
+        return await inter.response.send_message(
+            f"Stat must be one of {', '.join(PRIMARY_STATS)}.", ephemeral=True
+        )
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        c_row = await conn.fetchrow(
+            "SELECT id, name, stats, current_hp FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            inter.user.id,
+            creature_name,
+        )
+        if not c_row:
+            return await inter.response.send_message("Creature not found.", ephemeral=True)
+        listed = await conn.fetchval(
+            "SELECT 1 FROM creature_shop WHERE creature_id=$1",
+            c_row["id"],
+        )
+        if listed:
+            return await inter.response.send_message(
+                f"{c_row['name']} is listed in the shop and cannot be trained.",
+                ephemeral=True,
+            )
+        qty = await conn.fetchval(
+            "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            STAT_TRAINER,
+        )
+        if not qty or int(qty) <= 0:
+            return await inter.response.send_message(
+                "You don't have any Stat Trainers.", ephemeral=True
+            )
+        stats = json.loads(c_row["stats"])
+        stats[stat] = int(stats.get(stat, 0)) + 1
+        new_max_hp = stats["HP"] * 5
+        new_cur_hp = c_row["current_hp"]
+        if stat == "HP":
+            new_cur_hp = min(new_cur_hp + 5, new_max_hp)
+        await conn.execute(
+            "UPDATE creatures SET stats=$1,current_hp=$2 WHERE id=$3",
+            json.dumps(stats),
+            new_cur_hp,
+            c_row["id"],
+        )
+        await conn.execute(
+            "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            STAT_TRAINER,
+        )
+    display_inc = 5 if stat == "HP" else 1
+    await inter.response.send_message(
+        f"{c_row['name']} trained: +{display_inc} {stat}.", ephemeral=True
+    )
+
+
 async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
@@ -3679,21 +3748,28 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         inter.user.id,
         EXHAUSTION_ELIMINATOR,
     )
+    qty_stat = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        STAT_TRAINER,
+    )
     qty_small = int(qty_small or 0)
     qty_large = int(qty_large or 0)
     qty_full = int(qty_full or 0)
     qty_exhaust = int(qty_exhaust or 0)
+    qty_stat = int(qty_stat or 0)
     if (
         qty_small <= 0
         and qty_large <= 0
         and qty_full <= 0
         and qty_exhaust <= 0
+        and qty_stat <= 0
     ):
         return await inter.response.send_message("You have no items.", ephemeral=True)
     await inter.response.send_message(
         f"Choose an item for {creature_name}:",
         ephemeral=True,
-        view=UseItemView(creature_name, qty_small, qty_large, qty_full, qty_exhaust),
+        view=UseItemView(creature_name, qty_small, qty_large, qty_full, qty_exhaust, qty_stat),
     )
 
 
@@ -3705,6 +3781,7 @@ class UseItemView(discord.ui.View):
         large_qty: int,
         full_qty: int,
         exhaust_qty: int,
+        stat_qty: int,
     ):
         super().__init__(timeout=None)
         self.creature_name = creature_name
@@ -3716,6 +3793,8 @@ class UseItemView(discord.ui.View):
         self.use_full.disabled = full_qty <= 0
         self.use_exhaust.label = f"{EXHAUSTION_ELIMINATOR} ({exhaust_qty})"
         self.use_exhaust.disabled = exhaust_qty <= 0
+        self.use_stat.label = f"{STAT_TRAINER} ({stat_qty})"
+        self.use_stat.disabled = stat_qty <= 0
 
     @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_small(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3732,6 +3811,21 @@ class UseItemView(discord.ui.View):
     @discord.ui.button(label=EXHAUSTION_ELIMINATOR, style=discord.ButtonStyle.primary)
     async def use_exhaust(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _use_exhaustion_eliminator(interaction, self.creature_name)
+
+    @discord.ui.button(label=STAT_TRAINER, style=discord.ButtonStyle.primary)
+    async def use_stat(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(StatTrainerModal(self.creature_name))
+
+
+class StatTrainerModal(discord.ui.Modal):
+    def __init__(self, creature_name: str):
+        super().__init__(title=f"Stat Trainer for {creature_name}")
+        self.creature_name = creature_name
+        self.stat = discord.ui.TextInput(label="Stat")
+        self.add_item(self.stat)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _use_stat_trainer(interaction, self.creature_name, self.stat.value)
 
 
 class CreatureView(discord.ui.View):

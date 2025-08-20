@@ -265,6 +265,8 @@ PREMIUM_STAT_TRAINER = "Premium Stat Trainer"
 PREMIUM_STAT_TRAINER_PRICE = 235_000
 EXHAUSTION_ELIMINATOR = "Exhaustion Eliminator"
 EXHAUSTION_ELIMINATOR_PRICE = 60_000
+GENETIC_RESHUFFLER = "Genetic Reshuffler"
+GENETIC_RESHUFFLER_PRICE = 35_000
 
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -1664,6 +1666,11 @@ async def update_item_store_now(reason: str = "manual") -> None:
         inline=False,
     )
     embed.add_field(
+        name=GENETIC_RESHUFFLER,
+        value=f"Price: {GENETIC_RESHUFFLER_PRICE}",
+        inline=False,
+    )
+    embed.add_field(
         name=EXHAUSTION_ELIMINATOR,
         value=f"Price: {EXHAUSTION_ELIMINATOR_PRICE}",
         inline=False,
@@ -2513,6 +2520,9 @@ async def _buy_item(inter: discord.Interaction, item_name: str, quantity: int):
     elif item_key == PREMIUM_STAT_TRAINER.lower():
         item_const = PREMIUM_STAT_TRAINER
         price = PREMIUM_STAT_TRAINER_PRICE
+    elif item_key == GENETIC_RESHUFFLER.lower():
+        item_const = GENETIC_RESHUFFLER
+        price = GENETIC_RESHUFFLER_PRICE
     elif item_key == EXHAUSTION_ELIMINATOR.lower():
         item_const = EXHAUSTION_ELIMINATOR
         price = EXHAUSTION_ELIMINATOR_PRICE
@@ -3785,6 +3795,46 @@ async def _use_premium_stat_trainer(inter: discord.Interaction, creature_name: s
     )
 
 
+async def _use_genetic_reshuffler(inter: discord.Interaction, creature_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        c_row = await conn.fetchrow(
+            "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            inter.user.id,
+            creature_name,
+        )
+        if not c_row:
+            return await inter.response.send_message("Creature not found.", ephemeral=True)
+        qty = await conn.fetchval(
+            "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            GENETIC_RESHUFFLER,
+        )
+        if not qty or int(qty) <= 0:
+            return await inter.response.send_message(
+                "You don't have any Genetic Reshufflers.", ephemeral=True
+            )
+        personality = choose_personality()
+        await conn.execute(
+            "UPDATE creatures SET personality=$1 WHERE id=$2",
+            json.dumps(personality),
+            c_row["id"],
+        )
+        await conn.execute(
+            "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            GENETIC_RESHUFFLER,
+        )
+    stats_list = ",".join(personality.get("stats", []))
+    await inter.response.send_message(
+        f"{c_row['name']}'s personality is now {personality.get('name')} ({stats_list}).",
+        ephemeral=True,
+    )
+
+
 async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
@@ -3820,12 +3870,18 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         inter.user.id,
         PREMIUM_STAT_TRAINER,
     )
+    qty_reshuffler = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        GENETIC_RESHUFFLER,
+    )
     qty_small = int(qty_small or 0)
     qty_large = int(qty_large or 0)
     qty_full = int(qty_full or 0)
     qty_exhaust = int(qty_exhaust or 0)
     qty_stat = int(qty_stat or 0)
     qty_premium = int(qty_premium or 0)
+    qty_reshuffler = int(qty_reshuffler or 0)
     if (
         qty_small <= 0
         and qty_large <= 0
@@ -3833,6 +3889,7 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         and qty_exhaust <= 0
         and qty_stat <= 0
         and qty_premium <= 0
+        and qty_reshuffler <= 0
     ):
         return await inter.response.send_message("You have no items.", ephemeral=True)
     await inter.response.send_message(
@@ -3846,6 +3903,7 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
             qty_exhaust,
             qty_stat,
             qty_premium,
+            qty_reshuffler,
         ),
     )
 
@@ -3860,6 +3918,7 @@ class UseItemView(discord.ui.View):
         exhaust_qty: int,
         stat_qty: int,
         premium_qty: int,
+        reshuffler_qty: int,
     ):
         super().__init__(timeout=None)
         self.creature_name = creature_name
@@ -3875,6 +3934,8 @@ class UseItemView(discord.ui.View):
         self.use_stat.disabled = stat_qty <= 0
         self.use_premium_stat.label = f"{PREMIUM_STAT_TRAINER} ({premium_qty})"
         self.use_premium_stat.disabled = premium_qty <= 0
+        self.use_reshuffler.label = f"{GENETIC_RESHUFFLER} ({reshuffler_qty})"
+        self.use_reshuffler.disabled = reshuffler_qty <= 0
 
     @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_small(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3899,6 +3960,10 @@ class UseItemView(discord.ui.View):
     @discord.ui.button(label=PREMIUM_STAT_TRAINER, style=discord.ButtonStyle.primary)
     async def use_premium_stat(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _use_premium_stat_trainer(interaction, self.creature_name)
+
+    @discord.ui.button(label=GENETIC_RESHUFFLER, style=discord.ButtonStyle.primary)
+    async def use_reshuffler(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _use_genetic_reshuffler(interaction, self.creature_name)
 
 
 class StatTrainerModal(discord.ui.Modal):

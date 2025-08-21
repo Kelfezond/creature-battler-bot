@@ -738,10 +738,12 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
     for chunk in chunks[1:]:
         await inter.followup.send(chunk, ephemeral=ephemeral)
 
-async def channel_send_chunks(channel: discord.abc.Messageable, content: str):
+async def user_send_chunks(user: discord.abc.User, content: str):
+    """DM the user the given content in <=1900-char chunks."""
     chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
+    dm = user.dm_channel or await user.create_dm()
     for chunk in chunks:
-        await channel.send(chunk)
+        await dm.send(chunk)
 
 # ─── Command listing helper ─────────────────────────────────
 def _build_command_list(bot: commands.Bot) -> str:
@@ -2955,12 +2957,12 @@ async def _battle(inter: discord.Interaction, creature_name: str, tier: int):
         if arena_channel is None:
             arena_channel = inter.channel
 
-        await inter.followup.send(start_public, ephemeral=True)
         if arena_channel is not None:
             try:
                 await arena_channel.send(start_public)
             except Exception:
                 pass
+        await inter.followup.send("Battle started in the battle arena!", ephemeral=True)
 
         # Drip-feed rounds privately
         st.next_log_idx = len(st.logs)
@@ -2970,12 +2972,10 @@ async def _battle(inter: discord.Interaction, creature_name: str, tier: int):
             st.next_log_idx = len(st.logs)
             if new_logs:
                 log_text = "\n".join(new_logs)
-                await send_chunks(inter, log_text, ephemeral=True)
-                if arena_channel is not None:
-                    try:
-                        await channel_send_chunks(arena_channel, log_text)
-                    except Exception:
-                        pass
+                try:
+                    await user_send_chunks(inter.user, log_text)
+                except Exception:
+                    pass
                 await asyncio.sleep(0.2)
 
         await (await db_pool()).execute(
@@ -2993,15 +2993,12 @@ async def _battle(inter: discord.Interaction, creature_name: str, tier: int):
             st.next_log_idx = len(st.logs)
             if pending:
                 pend_text = "\n".join(pending)
-                await send_chunks(inter, pend_text, ephemeral=True)
-                if arena_channel is not None:
-                    try:
-                        await channel_send_chunks(arena_channel, pend_text)
-                    except Exception:
-                        pass
+                try:
+                    await user_send_chunks(inter.user, pend_text)
+                except Exception:
+                    pass
                 await asyncio.sleep(0.35)
             final_msg = format_public_battle_summary(st, summary, trainer_name)
-            await inter.followup.send(final_msg, ephemeral=True)
             if arena_channel is not None:
                 try:
                     await arena_channel.send(final_msg)
@@ -3172,16 +3169,35 @@ async def pvp(inter: discord.Interaction):
                         stat_block(st.opp_creature['name'], st.opp_current_hp, st.opp_max_hp, st.opp_creature['stats']),
                     ]
                     st.next_log_idx = len(st.logs)
+                    arena_channel = None
+                    arena_chan_id = await _get_battle_arena_channel_id()
+                    if arena_chan_id:
+                        try:
+                            arena_channel = bot.get_channel(arena_chan_id) or await bot.fetch_channel(arena_chan_id)
+                        except Exception as e:
+                            logger.error("Failed to fetch battle arena channel %s: %s", arena_chan_id, e)
+                    if arena_channel is None:
+                        arena_channel = interaction.channel
+                    try:
+                        await arena_channel.send(
+                            f"**PvP Battle Start** — {st.user_creature['name']} vs {st.opp_creature['name']} (Wager {wager})"
+                        )
+                    except Exception:
+                        pass
                     await interaction.followup.send(
-                        f"**PvP Battle Start** — {st.user_creature['name']} vs {st.opp_creature['name']} (Wager {wager})",
-                        ephemeral=False
+                        "PvP battle started in the battle arena!", ephemeral=True
                     )
                     while st.user_current_hp > 0 and st.opp_current_hp > 0:
                         simulate_round(st)
                         new_logs = st.logs[st.next_log_idx:]
                         st.next_log_idx = len(st.logs)
                         if new_logs:
-                            await send_chunks(interaction, "\n".join(new_logs), ephemeral=False)
+                            log_text = "\n".join(new_logs)
+                            try:
+                                await user_send_chunks(inter.user, log_text)
+                                await user_send_chunks(opponent_user, log_text)
+                            except Exception:
+                                pass
                             await asyncio.sleep(0.2)
                     await pool.execute(
                         "UPDATE creatures SET current_hp=$1 WHERE id=$2",
@@ -3202,11 +3218,19 @@ async def pvp(inter: discord.Interaction):
                     pending = st.logs[st.next_log_idx:]
                     st.next_log_idx = len(st.logs)
                     if pending:
-                        await send_chunks(interaction, "\n".join(pending), ephemeral=False)
+                        pend_text = "\n".join(pending)
+                        try:
+                            await user_send_chunks(inter.user, pend_text)
+                            await user_send_chunks(opponent_user, pend_text)
+                        except Exception:
+                            pass
                         await asyncio.sleep(0.35)
-                    await interaction.followup.send(
-                        format_public_battle_summary(st, summary, trainer_name), ephemeral=False
-                    )
+                    try:
+                        await arena_channel.send(
+                            format_public_battle_summary(st, summary, trainer_name)
+                        )
+                    except Exception:
+                        pass
                 finally:
                     try:
                         if current_battler_id == inter.user.id:

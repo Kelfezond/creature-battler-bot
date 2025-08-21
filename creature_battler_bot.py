@@ -2842,8 +2842,7 @@ async def dailylimit(inter: discord.Interaction, creature_name: str, number: int
         ephemeral=True
     )
 
-@bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
-async def battle(inter: discord.Interaction, creature_name: str, tier: int):
+async def _battle(inter: discord.Interaction, creature_name: str, tier: int):
     if tier not in TIER_EXTRAS:
         return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
     if inter.user.id in active_battles:
@@ -2998,6 +2997,13 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
                 battle_lock.release()
         except Exception:
             pass
+
+
+# Slash command wrapper
+@bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
+async def battle(inter: discord.Interaction, creature_name: str, tier: int):
+    await _battle(inter, creature_name, tier)
+
 
 @bot.tree.command(description="Challenge another trainer to a PvP battle")
 async def pvp(inter: discord.Interaction):
@@ -4108,7 +4114,7 @@ class CreatureView(discord.ui.View):
             async def select_callback(self, inter2: discord.Interaction, select: discord.ui.Select):
                 if inter2.user.id != interaction.user.id:
                     return await inter2.response.send_message("This menu isn't for you.", ephemeral=True)
-                await battle(inter2, cname, int(select.values[0]))
+                await _battle(inter2, cname, int(select.values[0]))
                 try:
                     await inter2.edit_original_response(view=None)
                 except Exception:

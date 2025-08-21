@@ -588,43 +588,83 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
             logger.error("OpenAI error: %s", e)
     return None
 
-# ─── Name-only generator for battles ─────────────────────────
+
+# ─── Name-only generator for battles ──────────────────────────────────────
+
+FIRST_NAMES = [
+    "Ashen", "Blazing", "Burning", "Crimson", "Dread", "Ember", "Fiery", "Flame",
+    "Frost", "Frozen", "Glacial", "Icebound", "Polar", "Snowy", "Winter", "Storm",
+    "Thunder", "Lightning", "Tempest", "Gale", "Windborne", "Skyward", "Clouded",
+    "Misty", "Foggy", "Shadow", "Dark", "Duskwind", "Midnight", "Moonlit", "Lunar",
+    "Starry", "Cosmic", "Solar", "Sunscorch", "Radiant", "Dawnbreak", "Twilight",
+    "Gloom", "Nightfall", "Bonewhite", "Skulking", "Grim", "Deathly", "Carrion",
+    "Corpse", "Bloodied", "Crimsoned", "Marrow", "Blackened", "Venomous",
+    "Poisonous", "Toxic", "Corrupted", "Pestilent", "Plagued", "Mire", "Swampy",
+    "Marshy", "Bogborn", "Bramble", "Thorned", "Rooted", "Viney", "Leafy", "Verdant",
+    "Barked", "Stony", "Iron", "Steel", "Rusted", "Copper", "Bronze", "Silver",
+    "Golden", "Platinum", "Auric", "Gemmed", "Crystal", "Glassy", "Obsidian", "Onyx",
+    "Quartz", "Jade", "Sapphire", "Ruby", "Emerald", "Diamond", "Adamant", "Mithril",
+    "Bronzeblooded", "Cobalt", "Leaden", "Mercury", "Acidic", "Fiendish", "Infernal",
+    "Charring", "Smoldering", "Scorched", "Smoking", "Molten", "Magma", "Igneous",
+    "Volcanic", "Seething", "Blistering", "Wild", "Savage", "Feral", "Untamed",
+    "Primeval", "Ancient", "Timeless", "Eternal", "Ageless", "Mystic", "Arcane",
+    "Enchanted", "Cursed", "Hexed", "Runed", "Glyphic", "Warded", "Blessed", "Holy",
+    "Sacred", "Hallowed", "Celestial", "Stellar", "Astral", "Ethereal", "Spiritual",
+    "Phantom", "Ghostly", "Wraithlike", "Spectral", "Haunted", "Soulbound",
+    "Necrotic", "Graveborn", "Deathborn", "Undying", "Rotting", "Decayed",
+    "Withered", "Hollow", "Shattered", "Broken", "Ruined", "Forsaken", "Doomed",
+    "Fallen", "Lost", "Wandering", "Drifting", "Soaring", "Swift", "Rapid", "Fleet",
+    "Nimble", "Quick", "Leaping", "Bounding", "Rushing", "Charging", "Relentless",
+    "Tireless", "Vicious", "Brutal", "Fierce", "Merciless", "Ruthless",
+    "Savagehearted", "Bloodthirsty", "Frenzied", "Maddened", "Rabid", "Foaming",
+    "Snarling", "Growling", "Biting", "Slashing", "Piercing", "Crushing", "Rending",
+    "Tearing", "Shredding", "Hunting", "Stalking", "Lurking", "Watching", "Silent",
+    "Quiet", "Cold", "Chilling", "Icy", "Bitter", "Harsh", "Bleak",
+]
+
+SECOND_NAMES = [
+    "Wolf", "Lion", "Tiger", "Bear", "Boar", "Bull", "Stag", "Elk", "Ram", "Goat",
+    "Horse", "Stallion", "Charger", "Zebra", "Camel", "Mammoth", "Elephant", "Ox",
+    "Bison", "Buffalo", "Crocodile", "Alligator", "Snapper", "Tortoise", "Turtle",
+    "Lizard", "Gecko", "Monitor", "Basilisk", "Drake", "Wyrmling", "Wyrm", "Dragon",
+    "Wyvern", "Serpent", "Viper", "Cobra", "Python", "Anaconda", "Scuttler",
+    "Creeper", "Crawler", "Scorpion", "Spider", "Widow", "Tarantula", "Webspinner",
+    "Silkfang", "Hornet", "Wasp", "Bee", "Hivebeast", "Drone", "Swarmkin", "Mantis",
+    "Locust", "Cricket", "Beetle", "Scarab", "Firefly", "Moth", "Butterfly", "Raven",
+    "Crow", "Vulture", "Hawk", "Falcon", "Eagle", "Owl", "Harrier", "Buzzard",
+    "Kite", "Gull", "Albatross", "Roc", "Phoenix", "Thunderbird", "Stormbird",
+    "Skyhunter", "Cloudstalker", "Bat", "Vampbat", "Duskfang", "Rat", "Mouse",
+    "Vermin", "Mole", "Shrew", "Weasel", "Ferret", "Badger", "Otter", "Beaver",
+    "Stoat", "Lynx", "Cougar", "Panther", "Jaguar", "Leopard", "Cheetah", "Puma",
+    "Catbeast", "Sabrecat", "Saberfang", "Hyena", "Jackal", "Hound", "Direwolf",
+    "Warg", "Prowler", "Stalker", "Ravager", "Mauler", "Devourer", "Horror",
+    "Abomination", "Monstrosity", "Colossus", "Titanbeast", "Behemoth",
+    "Leviathan", "Terror", "Nightmare", "Shadebeast", "Wraithfang", "Spectral",
+    "Phantom", "Ghostfang", "Spiritbeast", "Soulfang", "Etherfang", "Arcaneclaw",
+    "Runehound", "Hexbeast", "Cursefang", "Spellmaw", "Warfang", "Doomfang",
+    "Chaosfang", "Frenzybeast", "Ragehound", "Bloodfang", "Fleshfang", "Bonefang",
+    "Skullfang", "Fangmaw", "Clawmaw", "Toothmaw", "Talonmaw", "Hookmaw",
+    "Spearmaw", "Needlefang", "Spineback", "Spiketail", "Barbedbeast", "Thornhide",
+    "Bramblepaw", "Rootfang", "Mossfang", "Vineclaw", "Barkhide", "Stonehide",
+    "Ironhide", "Rusthide", "Steelhide", "Bronzehide", "Silverhide", "Goldhide",
+    "Gemhide", "Crystalhide", "Glasshide", "Obsidianhide", "Onyxhide", "Quartzhide",
+    "Diamondhide", "Jadefang", "Sapphirefang", "Rubyfang", "Emeraldfang",
+    "Topazfang", "Seraphbeast", "Celestial", "Astral", "Cosmicfang", "Starfang",
+    "Moonfang", "Sunfang", "Flamefang", "Frostfang", "Stormfang", "Thunderfang",
+    "Tempestfang", "Dreadfang", "Nightfang", "Shadowfang", "Venomfang", "Poisonfang",
+    "Toxicfang", "Pestilence", "Plaguefang",
+]
 
 async def generate_creature_name(rarity: str) -> str:
-    """Ask the model for a name only (short) to reduce tokens. Non-blocking with timeout."""
-    # Pull some existing names to avoid dupes
+    """Generate a creature name from predefined lists instead of GPT."""
     pool = await db_pool()
     rows = await pool.fetch("SELECT name FROM creatures")
-    used = sorted({r["name"].lower() for r in rows})[:50]
-    prompt = (
-        f"Invent a creature of rarity **{rarity}**. Return ONLY JSON\n"
-        f"{{\"name\":\"1-3 words\"}}\n"
-        f"Avoid names: {', '.join(used) if used else 'None'}\n"
-    )
-    import random as _random, re as _re, json as _json
-    for _ in range(3):
-        try:
-            resp = await _with_timeout(
-                _to_thread(lambda: client.responses.create(
-                    model=TEXT_MODEL,
-                    input=prompt,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                )),
-                timeout=15.0
-            )
-            try:
-                text = getattr(resp, "output_text", None) or ""
-            except Exception:
-                text = str(resp) if resp is not None else ""
-            m = _re.search(r"\{[\s\S]*\}", text or "")
-            data = _json.loads(m.group(0)) if m else {}
-            if "name" in data:
-                return str(data["name"]).title()
-        except asyncio.TimeoutError:
-            logger.warning("generate_creature_name timed out; retrying…")
-        except Exception as e:
-            logger.error("OpenAI name-only error: %s", e)
-    return f"Wild{_random.randint(1000,9999)}"
+    used = {r["name"].lower() for r in rows}
+    for _ in range(10):
+        name = f"{random.choice(FIRST_NAMES)} {random.choice(SECOND_NAMES)}"
+        if name.lower() not in used:
+            return name
+    return name
 
 # Robust extractor for Images API responses (dict or SDK object)
 def _extract_image_url(img_resp):

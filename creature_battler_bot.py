@@ -55,6 +55,8 @@ SHOP_CHANNEL_ID_ENV = os.getenv("SHOP_CHANNEL_ID")
 ITEM_STORE_CHANNEL_ID_ENV = os.getenv("ITEM_STORE_CHANNEL_ID")
 # Optional: channel where interactive controls are posted.
 CONTROLS_CHANNEL_ID_ENV = os.getenv("CONTROLS_CHANNEL_ID")
+# Optional: channel where battles are posted.
+BATTLE_ARENA_CHANNEL_ID_ENV = os.getenv("BATTLE_ARENA_CHANNEL_ID")
 
 # Admin allow-list for privileged commands (e.g., /cashadd, /setleaderboardchannel)
 def _parse_admin_ids(raw: Optional[str]) -> set[int]:
@@ -227,6 +229,11 @@ CREATE TABLE IF NOT EXISTS trainer_items (
 CREATE TABLE IF NOT EXISTS controls_messages (
   channel_id BIGINT PRIMARY KEY,
   message_id BIGINT
+);
+
+-- Battle arena target channel
+CREATE TABLE IF NOT EXISTS battle_arena_channel (
+  channel_id BIGINT PRIMARY KEY
 );
 
 -- Encyclopedia target channel
@@ -1530,6 +1537,19 @@ async def _get_controls_channel_id() -> Optional[int]:
     return None
 
 
+async def _get_battle_arena_channel_id() -> Optional[int]:
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM battle_arena_channel LIMIT 1")
+    if chan:
+        return int(chan)
+    if BATTLE_ARENA_CHANNEL_ID_ENV:
+        try:
+            return int(BATTLE_ARENA_CHANNEL_ID_ENV)
+        except Exception:
+            logger.error("BATTLE_ARENA_CHANNEL_ID env was set but not an integer.")
+    return None
+
+
 async def _get_or_create_controls_message(channel_id: int) -> Optional[discord.Message]:
     try:
         channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
@@ -2005,6 +2025,12 @@ async def setup_hook():
     else:
         logger.info("No controls channel configured yet. Use /setcontrolchannel in the desired channel or set CONTROLS_CHANNEL_ID.")
 
+    battle_chan = await _get_battle_arena_channel_id()
+    if not battle_chan:
+        logger.info(
+            "No battle arena channel configured yet. Use /setbattlearena in the desired channel or set BATTLE_ARENA_CHANNEL_ID."
+        )
+
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
@@ -2146,6 +2172,29 @@ async def setencyclopediachannel(inter: discord.Interaction):
     """, inter.channel.id)
 
     await inter.response.send_message(f"Encyclopedia channel set to {inter.channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(description="(Admin) Set this channel as the battle arena channel")
+async def setbattlearena(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute(
+        """
+        INSERT INTO battle_arena_channel(channel_id)
+        VALUES ($1)
+        ON CONFLICT (channel_id) DO UPDATE SET channel_id = EXCLUDED.channel_id
+        """,
+        inter.channel.id,
+    )
+
+    await inter.response.send_message(
+        f"Battle arena channel set to {inter.channel.mention}.",
+        ephemeral=True,
+    )
 
 @bot.tree.command(description="Register as a trainer")
 async def register(inter: discord.Interaction):
@@ -2885,13 +2934,29 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         max_tier = await _max_unlocked_tier(c_row["id"])
         st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
 
-    
+
         # Public start (concise)
         start_public = (
             f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\n"
             f"Opponent rarity: **{rarity}**"
         )
-        await inter.followup.send(start_public, ephemeral=False)
+
+        arena_channel = None
+        arena_chan_id = await _get_battle_arena_channel_id()
+        if arena_chan_id:
+            try:
+                arena_channel = bot.get_channel(arena_chan_id) or await bot.fetch_channel(arena_chan_id)
+            except Exception as e:
+                logger.error("Failed to fetch battle arena channel %s: %s", arena_chan_id, e)
+        if arena_channel is None:
+            arena_channel = inter.channel
+
+        await inter.followup.send(start_public, ephemeral=True)
+        if arena_channel is not None:
+            try:
+                await arena_channel.send(start_public)
+            except Exception:
+                pass
 
         # Drip-feed rounds privately
         st.next_log_idx = len(st.logs)
@@ -2919,7 +2984,13 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             if pending:
                 await send_chunks(inter, "\n".join(pending), ephemeral=True)
                 await asyncio.sleep(0.35)
-            await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
+            final_msg = format_public_battle_summary(st, summary, trainer_name)
+            await inter.followup.send(final_msg, ephemeral=True)
+            if arena_channel is not None:
+                try:
+                    await arena_channel.send(final_msg)
+                except Exception:
+                    pass
     finally:
         try:
             current_battler_id = None
@@ -4010,6 +4081,42 @@ class CreatureView(discord.ui.View):
     @discord.ui.button(label="Item", style=discord.ButtonStyle.primary)
     async def btn_item(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _show_item_menu(interaction, self.creature_name)
+
+    @discord.ui.button(label="Battle", style=discord.ButtonStyle.danger)
+    async def btn_battle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pool = await db_pool()
+        row = await pool.fetchrow(
+            "SELECT id FROM creatures WHERE owner_id=$1 AND name=$2",
+            interaction.user.id,
+            self.creature_name,
+        )
+        if not row:
+            return await interaction.response.send_message("Creature not found.", ephemeral=True)
+        creature_id = int(row["id"])
+        max_tier = await _max_unlocked_tier(creature_id)
+        options = [
+            discord.SelectOption(label=f"Tier {t}", value=str(t))
+            for t in range(1, max_tier + 1)
+        ]
+        cname = self.creature_name
+
+        class TierSelect(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=30)
+
+            @discord.ui.select(placeholder="Select tier", options=options)
+            async def select_callback(self, inter2: discord.Interaction, select: discord.ui.Select):
+                if inter2.user.id != interaction.user.id:
+                    return await inter2.response.send_message("This menu isn't for you.", ephemeral=True)
+                await battle(inter2, cname, int(select.values[0]))
+                try:
+                    await inter2.edit_original_response(view=None)
+                except Exception:
+                    pass
+                self.stop()
+
+        view = TierSelect()
+        await interaction.response.send_message("Choose battle tier:", view=view, ephemeral=True)
 
 
 class TrainModal(discord.ui.Modal, title="Train Creature"):

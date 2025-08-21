@@ -738,6 +738,11 @@ async def send_chunks(inter: discord.Interaction, content: str, ephemeral: bool 
     for chunk in chunks[1:]:
         await inter.followup.send(chunk, ephemeral=ephemeral)
 
+async def channel_send_chunks(channel: discord.abc.Messageable, content: str):
+    chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
+    for chunk in chunks:
+        await channel.send(chunk)
+
 # ─── Command listing helper ─────────────────────────────────
 def _build_command_list(bot: commands.Bot) -> str:
     """
@@ -2964,7 +2969,13 @@ async def _battle(inter: discord.Interaction, creature_name: str, tier: int):
             new_logs = st.logs[st.next_log_idx:]
             st.next_log_idx = len(st.logs)
             if new_logs:
-                await send_chunks(inter, "\n".join(new_logs), ephemeral=True)
+                log_text = "\n".join(new_logs)
+                await send_chunks(inter, log_text, ephemeral=True)
+                if arena_channel is not None:
+                    try:
+                        await channel_send_chunks(arena_channel, log_text)
+                    except Exception:
+                        pass
                 await asyncio.sleep(0.2)
 
         await (await db_pool()).execute(
@@ -2981,7 +2992,13 @@ async def _battle(inter: discord.Interaction, creature_name: str, tier: int):
             pending = st.logs[st.next_log_idx:]
             st.next_log_idx = len(st.logs)
             if pending:
-                await send_chunks(inter, "\n".join(pending), ephemeral=True)
+                pend_text = "\n".join(pending)
+                await send_chunks(inter, pend_text, ephemeral=True)
+                if arena_channel is not None:
+                    try:
+                        await channel_send_chunks(arena_channel, pend_text)
+                    except Exception:
+                        pass
                 await asyncio.sleep(0.35)
             final_msg = format_public_battle_summary(st, summary, trainer_name)
             await inter.followup.send(final_msg, ephemeral=True)

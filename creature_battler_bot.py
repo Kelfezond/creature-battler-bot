@@ -4037,7 +4037,7 @@ class StatTrainerModal(discord.ui.Modal):
 
 
 class CreatureView(discord.ui.View):
-    """View with rename and item buttons for a single creature."""
+    """View with rename, item, and quick sell buttons for a single creature."""
 
     def __init__(self, creature_name: str):
         super().__init__(timeout=None)
@@ -4050,6 +4050,10 @@ class CreatureView(discord.ui.View):
     @discord.ui.button(label="Item", style=discord.ButtonStyle.primary)
     async def btn_item(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _show_item_menu(interaction, self.creature_name)
+
+    @discord.ui.button(label="Quick Sell", style=discord.ButtonStyle.danger)
+    async def btn_quicksell(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await quicksell.callback(interaction, self.creature_name)
 
 
 class TrainModal(discord.ui.Modal, title="Train Creature"):

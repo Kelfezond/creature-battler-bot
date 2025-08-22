@@ -314,6 +314,26 @@ FLUX_CAPACITOR_DESC = (
 FLUX_CAPACITOR_GRADE = "A"
 FLUX_CAPACITOR_TYPE = "Passive"
 
+IMPROVED_CLOTTING_MATRIX = "Improved Clotting Matrix"
+IMPROVED_CLOTTING_MATRIX_PRICE = 150_000
+IMPROVED_CLOTTING_MATRIX_DESC = "Heals the creature for 10% of their Max HP"
+IMPROVED_CLOTTING_MATRIX_GRADE = "C"
+IMPROVED_CLOTTING_MATRIX_TYPE = "Active"
+
+AEGIS_COUNTER = "Aegis Counter"
+AEGIS_COUNTER_PRICE = 2_000_000
+AEGIS_COUNTER_DESC = (
+    "The next time the creature is hit reflects 50% of the damage back to the attacker. Can stack if activated multiple times before taking damage."
+)
+AEGIS_COUNTER_GRADE = "B"
+AEGIS_COUNTER_TYPE = "Active"
+
+PRISM_COIL = "Prism Coil"
+PRISM_COIL_PRICE = 12_000_000
+PRISM_COIL_DESC = "Fires the Prism Coil"
+PRISM_COIL_GRADE = "A"
+PRISM_COIL_TYPE = "Active"
+
 AUGMENTS = {
     SUBDERMAL_BALLISTICS_GEL.lower(): {
         "name": SUBDERMAL_BALLISTICS_GEL,
@@ -335,6 +355,27 @@ AUGMENTS = {
         "desc": FLUX_CAPACITOR_DESC,
         "grade": FLUX_CAPACITOR_GRADE,
         "type": FLUX_CAPACITOR_TYPE,
+    },
+    IMPROVED_CLOTTING_MATRIX.lower(): {
+        "name": IMPROVED_CLOTTING_MATRIX,
+        "price": IMPROVED_CLOTTING_MATRIX_PRICE,
+        "desc": IMPROVED_CLOTTING_MATRIX_DESC,
+        "grade": IMPROVED_CLOTTING_MATRIX_GRADE,
+        "type": IMPROVED_CLOTTING_MATRIX_TYPE,
+    },
+    AEGIS_COUNTER.lower(): {
+        "name": AEGIS_COUNTER,
+        "price": AEGIS_COUNTER_PRICE,
+        "desc": AEGIS_COUNTER_DESC,
+        "grade": AEGIS_COUNTER_GRADE,
+        "type": AEGIS_COUNTER_TYPE,
+    },
+    PRISM_COIL.lower(): {
+        "name": PRISM_COIL,
+        "price": PRISM_COIL_PRICE,
+        "desc": PRISM_COIL_DESC,
+        "grade": PRISM_COIL_GRADE,
+        "type": PRISM_COIL_TYPE,
     },
 }
 
@@ -475,6 +516,8 @@ class BattleState:
     opp_afp_charges: int = 0
     user_afp_triggered: bool = False
     opp_afp_triggered: bool = False
+    user_aegis_charges: int = 0
+    opp_aegis_charges: int = 0
 
 active_battles: Dict[int, BattleState] = {}
 
@@ -1033,13 +1076,33 @@ def simulate_round(st: BattleState):
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
         has_flux = any(a.get("name") == FLUX_CAPACITOR for a in atk.get("augments", []))
         has_afp = any(a.get("name") == ABLATIVE_FOAM_PODS for a in dfn.get("augments", []))
+        activated_aug = None
+        use_prism_coil = False
         if act == "Activate":
             active_aug = next(
                 (a for a in atk.get("augments", []) if a.get("type", "").lower() == "active"),
                 None,
             )
             if active_aug:
-                st.logs.append(f"{atk['name']} activates {active_aug['name']}!")
+                activated_aug = active_aug["name"]
+                st.logs.append(f"{atk['name']} activates {activated_aug}!")
+                if activated_aug == IMPROVED_CLOTTING_MATRIX:
+                    max_hp = st.user_max_hp if side == "user" else st.opp_max_hp
+                    heal = max(1, math.ceil(0.10 * max_hp))
+                    if side == "user":
+                        st.user_current_hp = min(st.user_current_hp + heal, st.user_max_hp)
+                    else:
+                        st.opp_current_hp = min(st.opp_current_hp + heal, st.opp_max_hp)
+                    st.logs.append(f"{atk['name']} heals {heal} HP.")
+                elif activated_aug == AEGIS_COUNTER:
+                    if side == "user":
+                        st.user_aegis_charges += 1
+                        st.logs.append(f"{atk['name']}'s {AEGIS_COUNTER} is primed ({st.user_aegis_charges}).")
+                    else:
+                        st.opp_aegis_charges += 1
+                        st.logs.append(f"{atk['name']}'s {AEGIS_COUNTER} is primed ({st.opp_aegis_charges}).")
+                elif activated_aug == PRISM_COIL:
+                    use_prism_coil = True
                 act = "Attack"
             else:
                 st.logs.append(f"{atk['name']} has no activate augment; attacks aggressively.")
@@ -1092,21 +1155,31 @@ def simulate_round(st: BattleState):
                         st.logs.append(f"{dfn['name']} is down!")
                         break
             continue
-        swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
+        swings = 1 if use_prism_coil else (2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1)
         for _ in range(swings):
-            if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+            if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+                break
             S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
-            AR_val = 0 if act == "Special" else dfn["stats"]["AR"] // 2
-            rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
-            s = sum(rolls)
-            dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
-            if act == "Aggressive": dmg = math.ceil(dmg * 1.25)
-            if act in ("Attack", "Aggressive") and any(
-                a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])
-            ):
-                dmg = max(1, math.ceil(dmg * 0.9))
-            if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
-            if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
+            if use_prism_coil:
+                rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10) + 2)]
+                s = sum(rolls)
+                dmg = max(1, math.ceil((s * s) / (s if s > 0 else 1)))
+                dmg = math.ceil(dmg * 1.20)
+            else:
+                AR_val = 0 if act == "Special" else dfn["stats"]["AR"] // 2
+                rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
+                s = sum(rolls)
+                dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
+                if act == "Aggressive":
+                    dmg = math.ceil(dmg * 1.25)
+                if act in ("Attack", "Aggressive") and any(
+                    a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])
+                ):
+                    dmg = max(1, math.ceil(dmg * 0.9))
+            if dfn_act == "Defend":
+                dmg = max(1, math.ceil(dmg * 0.5))
+            if sudden_death_mult > 1.0:
+                dmg = max(1, math.ceil(dmg * sudden_death_mult))
             if has_afp:
                 if side == "user":
                     if st.opp_afp_charges > 0:
@@ -1132,12 +1205,39 @@ def simulate_round(st: BattleState):
                     st.user_afp_charges = 2
                     st.user_afp_triggered = True
                     st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
-            act_word = {"Attack":"hits","Aggressive":"aggressively hits","Special":"unleashes a special attack on"}[act]
-            note = " (defended)" if dfn_act == "Defend" else ""
-            st.logs.append(f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg"
-                           f"{' (rolls '+str(rolls)+')' if act!='Special' else ''}{note}")
+            if use_prism_coil:
+                note = " (defended)" if dfn_act == "Defend" else ""
+                st.logs.append(
+                    f"{atk['name']} fires {PRISM_COIL} at {dfn['name']} for {dmg} dmg (rolls {rolls}){note}"
+                )
+            else:
+                act_word = {"Attack": "hits", "Aggressive": "aggressively hits", "Special": "unleashes a special attack on"}[act]
+                note = " (defended)" if dfn_act == "Defend" else ""
+                st.logs.append(
+                    f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg" +
+                    (f" (rolls {rolls})" if act != "Special" else "") + note
+                )
+            if side == "user" and st.opp_aegis_charges > 0:
+                reflect = max(1, math.ceil(dmg * 0.5 * st.opp_aegis_charges))
+                st.user_current_hp -= reflect
+                st.logs.append(
+                    f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
+                )
+                st.opp_aegis_charges = 0
+                st.user_aegis_charges = 0
+            elif side == "opp" and st.user_aegis_charges > 0:
+                reflect = max(1, math.ceil(dmg * 0.5 * st.user_aegis_charges))
+                st.opp_current_hp -= reflect
+                st.logs.append(
+                    f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
+                )
+                st.user_aegis_charges = 0
+                st.opp_aegis_charges = 0
+            if st.user_current_hp <= 0:
+                st.logs.append(f"{st.user_creature['name']} is down!")
+            if st.opp_current_hp <= 0:
+                st.logs.append(f"{st.opp_creature['name']} is down!")
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-                st.logs.append(f"{dfn['name']} is down!")
                 break
 
         if has_flux and st.rounds % 5 == 0 and st.user_current_hp > 0 and st.opp_current_hp > 0:
@@ -1181,8 +1281,27 @@ def simulate_round(st: BattleState):
                     f"{atk['name']} makes an extra attack on {dfn['name']} for {dmg} dmg" +
                     f" (rolls {rolls})" + (" (defended)" if dfn_act == "Defend" else "")
                 )
+                if side == "user" and st.opp_aegis_charges > 0:
+                    reflect = max(1, math.ceil(dmg * 0.5 * st.opp_aegis_charges))
+                    st.user_current_hp -= reflect
+                    st.logs.append(
+                        f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
+                    )
+                    st.opp_aegis_charges = 0
+                    st.user_aegis_charges = 0
+                elif side == "opp" and st.user_aegis_charges > 0:
+                    reflect = max(1, math.ceil(dmg * 0.5 * st.user_aegis_charges))
+                    st.opp_current_hp -= reflect
+                    st.logs.append(
+                        f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
+                    )
+                    st.user_aegis_charges = 0
+                    st.opp_aegis_charges = 0
+                if st.user_current_hp <= 0:
+                    st.logs.append(f"{st.user_creature['name']} is down!")
+                if st.opp_current_hp <= 0:
+                    st.logs.append(f"{st.opp_creature['name']} is down!")
                 if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-                    st.logs.append(f"{dfn['name']} is down!")
                     break
     st.logs.append(
         f"{st.user_creature['name']} HP {max(st.user_current_hp,0)}/{st.user_max_hp} | "
@@ -4426,6 +4545,21 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         inter.user.id,
         FLUX_CAPACITOR,
     )
+    qty_clot = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        IMPROVED_CLOTTING_MATRIX,
+    )
+    qty_aegis = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        AEGIS_COUNTER,
+    )
+    qty_prism = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        PRISM_COIL,
+    )
     qty_small = int(qty_small or 0)
     qty_large = int(qty_large or 0)
     qty_full = int(qty_full or 0)
@@ -4436,6 +4570,9 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     qty_ballistics = int(qty_ballistics or 0)
     qty_foam = int(qty_foam or 0)
     qty_flux = int(qty_flux or 0)
+    qty_clot = int(qty_clot or 0)
+    qty_aegis = int(qty_aegis or 0)
+    qty_prism = int(qty_prism or 0)
     if (
         qty_small <= 0
         and qty_large <= 0
@@ -4447,6 +4584,9 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         and qty_ballistics <= 0
         and qty_foam <= 0
         and qty_flux <= 0
+        and qty_clot <= 0
+        and qty_aegis <= 0
+        and qty_prism <= 0
     ):
         return await inter.response.send_message("You have no items.", ephemeral=True)
     await inter.response.send_message(
@@ -4464,6 +4604,9 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
             qty_ballistics,
             qty_foam,
             qty_flux,
+            qty_clot,
+            qty_aegis,
+            qty_prism,
         ),
     )
 
@@ -4482,6 +4625,9 @@ class UseItemView(discord.ui.View):
         ballistics_qty: int,
         foam_qty: int,
         flux_qty: int,
+        clot_qty: int,
+        aegis_qty: int,
+        prism_qty: int,
     ):
         super().__init__(timeout=None)
         self.creature_name = creature_name
@@ -4505,6 +4651,12 @@ class UseItemView(discord.ui.View):
         self.use_foam.disabled = foam_qty <= 0
         self.use_flux.label = f"{FLUX_CAPACITOR} ({flux_qty})"
         self.use_flux.disabled = flux_qty <= 0
+        self.use_clot.label = f"{IMPROVED_CLOTTING_MATRIX} ({clot_qty})"
+        self.use_clot.disabled = clot_qty <= 0
+        self.use_aegis.label = f"{AEGIS_COUNTER} ({aegis_qty})"
+        self.use_aegis.disabled = aegis_qty <= 0
+        self.use_prism.label = f"{PRISM_COIL} ({prism_qty})"
+        self.use_prism.disabled = prism_qty <= 0
 
     @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_small(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4545,6 +4697,18 @@ class UseItemView(discord.ui.View):
     @discord.ui.button(label=FLUX_CAPACITOR, style=discord.ButtonStyle.primary)
     async def use_flux(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _install_augment(interaction, self.creature_name, FLUX_CAPACITOR)
+
+    @discord.ui.button(label=IMPROVED_CLOTTING_MATRIX, style=discord.ButtonStyle.primary)
+    async def use_clot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _install_augment(interaction, self.creature_name, IMPROVED_CLOTTING_MATRIX)
+
+    @discord.ui.button(label=AEGIS_COUNTER, style=discord.ButtonStyle.primary)
+    async def use_aegis(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _install_augment(interaction, self.creature_name, AEGIS_COUNTER)
+
+    @discord.ui.button(label=PRISM_COIL, style=discord.ButtonStyle.primary)
+    async def use_prism(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _install_augment(interaction, self.creature_name, PRISM_COIL)
 
 
 class StatTrainerModal(discord.ui.Modal):

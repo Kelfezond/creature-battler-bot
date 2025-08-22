@@ -2493,6 +2493,20 @@ async def creatures(inter: discord.Interaction):
 
     left_map = await _battles_left_map(ids)
     pvp_ready_map = await _pvp_ready_map(ids)
+    aug_rows = await (await db_pool()).fetch(
+        """
+        SELECT creature_id,
+               ARRAY_AGG(augment_name ORDER BY augment_name) AS aug_names
+        FROM creature_augments
+        WHERE creature_id = ANY($1::int[])
+        GROUP BY creature_id
+        """,
+        ids,
+    )
+    augment_map = {
+        int(r["creature_id"]): (list(r["aug_names"]) if r["aug_names"] else [])
+        for r in aug_rows
+    }
 
     first = True
     for r in rows:
@@ -2511,6 +2525,9 @@ async def creatures(inter: discord.Interaction):
         pvp_ready = r["not_listed"] and pvp_ready_map.get(int(r["id"]), True)
         pvp_icon = "✅" if pvp_ready else "❌"
 
+        augments = augment_map.get(int(r["id"]), [])
+        aug_str = ", ".join(augments) if augments else "None"
+
         lines = [
             f"**{r['name']}** ({r['rarity']})",
             f"{desc}",
@@ -2518,6 +2535,7 @@ async def creatures(inter: discord.Interaction):
             f"AR: {st.get('AR', 0)}  PATK: {st.get('PATK', 0)}  SATK: {st.get('SATK', 0)}  SPD: {st.get('SPD', 0)}",
             f"Overall: {overall}  |  Glyph: {glyph_disp}",
             f"Personality: { (personality.get('name') + ' (' + ','.join(personality.get('stats', [])) + ')') if personality else '-' }",
+            f"Augments ({len(augments)}/3): {aug_str}",
             f"Battles left today: **{left}/{DAILY_BATTLE_CAP}**",
             f"PvP: {pvp_icon}",
         ]

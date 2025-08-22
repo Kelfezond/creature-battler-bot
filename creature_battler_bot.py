@@ -19,6 +19,11 @@ async def _max_glyph_for_trainer(user_id: int) -> int:
 
 import asyncio, json, logging, math, os, random, time, re
 
+
+def fmt_cash(amount: int) -> str:
+    """Return a cash value formatted with apostrophes as thousands separators."""
+    return f"{int(amount):,}".replace(",", "'")
+
 # Global battle lock
 active_battle_user_id = None
 from dataclasses import dataclass
@@ -2029,7 +2034,7 @@ async def update_shop_now(reason: str = "manual") -> None:
                 name=r["name"],
                 value=(
                     f"Trainer: {r['trainer_name']} — {r['rarity']} "
-                    f"— OVR {ovr} — Personality: {p_name} — Price: {r['price']}"
+                    f"— OVR {ovr} — Personality: {p_name} — Price: {fmt_cash(r['price'])}"
                 ),
                 inline=False,
             )
@@ -2059,37 +2064,37 @@ async def update_item_store_now(reason: str = "manual") -> None:
     )
     embed.add_field(
         name=SMALL_HEALING_INJECTOR,
-        value=f"Price: {SMALL_HEALING_INJECTOR_PRICE}\n{SMALL_HEALING_INJECTOR_DESC}",
+        value=f"Price: {fmt_cash(SMALL_HEALING_INJECTOR_PRICE)}\n{SMALL_HEALING_INJECTOR_DESC}",
         inline=False,
     )
     embed.add_field(
         name=LARGE_HEALING_INJECTOR,
-        value=f"Price: {LARGE_HEALING_INJECTOR_PRICE}\n{LARGE_HEALING_INJECTOR_DESC}",
+        value=f"Price: {fmt_cash(LARGE_HEALING_INJECTOR_PRICE)}\n{LARGE_HEALING_INJECTOR_DESC}",
         inline=False,
     )
     embed.add_field(
         name=FULL_HEALING_INJECTOR,
-        value=f"Price: {FULL_HEALING_INJECTOR_PRICE}\n{FULL_HEALING_INJECTOR_DESC}",
+        value=f"Price: {fmt_cash(FULL_HEALING_INJECTOR_PRICE)}\n{FULL_HEALING_INJECTOR_DESC}",
         inline=False,
     )
     embed.add_field(
         name=STAT_TRAINER,
-        value=f"Price: {STAT_TRAINER_PRICE}\n{STAT_TRAINER_DESC}",
+        value=f"Price: {fmt_cash(STAT_TRAINER_PRICE)}\n{STAT_TRAINER_DESC}",
         inline=False,
     )
     embed.add_field(
         name=PREMIUM_STAT_TRAINER,
-        value=f"Price: {PREMIUM_STAT_TRAINER_PRICE}\n{PREMIUM_STAT_TRAINER_DESC}",
+        value=f"Price: {fmt_cash(PREMIUM_STAT_TRAINER_PRICE)}\n{PREMIUM_STAT_TRAINER_DESC}",
         inline=False,
     )
     embed.add_field(
         name=GENETIC_RESHUFFLER,
-        value=f"Price: {GENETIC_RESHUFFLER_PRICE}\n{GENETIC_RESHUFFLER_DESC}",
+        value=f"Price: {fmt_cash(GENETIC_RESHUFFLER_PRICE)}\n{GENETIC_RESHUFFLER_DESC}",
         inline=False,
     )
     embed.add_field(
         name=EXHAUSTION_ELIMINATOR,
-        value=f"Price: {EXHAUSTION_ELIMINATOR_PRICE}\n{EXHAUSTION_ELIMINATOR_DESC}",
+        value=f"Price: {fmt_cash(EXHAUSTION_ELIMINATOR_PRICE)}\n{EXHAUSTION_ELIMINATOR_DESC}",
         inline=False,
     )
     try:
@@ -2119,7 +2124,7 @@ async def update_augment_store_now(reason: str = "manual") -> None:
         lines = []
         for data in grade_augs:
             lines.append(
-                f"**{data['name']}** ({data['type']})\n{data['desc']}\nCost: {data['price']}"
+                f"**{data['name']}** ({data['type']})\n{data['desc']}\nCost: {fmt_cash(data['price'])}"
             )
         embed.add_field(name=f"Grade {grade}", value="\n\n".join(lines), inline=False)
     try:
@@ -2161,7 +2166,7 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
             await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", st.wager, st.opp_user_id)
 
         st.logs.append(
-            f"You {'won' if player_won else 'lost'} the PvP battle: {'+' if player_won else '-'}{st.wager} cash."
+            f"You {'won' if player_won else 'lost'} the PvP battle: {'+' if player_won else '-'}{fmt_cash(st.wager)} cash."
         )
 
         gained_stat = None
@@ -2236,7 +2241,9 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
     await _record_result(st.user_id, st.user_creature["name"], player_won)
 
     await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", payout, st.user_id)
-    st.logs.append(f"You {'won' if player_won else 'lost'} the Tier {st.tier} battle: +{payout} cash awarded.")
+    st.logs.append(
+        f"You {'won' if player_won else 'lost'} the Tier {st.tier} battle: +{fmt_cash(payout)} cash awarded."
+    )
 
     if player_won:
         wins, unlocked_now = await _record_win_and_maybe_unlock(st.creature_id, st.tier)
@@ -2310,7 +2317,7 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
         lines = [
             f"**PvP Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs {opp_name}'s **{st.opp_creature['name']}**",
             f"🏅 Winner: {winner_trainer}'s **{winner_cre}**",
-            f"💰 {winner_trainer} wins {abs(summary.get('payout',0))} cash!",
+            f"💰 {winner_trainer} wins {fmt_cash(abs(summary.get('payout',0)))} cash!",
         ]
         gained = summary.get("gained_stat")
         if gained:
@@ -2323,7 +2330,7 @@ def format_public_battle_summary(st: BattleState, summary: dict, trainer_name: s
         lines = [
             f"**Battle Result** — {trainer_name}'s **{st.user_creature['name']}** vs **{st.opp_creature['name']}** (Tier {st.tier})",
             f"🏅 Winner: **{winner}**",
-            f"💰 Payout: **+{summary.get('payout', 0)}** cash to {trainer_name}",
+            f"💰 Payout: **+{fmt_cash(summary.get('payout', 0))}** cash to {trainer_name}",
         ]
         wins = summary.get("wins")
         if wins is not None:
@@ -2669,11 +2676,11 @@ async def register(inter: discord.Interaction):
         logger.warning("Unexpected error while assigning 'Testers' role: %s", e)
 
     await inter.response.send_message(
-        "Profile created! You received 20 000 cash and 5 trainer points.",
+        f"Profile created! You received {fmt_cash(20000)} cash and 5 trainer points.",
         ephemeral=True
     )
 
-@bot.tree.command(description="Spawn a new creature egg (10 000 cash)")
+@bot.tree.command(description="Spawn a new creature egg (10'000 cash)")
 async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if not row:
@@ -2696,7 +2703,7 @@ async def spawn(inter: discord.Interaction):
             "UPDATE trainers SET cash = cash + 10000 WHERE user_id=$1", inter.user.id
         )
         await inter.followup.send(
-            "Creature generation timed out. 10,000 cash has been reimbursed.",
+            f"Creature generation timed out. {fmt_cash(10000)} cash has been reimbursed.",
             ephemeral=True,
         )
         return
@@ -2858,7 +2865,8 @@ async def quicksell(inter: discord.Interaction, creature_name: str):
             await conn.execute("DELETE FROM creatures WHERE id=$1", c_row["id"])
             await conn.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", price, inter.user.id)
     await inter.response.send_message(
-        f"Sold **{c_row['name']}** ({rarity}) for **{price}** cash.", ephemeral=True
+        f"Sold **{c_row['name']}** ({rarity}) for **{fmt_cash(price)}** cash.",
+        ephemeral=True,
     )
     asyncio.create_task(update_leaderboard_now(reason="quicksell"))
     asyncio.create_task(update_shop_now(reason="quicksell"))
@@ -2899,7 +2907,8 @@ async def sell(inter: discord.Interaction, creature_name: str, price: int):
         price,
     )
     await inter.response.send_message(
-        f"Listed **{c_row['name']}** for **{price}** cash in the shop.", ephemeral=True
+        f"Listed **{c_row['name']}** for **{fmt_cash(price)}** cash in the shop.",
+        ephemeral=True,
     )
     asyncio.create_task(update_shop_now(reason="sell"))
 
@@ -2932,7 +2941,7 @@ async def withdraw(inter: discord.Interaction, creature_name: str):
             f"{c_row['name']} is not listed in the shop.", ephemeral=True
         )
     await inter.response.send_message(
-        f"Withdrew **{c_row['name']}** from the shop (was listed for {deleted['price']} cash).",
+        f"Withdrew **{c_row['name']}** from the shop (was listed for {fmt_cash(deleted['price'])} cash).",
         ephemeral=True,
     )
     asyncio.create_task(update_shop_now(reason="withdraw"))
@@ -2995,7 +3004,7 @@ async def buy(inter: discord.Interaction, creature_name: str):
 
     await _ensure_record(inter.user.id, c_row["id"], c_row["name"])
     await inter.response.send_message(
-        f"You bought **{c_row['name']}** from {c_row['trainer_name']} for {price} cash.",
+        f"You bought **{c_row['name']}** from {c_row['trainer_name']} for {fmt_cash(price)} cash.",
         ephemeral=True,
     )
     asyncio.create_task(update_shop_now(reason="buy"))
@@ -3558,7 +3567,8 @@ async def pvp(inter: discord.Interaction):
             return await modal_inter.response.send_message("You don't have enough cash for this wager.", ephemeral=True)
         if opp_tr["cash"] < wager:
             return await modal_inter.response.send_message(
-                f"Opponent only has {opp_tr['cash']} cash; reduce the wager.", ephemeral=True
+                f"Opponent only has {fmt_cash(opp_tr['cash'])} cash; reduce the wager.",
+                ephemeral=True,
             )
         ready_map = await _pvp_ready_map([int(c_row["id"]), int(opp_row["id"])])
         if not all(ready_map.values()):
@@ -3648,7 +3658,7 @@ async def pvp(inter: discord.Interaction):
                     active_battles[inter.user.id] = st
                     active_battles[opponent_id] = st
                     st.logs += [
-                        f"PvP battle start! Wager {wager} cash.",
+                        f"PvP battle start! Wager {fmt_cash(wager)} cash.",
                         f"{st.user_creature['name']} vs {st.opp_creature['name']}",
                         "",
                         "Challenger:",
@@ -3757,7 +3767,9 @@ async def pvp(inter: discord.Interaction):
 async def cash(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if row:
-        await inter.response.send_message(f"You have {row['cash']} cash.", ephemeral=True)
+        await inter.response.send_message(
+            f"You have {fmt_cash(row['cash'])} cash.", ephemeral=True
+        )
 
 @bot.tree.command(description="(Admin) Add cash to a player by name/mention/id, or 'all'")
 async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
@@ -3775,7 +3787,10 @@ async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
             count = int(str(updated).split()[-1])
         except Exception:
             count = 0
-        return await inter.response.send_message(f"Added {amount} cash to **all** trainers ({count} rows).", ephemeral=True)
+        return await inter.response.send_message(
+            f"Added {fmt_cash(amount)} cash to **all** trainers ({count} rows).",
+            ephemeral=True,
+        )
     else:
         user_id = await _extract_user_id_from_mention_or_id(tgt)
         if user_id is None:
@@ -3792,7 +3807,9 @@ async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
 
     await pool.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", amount, user_id)
     name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
-    await inter.response.send_message(f"Added **{amount}** cash to **{name}**.", ephemeral=True)
+    await inter.response.send_message(
+        f"Added **{fmt_cash(amount)}** cash to **{name}**.", ephemeral=True
+    )
 
 @bot.tree.command(description="(Admin) Add trainer points to a player by name/mention/id, or 'all'")
 async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str = "me"):
@@ -3927,7 +3944,7 @@ async def upgrade(inter: discord.Interaction):
     nxt = FACILITY_LEVELS[next_level]
     msg += [
         f"**Next Upgrade → Level {next_level}: {nxt['name']}**",
-        f"Cost: {nxt['cost']} cash",
+        f"Cost: {fmt_cash(nxt['cost'])} cash",
         f"New bonus: +{nxt['bonus']} (daily total = {daily_trainer_points_for(next_level)})",
         f"Description: {nxt['desc']}",
         "",
@@ -3959,7 +3976,7 @@ async def _do_upgrade(inter: discord.Interaction):
 
     if row["cash"] < cost:
         return await inter.response.send_message(
-            f"Not enough cash. You need {cost} but only have {row['cash']}.",
+            f"Not enough cash. You need {fmt_cash(cost)} but only have {fmt_cash(row['cash'])}.",
             ephemeral=True,
         )
 

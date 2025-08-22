@@ -298,6 +298,22 @@ SUBDERMAL_BALLISTICS_GEL_DESC = "Incoming regular attack damage is reduced by 10
 SUBDERMAL_BALLISTICS_GEL_GRADE = "C"
 SUBDERMAL_BALLISTICS_GEL_TYPE = "Passive"
 
+ABLATIVE_FOAM_PODS = "Ablative Foam-Pods"
+ABLATIVE_FOAM_PODS_PRICE = 1_600_000
+ABLATIVE_FOAM_PODS_DESC = (
+    "Once per battle, when the creature first drops to \u226440% max HP, the next 2 incoming hits it takes are reduced to \u00d70.35 final damage."
+)
+ABLATIVE_FOAM_PODS_GRADE = "B"
+ABLATIVE_FOAM_PODS_TYPE = "Passive"
+
+FLUX_CAPACITOR = "Flux Capacitor"
+FLUX_CAPACITOR_PRICE = 10_000_000
+FLUX_CAPACITOR_DESC = (
+    "Every 5 rounds starting from round 5 the creature makes 1 additional regular attack"
+)
+FLUX_CAPACITOR_GRADE = "A"
+FLUX_CAPACITOR_TYPE = "Passive"
+
 AUGMENTS = {
     SUBDERMAL_BALLISTICS_GEL.lower(): {
         "name": SUBDERMAL_BALLISTICS_GEL,
@@ -305,7 +321,21 @@ AUGMENTS = {
         "desc": SUBDERMAL_BALLISTICS_GEL_DESC,
         "grade": SUBDERMAL_BALLISTICS_GEL_GRADE,
         "type": SUBDERMAL_BALLISTICS_GEL_TYPE,
-    }
+    },
+    ABLATIVE_FOAM_PODS.lower(): {
+        "name": ABLATIVE_FOAM_PODS,
+        "price": ABLATIVE_FOAM_PODS_PRICE,
+        "desc": ABLATIVE_FOAM_PODS_DESC,
+        "grade": ABLATIVE_FOAM_PODS_GRADE,
+        "type": ABLATIVE_FOAM_PODS_TYPE,
+    },
+    FLUX_CAPACITOR.lower(): {
+        "name": FLUX_CAPACITOR,
+        "price": FLUX_CAPACITOR_PRICE,
+        "desc": FLUX_CAPACITOR_DESC,
+        "grade": FLUX_CAPACITOR_GRADE,
+        "type": FLUX_CAPACITOR_TYPE,
+    },
 }
 
 def spawn_rarity() -> str:
@@ -441,6 +471,10 @@ class BattleState:
     opp_trainer_name: Optional[str] = None
     next_log_idx: int = 0
     rounds: int = 0
+    user_afp_charges: int = 0
+    opp_afp_charges: int = 0
+    user_afp_triggered: bool = False
+    opp_afp_triggered: bool = False
 
 active_battles: Dict[int, BattleState] = {}
 
@@ -997,6 +1031,8 @@ def simulate_round(st: BattleState):
         order.reverse()
     for side, atk, dfn, act, dfn_act in order:
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+        has_flux = any(a.get("name") == FLUX_CAPACITOR for a in atk.get("augments", []))
+        has_afp = any(a.get("name") == ABLATIVE_FOAM_PODS for a in dfn.get("augments", []))
         if act == "Activate":
             active_aug = next(
                 (a for a in atk.get("augments", []) if a.get("type", "").lower() == "active"),
@@ -1009,7 +1045,52 @@ def simulate_round(st: BattleState):
                 st.logs.append(f"{atk['name']} has no activate augment; attacks aggressively.")
                 act = "Aggressive"
         if act == "Defend":
+
             st.logs.append(f"{atk['name']} is defending.")
+            if has_flux and st.rounds % 5 == 0 and st.user_current_hp > 0 and st.opp_current_hp > 0:
+                extra_attacks = st.rounds // 5
+                for _ in range(extra_attacks):
+                    S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+                    AR_val = dfn["stats"]["AR"] // 2
+                    rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
+                    s = sum(rolls)
+                    dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
+                    if any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])):
+                        dmg = max(1, math.ceil(dmg * 0.9))
+                    if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
+                    if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
+                    if has_afp:
+                        if side == "user":
+                            if st.opp_afp_charges > 0:
+                                dmg = max(1, math.ceil(dmg * 0.35))
+                                st.opp_afp_charges -= 1
+                        else:
+                            if st.user_afp_charges > 0:
+                                dmg = max(1, math.ceil(dmg * 0.35))
+                                st.user_afp_charges -= 1
+                    if side == "user":
+                        st.opp_current_hp -= dmg
+                        new_hp = st.opp_current_hp
+                        max_hp = st.opp_max_hp
+                        if has_afp and not st.opp_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+                            st.opp_afp_charges = 2
+                            st.opp_afp_triggered = True
+                            st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
+                    else:
+                        st.user_current_hp -= dmg
+                        new_hp = st.user_current_hp
+                        max_hp = st.user_max_hp
+                        if has_afp and not st.user_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+                            st.user_afp_charges = 2
+                            st.user_afp_triggered = True
+                            st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
+                    st.logs.append(
+                        f"{atk['name']} makes an extra attack on {dfn['name']} for {dmg} dmg" +
+                        f" (rolls {rolls})" + (" (defended)" if dfn_act == "Defend" else "")
+                    )
+                    if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+                        st.logs.append(f"{dfn['name']} is down!")
+                        break
             continue
         swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
         for _ in range(swings):
@@ -1026,8 +1107,31 @@ def simulate_round(st: BattleState):
                 dmg = max(1, math.ceil(dmg * 0.9))
             if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
             if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
-            if side == "user": st.opp_current_hp -= dmg
-            else: st.user_current_hp -= dmg
+            if has_afp:
+                if side == "user":
+                    if st.opp_afp_charges > 0:
+                        dmg = max(1, math.ceil(dmg * 0.35))
+                        st.opp_afp_charges -= 1
+                else:
+                    if st.user_afp_charges > 0:
+                        dmg = max(1, math.ceil(dmg * 0.35))
+                        st.user_afp_charges -= 1
+            if side == "user":
+                st.opp_current_hp -= dmg
+                new_hp = st.opp_current_hp
+                max_hp = st.opp_max_hp
+                if has_afp and not st.opp_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+                    st.opp_afp_charges = 2
+                    st.opp_afp_triggered = True
+                    st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
+            else:
+                st.user_current_hp -= dmg
+                new_hp = st.user_current_hp
+                max_hp = st.user_max_hp
+                if has_afp and not st.user_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+                    st.user_afp_charges = 2
+                    st.user_afp_triggered = True
+                    st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
             act_word = {"Attack":"hits","Aggressive":"aggressively hits","Special":"unleashes a special attack on"}[act]
             note = " (defended)" if dfn_act == "Defend" else ""
             st.logs.append(f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg"
@@ -1035,6 +1139,51 @@ def simulate_round(st: BattleState):
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
                 st.logs.append(f"{dfn['name']} is down!")
                 break
+
+        if has_flux and st.rounds % 5 == 0 and st.user_current_hp > 0 and st.opp_current_hp > 0:
+            extra_attacks = st.rounds // 5
+            for _ in range(extra_attacks):
+                S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+                AR_val = dfn["stats"]["AR"] // 2
+                rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
+                s = sum(rolls)
+                dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
+                if any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])):
+                    dmg = max(1, math.ceil(dmg * 0.9))
+                if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
+                if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
+                if has_afp:
+                    if side == "user":
+                        if st.opp_afp_charges > 0:
+                            dmg = max(1, math.ceil(dmg * 0.35))
+                            st.opp_afp_charges -= 1
+                    else:
+                        if st.user_afp_charges > 0:
+                            dmg = max(1, math.ceil(dmg * 0.35))
+                            st.user_afp_charges -= 1
+                if side == "user":
+                    st.opp_current_hp -= dmg
+                    new_hp = st.opp_current_hp
+                    max_hp = st.opp_max_hp
+                    if has_afp and not st.opp_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+                        st.opp_afp_charges = 2
+                        st.opp_afp_triggered = True
+                        st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
+                else:
+                    st.user_current_hp -= dmg
+                    new_hp = st.user_current_hp
+                    max_hp = st.user_max_hp
+                    if has_afp and not st.user_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+                        st.user_afp_charges = 2
+                        st.user_afp_triggered = True
+                        st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
+                st.logs.append(
+                    f"{atk['name']} makes an extra attack on {dfn['name']} for {dmg} dmg" +
+                    f" (rolls {rolls})" + (" (defended)" if dfn_act == "Defend" else "")
+                )
+                if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+                    st.logs.append(f"{dfn['name']} is down!")
+                    break
     st.logs.append(
         f"{st.user_creature['name']} HP {max(st.user_current_hp,0)}/{st.user_max_hp} | "
         f"{st.opp_creature['name']} HP {max(st.opp_current_hp,0)}/{st.opp_max_hp}"
@@ -1843,15 +1992,17 @@ async def update_augment_store_now(reason: str = "manual") -> None:
         title="Augment Store",
         description=f"Updated: <t:{updated_ts}:R>",
     )
-    for data in AUGMENTS.values():
-        embed.add_field(
-            name=data["name"],
-            value=(
-                f"Grade {data['grade']} {data['type']}\n"
-                f"{data['desc']}\nCost: {data['price']}"
-            ),
-            inline=False,
-        )
+    for grade in ["A", "B", "C"]:
+        grade_augs = [a for a in AUGMENTS.values() if a["grade"].upper() == grade]
+        if not grade_augs:
+            continue
+        grade_augs.sort(key=lambda a: a["price"])
+        lines = []
+        for data in grade_augs:
+            lines.append(
+                f"**{data['name']}** ({data['type']})\n{data['desc']}\nCost: {data['price']}"
+            )
+        embed.add_field(name=f"Grade {grade}", value="\n\n".join(lines), inline=False)
     try:
         await message.edit(content=None, embed=embed, view=AugmentStoreView())
         logger.info("Augment store updated (%s).", reason)
@@ -4265,6 +4416,16 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         inter.user.id,
         SUBDERMAL_BALLISTICS_GEL,
     )
+    qty_foam = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        ABLATIVE_FOAM_PODS,
+    )
+    qty_flux = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        FLUX_CAPACITOR,
+    )
     qty_small = int(qty_small or 0)
     qty_large = int(qty_large or 0)
     qty_full = int(qty_full or 0)
@@ -4273,6 +4434,8 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     qty_premium = int(qty_premium or 0)
     qty_reshuffler = int(qty_reshuffler or 0)
     qty_ballistics = int(qty_ballistics or 0)
+    qty_foam = int(qty_foam or 0)
+    qty_flux = int(qty_flux or 0)
     if (
         qty_small <= 0
         and qty_large <= 0
@@ -4282,6 +4445,8 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         and qty_premium <= 0
         and qty_reshuffler <= 0
         and qty_ballistics <= 0
+        and qty_foam <= 0
+        and qty_flux <= 0
     ):
         return await inter.response.send_message("You have no items.", ephemeral=True)
     await inter.response.send_message(
@@ -4297,6 +4462,8 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
             qty_premium,
             qty_reshuffler,
             qty_ballistics,
+            qty_foam,
+            qty_flux,
         ),
     )
 
@@ -4313,6 +4480,8 @@ class UseItemView(discord.ui.View):
         premium_qty: int,
         reshuffler_qty: int,
         ballistics_qty: int,
+        foam_qty: int,
+        flux_qty: int,
     ):
         super().__init__(timeout=None)
         self.creature_name = creature_name
@@ -4332,6 +4501,10 @@ class UseItemView(discord.ui.View):
         self.use_reshuffler.disabled = reshuffler_qty <= 0
         self.use_ballistics.label = f"{SUBDERMAL_BALLISTICS_GEL} ({ballistics_qty})"
         self.use_ballistics.disabled = ballistics_qty <= 0
+        self.use_foam.label = f"{ABLATIVE_FOAM_PODS} ({foam_qty})"
+        self.use_foam.disabled = foam_qty <= 0
+        self.use_flux.label = f"{FLUX_CAPACITOR} ({flux_qty})"
+        self.use_flux.disabled = flux_qty <= 0
 
     @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_small(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4364,6 +4537,14 @@ class UseItemView(discord.ui.View):
     @discord.ui.button(label=SUBDERMAL_BALLISTICS_GEL, style=discord.ButtonStyle.primary)
     async def use_ballistics(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _install_augment(interaction, self.creature_name, SUBDERMAL_BALLISTICS_GEL)
+
+    @discord.ui.button(label=ABLATIVE_FOAM_PODS, style=discord.ButtonStyle.primary)
+    async def use_foam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _install_augment(interaction, self.creature_name, ABLATIVE_FOAM_PODS)
+
+    @discord.ui.button(label=FLUX_CAPACITOR, style=discord.ButtonStyle.primary)
+    async def use_flux(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _install_augment(interaction, self.creature_name, FLUX_CAPACITOR)
 
 
 class StatTrainerModal(discord.ui.Modal):

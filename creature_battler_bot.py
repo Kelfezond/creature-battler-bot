@@ -53,6 +53,8 @@ LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
 SHOP_CHANNEL_ID_ENV = os.getenv("SHOP_CHANNEL_ID")
 # Optional: channel where the item store is posted/updated.
 ITEM_STORE_CHANNEL_ID_ENV = os.getenv("ITEM_STORE_CHANNEL_ID")
+# Optional: channel where the augment store is posted/updated.
+AUGMENT_STORE_CHANNEL_ID_ENV = os.getenv("AUGMENT_STORE_CHANNEL_ID")
 # Optional: channel where interactive controls are posted.
 CONTROLS_CHANNEL_ID_ENV = os.getenv("CONTROLS_CHANNEL_ID")
 
@@ -215,6 +217,21 @@ CREATE TABLE IF NOT EXISTS item_store_messages (
   message_id BIGINT
 );
 
+-- Store the message we keep editing for the augment store
+CREATE TABLE IF NOT EXISTS augment_store_messages (
+  channel_id BIGINT PRIMARY KEY,
+  message_id BIGINT
+);
+
+-- Per-creature installed augments
+CREATE TABLE IF NOT EXISTS creature_augments (
+  creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
+  augment_name TEXT NOT NULL,
+  grade TEXT NOT NULL,
+  augment_type TEXT NOT NULL,
+  PRIMARY KEY (creature_id, augment_name)
+);
+
 -- Per-trainer inventory of items
 CREATE TABLE IF NOT EXISTS trainer_items (
   user_id BIGINT NOT NULL,
@@ -274,6 +291,22 @@ EXHAUSTION_ELIMINATOR_DESC = "Restores one daily battle use."
 GENETIC_RESHUFFLER = "Genetic Reshuffler"
 GENETIC_RESHUFFLER_PRICE = 35_000
 GENETIC_RESHUFFLER_DESC = "Randomizes a creature's personality."
+
+SUBDERMAL_BALLISTICS_GEL = "Subdermal Ballistics Gel"
+SUBDERMAL_BALLISTICS_GEL_PRICE = 90_000
+SUBDERMAL_BALLISTICS_GEL_DESC = "Incoming regular attack damage is reduced by 10%"
+SUBDERMAL_BALLISTICS_GEL_GRADE = "C"
+SUBDERMAL_BALLISTICS_GEL_TYPE = "Passive"
+
+AUGMENTS = {
+    SUBDERMAL_BALLISTICS_GEL.lower(): {
+        "name": SUBDERMAL_BALLISTICS_GEL,
+        "price": SUBDERMAL_BALLISTICS_GEL_PRICE,
+        "desc": SUBDERMAL_BALLISTICS_GEL_DESC,
+        "grade": SUBDERMAL_BALLISTICS_GEL_GRADE,
+        "type": SUBDERMAL_BALLISTICS_GEL_TYPE,
+    }
+}
 
 def spawn_rarity() -> str:
     r = random.random() * 100.0
@@ -373,8 +406,8 @@ def choose_personality() -> dict:
     return {"name": choice["name"], "stats": list(choice["stats"])}
     
 
-ACTIONS = ["Attack", "Aggressive", "Special", "Defend"]
-ACTION_WEIGHTS = [38, 22, 22, 18]
+ACTIONS = ["Attack", "Activate", "Aggressive", "Special", "Defend"]
+ACTION_WEIGHTS = [50, 15, 15, 10, 10]
 
 TIER_PAYOUTS: Dict[int, Tuple[int, int]] = {
     1: (1000, 500),
@@ -964,6 +997,17 @@ def simulate_round(st: BattleState):
         order.reverse()
     for side, atk, dfn, act, dfn_act in order:
         if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+        if act == "Activate":
+            active_aug = next(
+                (a for a in atk.get("augments", []) if a.get("type", "").lower() == "active"),
+                None,
+            )
+            if active_aug:
+                st.logs.append(f"{atk['name']} activates {active_aug['name']}!")
+                act = "Attack"
+            else:
+                st.logs.append(f"{atk['name']} has no activate augment; attacks aggressively.")
+                act = "Aggressive"
         if act == "Defend":
             st.logs.append(f"{atk['name']} is defending.")
             continue
@@ -976,6 +1020,10 @@ def simulate_round(st: BattleState):
             s = sum(rolls)
             dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
             if act == "Aggressive": dmg = math.ceil(dmg * 1.25)
+            if act in ("Attack", "Aggressive") and any(
+                a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])
+            ):
+                dmg = max(1, math.ceil(dmg * 0.9))
             if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
             if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
             if side == "user": st.opp_current_hp -= dmg
@@ -1557,6 +1605,57 @@ async def _get_or_create_item_store_message(channel_id: int) -> Optional[discord
     return message
 
 
+async def _get_augment_store_channel_id() -> Optional[int]:
+    pool = await db_pool()
+    chan = await pool.fetchval("SELECT channel_id FROM augment_store_messages LIMIT 1")
+    if chan:
+        return int(chan)
+    if AUGMENT_STORE_CHANNEL_ID_ENV:
+        try:
+            return int(AUGMENT_STORE_CHANNEL_ID_ENV)
+        except Exception:
+            logger.error("AUGMENT_STORE_CHANNEL_ID env was set but not an integer.")
+    return None
+
+
+async def _get_or_create_augment_store_message(channel_id: int) -> Optional[discord.Message]:
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception as e:
+        logger.error("Failed to fetch augment store channel %s: %s", channel_id, e)
+        return None
+
+    pool = await db_pool()
+    msg_id = await pool.fetchval(
+        "SELECT message_id FROM augment_store_messages WHERE channel_id=$1", channel_id
+    )
+
+    message: Optional[discord.Message] = None
+    if msg_id:
+        try:
+            message = await channel.fetch_message(int(msg_id))
+        except Exception:
+            message = None
+
+    if message is None:
+        try:
+            message = await channel.send("Initializing augment store…")
+            await pool.execute(
+                """
+                INSERT INTO augment_store_messages(channel_id, message_id)
+                VALUES ($1,$2)
+                ON CONFLICT (channel_id) DO UPDATE SET message_id=EXCLUDED.message_id
+                """,
+                channel_id,
+                message.id,
+            )
+        except Exception as e:
+            logger.error("Failed to create augment store message: %s", e)
+            return None
+
+    return message
+
+
 async def _get_controls_channel_id() -> Optional[int]:
     pool = await db_pool()
     chan = await pool.fetchval("SELECT channel_id FROM controls_messages LIMIT 1")
@@ -1730,6 +1829,34 @@ async def update_item_store_now(reason: str = "manual") -> None:
         logger.info("Item store updated (%s).", reason)
     except Exception as e:
         logger.error("Failed to edit item store message: %s", e)
+
+
+async def update_augment_store_now(reason: str = "manual") -> None:
+    channel_id = await _get_augment_store_channel_id()
+    if not channel_id:
+        return
+    message = await _get_or_create_augment_store_message(channel_id)
+    if message is None:
+        return
+    updated_ts = int(time.time())
+    embed = discord.Embed(
+        title="Augment Store",
+        description=f"Updated: <t:{updated_ts}:R>",
+    )
+    for data in AUGMENTS.values():
+        embed.add_field(
+            name=data["name"],
+            value=(
+                f"Grade {data['grade']} {data['type']}\n"
+                f"{data['desc']}\nCost: {data['price']}"
+            ),
+            inline=False,
+        )
+    try:
+        await message.edit(content=None, embed=embed, view=AugmentStoreView())
+        logger.info("Augment store updated (%s).", reason)
+    except Exception as e:
+        logger.error("Failed to edit augment store message: %s", e)
 
 # ─── Battle finalize (records + leaderboard) ─────────────────
 async def finalize_battle(inter: discord.Interaction, st: BattleState):
@@ -2039,6 +2166,13 @@ async def setup_hook():
     else:
         logger.info("No item store channel configured yet. Use /setitemstore in the desired channel or set ITEM_STORE_CHANNEL_ID.")
 
+    augment_chan = await _get_augment_store_channel_id()
+    if augment_chan:
+        await _get_or_create_augment_store_message(augment_chan)
+        await update_augment_store_now(reason="startup")
+    else:
+        logger.info("No augment store channel configured yet. Use /setaugments in the desired channel or set AUGMENT_STORE_CHANNEL_ID.")
+
     controls_chan = await _get_controls_channel_id()
     if controls_chan:
         await _get_or_create_controls_message(controls_chan)
@@ -2156,6 +2290,26 @@ async def setitemstore(inter: discord.Interaction):
     )
     await _get_or_create_item_store_message(inter.channel.id)
     await update_item_store_now(reason="admin_set_channel")
+
+@bot.tree.command(description="(Admin) Set this channel as the augment store channel")
+async def setaugments(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+    if not inter.channel:
+        return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
+
+    pool = await db_pool()
+    await pool.execute("DELETE FROM augment_store_messages")
+    await pool.execute(
+        "INSERT INTO augment_store_messages(channel_id, message_id) VALUES($1, NULL)",
+        inter.channel.id,
+    )
+    await inter.response.send_message(
+        f"Augment store channel set to {inter.channel.mention}. Initializing…",
+        ephemeral=True,
+    )
+    await _get_or_create_augment_store_message(inter.channel.id)
+    await update_augment_store_now(reason="admin_set_channel")
 @bot.tree.command(description="(Admin) Set this channel as the controls channel")
 async def setcontrolchannel(inter: discord.Interaction):
     if inter.user.id not in ADMIN_USER_IDS:
@@ -2560,6 +2714,40 @@ async def buy(inter: discord.Interaction, creature_name: str):
     asyncio.create_task(update_leaderboard_now(reason="buy"))
 
 
+async def _buy_augment(inter: discord.Interaction, augment_name: str, quantity: int):
+    if quantity <= 0:
+        return await inter.response.send_message("Quantity must be positive.", ephemeral=True)
+    aug_key = augment_name.strip().lower()
+    data = AUGMENTS.get(aug_key)
+    if not data:
+        return await inter.response.send_message("Unknown augment.", ephemeral=True)
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    cost = data["price"] * quantity
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        cash = await conn.fetchval("SELECT cash FROM trainers WHERE user_id=$1", inter.user.id)
+        if cash is None or cash < cost:
+            return await inter.response.send_message("You don't have enough cash.", ephemeral=True)
+        await conn.execute("UPDATE trainers SET cash = cash - $1 WHERE user_id=$2", cost, inter.user.id)
+        await conn.execute(
+            """
+            INSERT INTO trainer_items(user_id, item_name, quantity)
+            VALUES ($1,$2,$3)
+            ON CONFLICT (user_id, item_name)
+            DO UPDATE SET quantity = trainer_items.quantity + EXCLUDED.quantity
+            """,
+            inter.user.id,
+            data["name"],
+            quantity,
+        )
+    await inter.response.send_message(
+        f"Purchased {quantity} {data['name']}(s).", ephemeral=True
+    )
+    asyncio.create_task(update_augment_store_now(reason="buy"))
+
+
 async def _buy_item(inter: discord.Interaction, item_name: str, quantity: int):
     if quantity <= 0:
         return await inter.response.send_message("Quantity must be positive.", ephemeral=True)
@@ -2654,6 +2842,27 @@ class ShopView(discord.ui.View):
     @discord.ui.button(label="Buy", style=discord.ButtonStyle.green)
     async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(BuyModal())
+
+
+class BuyAugmentModal(discord.ui.Modal, title="Buy Augment"):
+    augment_name = discord.ui.TextInput(label="Augment Name")
+    quantity = discord.ui.TextInput(label="Quantity")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            qty = int(self.quantity.value)
+        except ValueError:
+            return await interaction.response.send_message("Quantity must be an integer.", ephemeral=True)
+        await _buy_augment(interaction, self.augment_name.value, qty)
+
+
+class AugmentStoreView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green)
+    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BuyAugmentModal())
 
 
 class BuyItemModal(discord.ui.Modal, title="Buy Item"):
@@ -2895,7 +3104,18 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     try:
         await inter.response.defer(thinking=True)
 
-        user_cre = {"name": c_row["name"], "stats": stats}
+        aug_rows = await (await db_pool()).fetch(
+            "SELECT augment_name, augment_type FROM creature_augments WHERE creature_id=$1",
+            c_row["id"],
+        )
+        user_cre = {
+            "name": c_row["name"],
+            "stats": stats,
+            "augments": [
+                {"name": r["augment_name"], "type": r["augment_type"]}
+                for r in aug_rows
+            ],
+        }
         rarity = rarity_for_tier(tier)
         name_only = await generate_creature_name(rarity)
         extra = random.randint(*TIER_EXTRAS[tier])
@@ -2918,7 +3138,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             "Opponent:",
             stat_block(opp_cre["name"], st.opp_max_hp, st.opp_max_hp, opp_stats),
             "",
-            "Rules: Action weights A/Ag/Sp/Df = 38/22/22/18, Aggressive +25% dmg, Special ignores AR, "
+            "Rules: Action weights A/Ac/Ag/Sp/Df = 50/15/15/10/10, Aggressive +25% dmg, Special ignores AR, "
             "AR softened (halved), extra swing at 1.5× SPD, +10% global damage every 10 rounds.",
             f"Daily cap: Each creature can start at most {DAILY_BATTLE_CAP} battles per Europe/London day.",
         ]
@@ -3100,11 +3320,42 @@ async def pvp(inter: discord.Interaction):
                     await interaction.response.defer(thinking=True)
                     await pool.execute("UPDATE creatures SET current_hp=$1 WHERE id=$2", max_hp, c_row["id"])
                     await pool.execute("UPDATE creatures SET current_hp=$1 WHERE id=$2", opp_max_hp, opp_row["id"])
+                    user_aug = await pool.fetch(
+                        "SELECT augment_name, augment_type FROM creature_augments WHERE creature_id=$1",
+                        c_row["id"],
+                    )
+                    opp_aug = await pool.fetch(
+                        "SELECT augment_name, augment_type FROM creature_augments WHERE creature_id=$1",
+                        opp_row["id"],
+                    )
                     st = BattleState(
                         inter.user.id, c_row["id"], 0,
-                        {"name": c_row["name"], "stats": stats}, max_hp, max_hp,
-                        {"name": opp_row["name"], "stats": opp_stats}, opp_max_hp, opp_max_hp,
-                        logs=[], is_pvp=True, opp_user_id=opponent_id, opp_creature_id=opp_row["id"], wager=wager, opp_trainer_name=opp_name,
+                        {
+                            "name": c_row["name"],
+                            "stats": stats,
+                            "augments": [
+                                {"name": r["augment_name"], "type": r["augment_type"]}
+                                for r in user_aug
+                            ],
+                        },
+                        max_hp,
+                        max_hp,
+                        {
+                            "name": opp_row["name"],
+                            "stats": opp_stats,
+                            "augments": [
+                                {"name": r["augment_name"], "type": r["augment_type"]}
+                                for r in opp_aug
+                            ],
+                        },
+                        opp_max_hp,
+                        opp_max_hp,
+                        logs=[],
+                        is_pvp=True,
+                        opp_user_id=opponent_id,
+                        opp_creature_id=opp_row["id"],
+                        wager=wager,
+                        opp_trainer_name=opp_name,
                     )
                     active_battles[inter.user.id] = st
                     active_battles[opponent_id] = st
@@ -3894,6 +4145,63 @@ async def _use_genetic_reshuffler(inter: discord.Interaction, creature_name: str
     )
 
 
+async def _install_augment(inter: discord.Interaction, creature_name: str, augment_name: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    data = AUGMENTS.get(augment_name.strip().lower())
+    if not data:
+        return await inter.response.send_message("Unknown augment.", ephemeral=True)
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        c_row = await conn.fetchrow(
+            "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            inter.user.id,
+            creature_name,
+        )
+        if not c_row:
+            return await inter.response.send_message("Creature not found.", ephemeral=True)
+        qty = await conn.fetchval(
+            "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            data["name"],
+        )
+        if not qty or int(qty) <= 0:
+            return await inter.response.send_message("You don't have this augment.", ephemeral=True)
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM creature_augments WHERE creature_id=$1",
+            c_row["id"],
+        )
+        if int(count or 0) >= 3:
+            return await inter.response.send_message(
+                f"{c_row['name']} already has three augments.", ephemeral=True
+            )
+        glyph = await conn.fetchval(
+            "SELECT COALESCE(MAX(CASE WHEN glyph_unlocked THEN tier ELSE 0 END),0) FROM creature_progress WHERE creature_id=$1",
+            c_row["id"],
+        )
+        req = {"A": 6, "B": 3, "C": 0}.get(data["grade"], 0)
+        if int(glyph or 0) < req:
+            return await inter.response.send_message(
+                f"Requires Glyph {req} for grade {data['grade']} augments.", ephemeral=True
+            )
+        await conn.execute(
+            "INSERT INTO creature_augments(creature_id, augment_name, grade, augment_type) VALUES($1,$2,$3,$4)",
+            c_row["id"],
+            data["name"],
+            data["grade"],
+            data["type"],
+        )
+        await conn.execute(
+            "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+            inter.user.id,
+            data["name"],
+        )
+    await inter.response.send_message(
+        f"Installed {data['name']} on **{c_row['name']}**.", ephemeral=True
+    )
+
+
 async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
@@ -3934,6 +4242,11 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         inter.user.id,
         GENETIC_RESHUFFLER,
     )
+    qty_ballistics = await pool.fetchval(
+        "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
+        inter.user.id,
+        SUBDERMAL_BALLISTICS_GEL,
+    )
     qty_small = int(qty_small or 0)
     qty_large = int(qty_large or 0)
     qty_full = int(qty_full or 0)
@@ -3941,6 +4254,7 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
     qty_stat = int(qty_stat or 0)
     qty_premium = int(qty_premium or 0)
     qty_reshuffler = int(qty_reshuffler or 0)
+    qty_ballistics = int(qty_ballistics or 0)
     if (
         qty_small <= 0
         and qty_large <= 0
@@ -3949,6 +4263,7 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
         and qty_stat <= 0
         and qty_premium <= 0
         and qty_reshuffler <= 0
+        and qty_ballistics <= 0
     ):
         return await inter.response.send_message("You have no items.", ephemeral=True)
     await inter.response.send_message(
@@ -3963,6 +4278,7 @@ async def _show_item_menu(inter: discord.Interaction, creature_name: str):
             qty_stat,
             qty_premium,
             qty_reshuffler,
+            qty_ballistics,
         ),
     )
 
@@ -3978,6 +4294,7 @@ class UseItemView(discord.ui.View):
         stat_qty: int,
         premium_qty: int,
         reshuffler_qty: int,
+        ballistics_qty: int,
     ):
         super().__init__(timeout=None)
         self.creature_name = creature_name
@@ -3995,6 +4312,8 @@ class UseItemView(discord.ui.View):
         self.use_premium_stat.disabled = premium_qty <= 0
         self.use_reshuffler.label = f"{GENETIC_RESHUFFLER} ({reshuffler_qty})"
         self.use_reshuffler.disabled = reshuffler_qty <= 0
+        self.use_ballistics.label = f"{SUBDERMAL_BALLISTICS_GEL} ({ballistics_qty})"
+        self.use_ballistics.disabled = ballistics_qty <= 0
 
     @discord.ui.button(label=SMALL_HEALING_INJECTOR, style=discord.ButtonStyle.primary)
     async def use_small(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4023,6 +4342,10 @@ class UseItemView(discord.ui.View):
     @discord.ui.button(label=GENETIC_RESHUFFLER, style=discord.ButtonStyle.primary)
     async def use_reshuffler(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _use_genetic_reshuffler(interaction, self.creature_name)
+
+    @discord.ui.button(label=SUBDERMAL_BALLISTICS_GEL, style=discord.ButtonStyle.primary)
+    async def use_ballistics(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _install_augment(interaction, self.creature_name, SUBDERMAL_BALLISTICS_GEL)
 
 
 class StatTrainerModal(discord.ui.Modal):

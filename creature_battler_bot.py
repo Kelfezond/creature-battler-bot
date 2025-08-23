@@ -4951,20 +4951,41 @@ class ControlsView(discord.ui.View):
 
 controls_view: Optional[ControlsView] = None
 
-@bot.tree.command(description="Show all commands and what they do")
+@bot.tree.command(description="Show basic info about the game")
 async def info(inter: discord.Interaction):
-    # Overview kept brief; the main goal is the dynamic command list.
-    caps_line = "• Passive income: 60 cash/hour | Creature cap: " + str(MAX_CREATURES) + " | Daily cap: " + str(DAILY_BATTLE_CAP) + "/creature/day (Europe/London)."
+    """Respond with core commands and stat explanations."""
+    caps_line = (
+        "• Passive income: 60 cash/hour | Creature cap: "
+        + str(MAX_CREATURES)
+        + " | Daily cap: "
+        + str(DAILY_BATTLE_CAP)
+        + "/creature/day (Europe/London)."
+    )
     header = (
         "**Game Overview**\n"
         "Collect, train, and battle creatures. Progress through tiers to unlock glyphs.\n"
-        + caps_line + "\n"
+        + caps_line
+        + "\n"
     )
-    try:
-        cmd_text = _build_command_list(bot)
-    except Exception:
-        cmd_text = "Failed to build command list."
-    content = header + "\n" + cmd_text
+    commands_info = (
+        "**Basic Commands**\n"
+        "/register — create your trainer account.\n"
+        "/record <creature_name> — view a creature's lifetime record.\n"
+        "/spawn — spend 10,000 cash to hatch a new creature.\n"
+        "/battle <creature_name> <tier> — fight an AI opponent in a chosen tier.\n"
+        "/pvp — challenge another trainer to battle.\n"
+        "/frc — show your friend recruitment code.\n"
+        "/fr <code> — redeem a friend code for rewards.\n"
+    )
+    stats_info = (
+        "\n**Creature Stats**\n"
+        "HP: total health (each point grants 5 HP).\n"
+        "AR: armor that mitigates incoming damage.\n"
+        "PATK: physical attack power.\n"
+        "SATK: special attack power.\n"
+        "SPD: speed; acts first and may grant extra swings.\n"
+    )
+    content = header + "\n" + commands_info + stats_info
     await send_chunks(inter, content, ephemeral=True)
 
 if __name__ == "__main__":

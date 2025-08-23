@@ -4957,9 +4957,7 @@ async def info(inter: discord.Interaction):
     caps_line = (
         "• Passive income: 60 cash/hour | Creature cap: "
         + str(MAX_CREATURES)
-        + " | Daily cap: "
-        + str(DAILY_BATTLE_CAP)
-        + "/creature/day (Europe/London)."
+        + "."
     )
     header = (
         "**Game Overview**\n"

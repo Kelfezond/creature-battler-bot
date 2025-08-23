@@ -17,12 +17,18 @@ async def _max_glyph_for_trainer(user_id: int) -> int:
         except Exception:
             return 0
 
-import asyncio, json, logging, math, os, random, time, re
+import asyncio, json, logging, math, os, random, time, re, secrets, string
 
 
 def fmt_cash(amount: int) -> str:
     """Return a cash value formatted with apostrophes as thousands separators."""
     return f"{int(amount):,}".replace(",", "'")
+
+
+def _generate_friend_code() -> str:
+    """Return a random 8-character alphanumeric friend code."""
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(8))
 
 # Global battle lock
 active_battle_user_id = None
@@ -254,6 +260,18 @@ CREATE TABLE IF NOT EXISTS controls_messages (
 -- Encyclopedia target channel
 CREATE TABLE IF NOT EXISTS encyclopedia_channel (
   channel_id BIGINT PRIMARY KEY
+);
+
+-- Friend recruitment codes
+CREATE TABLE IF NOT EXISTS friend_codes (
+  user_id BIGINT PRIMARY KEY REFERENCES trainers(user_id) ON DELETE CASCADE,
+  code TEXT NOT NULL UNIQUE
+);
+
+-- Friend recruitment redemptions
+CREATE TABLE IF NOT EXISTS friend_recruits (
+  new_user_id BIGINT PRIMARY KEY REFERENCES trainers(user_id) ON DELETE CASCADE,
+  code TEXT NOT NULL REFERENCES friend_codes(code)
 );
 """
 
@@ -3883,6 +3901,51 @@ async def trainerpoints(inter: discord.Interaction):
             f"(total {daily}/day)."
         )
         await inter.response.send_message(msg, ephemeral=True, view=TrainerPointsView())
+
+
+@bot.tree.command(description="Show your friend recruitment code")
+async def frc(inter: discord.Interaction):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    code = await pool.fetchval("SELECT code FROM friend_codes WHERE user_id=$1", inter.user.id)
+    if not code:
+        while True:
+            code = _generate_friend_code()
+            exists = await pool.fetchval("SELECT 1 FROM friend_codes WHERE code=$1", code)
+            if not exists:
+                await pool.execute("INSERT INTO friend_codes(user_id, code) VALUES($1,$2)", inter.user.id, code)
+                break
+    await inter.response.send_message(f"Your friend code is **{code}**. Share it with friends!", ephemeral=True)
+
+
+@bot.tree.command(description="Redeem a friend recruitment code")
+async def fr(inter: discord.Interaction, code: str):
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    code = (code or "").strip().upper()
+    pool = await db_pool()
+    already = await pool.fetchval("SELECT 1 FROM friend_recruits WHERE new_user_id=$1", inter.user.id)
+    if already:
+        return await inter.response.send_message("You have already redeemed a friend code.", ephemeral=True)
+    rec = await pool.fetchrow("SELECT user_id FROM friend_codes WHERE code=$1", code)
+    if not rec:
+        return await inter.response.send_message("Invalid friend code.", ephemeral=True)
+    inviter_id = rec["user_id"]
+    if inviter_id == inter.user.id:
+        return await inter.response.send_message("You cannot redeem your own code.", ephemeral=True)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("INSERT INTO friend_recruits(new_user_id, code) VALUES($1,$2)", inter.user.id, code)
+            await conn.execute("UPDATE trainers SET cash = cash + 20000 WHERE user_id=$1", inter.user.id)
+            await conn.execute("UPDATE trainers SET trainer_points = trainer_points + 5 WHERE user_id=$1", inviter_id)
+    inviter_name = await _resolve_trainer_name_from_db(inviter_id) or str(inviter_id)
+    await inter.response.send_message(
+        f"Friend code redeemed! You received {fmt_cash(20000)} cash and **{inviter_name}** gained 5 trainer points.",
+        ephemeral=True,
+    )
 
 async def _train_creature(inter: discord.Interaction, creature_name: str, stat: str, increase: int):
     """Core logic for training a creature."""

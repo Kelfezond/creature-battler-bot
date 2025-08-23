@@ -4739,6 +4739,37 @@ class StatTrainerModal(discord.ui.Modal):
         await _use_stat_trainer(interaction, self.creature_name, self.stat.value)
 
 
+class QuickSellConfirmView(discord.ui.View):
+    def __init__(self, user_id: int, creature_name: str):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.creature_name = creature_name
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("This isn't your confirmation.", ephemeral=True)
+        await quicksell.callback(interaction, self.creature_name)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("This isn't your confirmation.", ephemeral=True)
+        await interaction.response.send_message("Quicksell canceled.", ephemeral=True)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+
 class CreatureView(discord.ui.View):
     """View with rename, item, and quick sell buttons for a single creature."""
 
@@ -4756,7 +4787,11 @@ class CreatureView(discord.ui.View):
 
     @discord.ui.button(label="Quick Sell", style=discord.ButtonStyle.danger)
     async def btn_quicksell(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await quicksell.callback(interaction, self.creature_name)
+        await interaction.response.send_message(
+            f"Are you sure you want to quick sell **{self.creature_name}**? This cannot be undone.",
+            ephemeral=True,
+            view=QuickSellConfirmView(interaction.user.id, self.creature_name),
+        )
 
 
 class TrainModal(discord.ui.Modal, title="Train Creature"):

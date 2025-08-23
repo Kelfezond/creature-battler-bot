@@ -2947,6 +2947,26 @@ async def withdraw(inter: discord.Interaction, creature_name: str):
     asyncio.create_task(update_shop_now(reason="withdraw"))
 
 
+async def _notify_seller_sale(
+    seller_id: int, creature_name: str, buyer_name: str, price: int
+) -> None:
+    """DM the seller when their creature is purchased."""
+    u = bot.get_user(seller_id)
+    if not u:
+        try:
+            u = await bot.fetch_user(seller_id)
+        except Exception:
+            u = None
+    if not u:
+        return
+    try:
+        await u.send(
+            f"Your creature **{creature_name}** was bought by {buyer_name} for {fmt_cash(price)} cash."
+        )
+    except Exception as e:
+        logger.warning("Failed to DM seller %s about sale: %s", seller_id, e)
+
+
 @bot.tree.command(description="Buy a creature from the shop")
 async def buy(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
@@ -3006,6 +3026,10 @@ async def buy(inter: discord.Interaction, creature_name: str):
     await inter.response.send_message(
         f"You bought **{c_row['name']}** from {c_row['trainer_name']} for {fmt_cash(price)} cash.",
         ephemeral=True,
+    )
+    buyer_name = getattr(inter.user, "global_name", None) or inter.user.name
+    asyncio.create_task(
+        _notify_seller_sale(c_row["owner_id"], c_row["name"], buyer_name, price)
     )
     asyncio.create_task(update_shop_now(reason="buy"))
     asyncio.create_task(update_leaderboard_now(reason="buy"))

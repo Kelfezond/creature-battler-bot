@@ -139,6 +139,13 @@ ALTER TABLE creatures
 ALTER TABLE creatures
   ADD COLUMN IF NOT EXISTS last_hp_regen TIMESTAMPTZ;
 
+ALTER TABLE creatures
+  ADD COLUMN IF NOT EXISTS original_name TEXT;
+
+UPDATE creatures
+  SET original_name = name
+  WHERE original_name IS NULL;
+
 -- store display names for leaderboards
 ALTER TABLE trainers
   ADD COLUMN IF NOT EXISTS display_name TEXT;
@@ -2732,9 +2739,9 @@ async def spawn(inter: discord.Interaction):
     personality = choose_personality()
 
     rec = await (await db_pool()).fetchrow(
-        "INSERT INTO creatures(owner_id,name,rarity,descriptors,stats,current_hp,personality,last_hp_regen)"
-        " VALUES($1,$2,$3,$4,$5,$6,$7, now()) RETURNING id",
-        inter.user.id, meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp, json.dumps(personality)
+        "INSERT INTO creatures(owner_id,name,original_name,rarity,descriptors,stats,current_hp,personality,last_hp_regen)"
+        " VALUES($1,$2,$3,$4,$5,$6,$7,$8, now()) RETURNING id",
+        inter.user.id, meta["name"], meta["name"], rarity, meta["descriptors"], json.dumps(stats), max_hp, json.dumps(personality)
     )
     await _ensure_record(inter.user.id, rec["id"], meta["name"], ovr)
 
@@ -4119,12 +4126,18 @@ async def enc(inter: discord.Interaction, creature_name: str):
 
     # Find creature by owner/name (case-insensitive)
     c_row = await (await db_pool()).fetchrow(
-        "SELECT id, name, rarity, descriptors, stats, current_hp FROM creatures "
+        "SELECT id, name, original_name, rarity, descriptors, stats, current_hp FROM creatures "
         "WHERE owner_id=$1 AND name ILIKE $2",
         inter.user.id, creature_name
     )
     if not c_row:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
+
+    if c_row["original_name"] and c_row["name"] != c_row["original_name"]:
+        return await inter.response.send_message(
+            f"{c_row['name']} has been renamed. Rename it back to **{c_row['original_name']}** before adding to the Encyclopedia.",
+            ephemeral=True,
+        )
 
     # Gate: Common/Uncommon cannot be added to the Encyclopedia
     # unless they have >10 total wins OR have unlocked Glyph 3.
@@ -4162,7 +4175,7 @@ async def enc(inter: discord.Interaction, creature_name: str):
     await inter.response.defer(thinking=True, ephemeral=True)
 
     # Prepare data
-    name = c_row["name"]
+    name = c_row["original_name"] or c_row["name"]
     rarity = c_row["rarity"]
     traits = c_row["descriptors"] or []
     stats = json.loads(c_row["stats"])

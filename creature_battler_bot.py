@@ -364,6 +364,24 @@ PRISM_COIL_DESC = "Fires the Prism Coil"
 PRISM_COIL_GRADE = "A"
 PRISM_COIL_TYPE = "Active"
 
+MARKING_SPINES = "Marking Spines"
+MARKING_SPINES_PRICE = 90_000
+MARKING_SPINES_DESC = "Aggressive action weight +5pp; Attack weight -5pp"
+MARKING_SPINES_GRADE = "C"
+MARKING_SPINES_TYPE = "Passive"
+
+QUANTUM_BLINK = "Quantum Blink"
+QUANTUM_BLINK_PRICE = 2_000_000
+QUANTUM_BLINK_DESC = "On Activate: Defend this turn and make an Aggressive attack"
+QUANTUM_BLINK_GRADE = "B"
+QUANTUM_BLINK_TYPE = "Active"
+
+SHOCK_FANGS = "Shock Fangs"
+SHOCK_FANGS_PRICE = 12_000_000
+SHOCK_FANGS_DESC = "Shock strike with partial armor penetration; chance to stun"
+SHOCK_FANGS_GRADE = "A"
+SHOCK_FANGS_TYPE = "Active"
+
 AUGMENTS = {
     SUBDERMAL_BALLISTICS_GEL.lower(): {
         "name": SUBDERMAL_BALLISTICS_GEL,
@@ -406,6 +424,27 @@ AUGMENTS = {
         "desc": PRISM_COIL_DESC,
         "grade": PRISM_COIL_GRADE,
         "type": PRISM_COIL_TYPE,
+    },
+    MARKING_SPINES.lower(): {
+        "name": MARKING_SPINES,
+        "price": MARKING_SPINES_PRICE,
+        "desc": MARKING_SPINES_DESC,
+        "grade": MARKING_SPINES_GRADE,
+        "type": MARKING_SPINES_TYPE,
+    },
+    QUANTUM_BLINK.lower(): {
+        "name": QUANTUM_BLINK,
+        "price": QUANTUM_BLINK_PRICE,
+        "desc": QUANTUM_BLINK_DESC,
+        "grade": QUANTUM_BLINK_GRADE,
+        "type": QUANTUM_BLINK_TYPE,
+    },
+    SHOCK_FANGS.lower(): {
+        "name": SHOCK_FANGS,
+        "price": SHOCK_FANGS_PRICE,
+        "desc": SHOCK_FANGS_DESC,
+        "grade": SHOCK_FANGS_GRADE,
+        "type": SHOCK_FANGS_TYPE,
     },
 }
 
@@ -548,6 +587,12 @@ class BattleState:
     opp_afp_triggered: bool = False
     user_aegis_charges: int = 0
     opp_aegis_charges: int = 0
+    user_temp_defend: bool = False
+    opp_temp_defend: bool = False
+    user_stunned: int = 0
+    opp_stunned: int = 0
+    user_stun_immunity: int = 0
+    opp_stun_immunity: int = 0
 
 active_battles: Dict[int, BattleState] = {}
 
@@ -639,8 +684,245 @@ def allocate_stats(rarity: str, extra: int = 0) -> Dict[str, int]:
 def stat_block(name: str, cur_hp: int, max_hp: int, s: Dict[str, int]) -> str:
     return (f"{name} – HP:{cur_hp}/{max_hp} "
             f"AR:{s['AR']} PATK:{s['PATK']} SATK:{s['SATK']} SPD:{s['SPD']}")
-def choose_action() -> str:
-    return random.choices(ACTIONS, weights=ACTION_WEIGHTS, k=1)[0]
+def choose_action(augments: List[dict]) -> str:
+    weights = ACTION_WEIGHTS.copy()
+    if any(a.get("name") == MARKING_SPINES for a in augments):
+        weights[2] += 5
+        giveback = 5
+        take = min(giveback, weights[0] - 35)
+        weights[0] -= take
+        giveback -= take
+        if giveback > 0:
+            take = min(giveback, weights[3])
+            weights[3] -= take
+            giveback -= take
+        if giveback > 0:
+            take = min(giveback, weights[4])
+            weights[4] -= take
+    return random.choices(ACTIONS, weights=weights, k=1)[0]
+
+
+def _deal_damage(
+    st: BattleState,
+    side: str,
+    atk: dict,
+    dfn: dict,
+    dmg: int,
+    dfn_act: str,
+    has_afp: bool,
+    dfn_temp_defend: bool,
+    sudden_death_mult: float,
+) -> int:
+    """Apply damage with defense, pods, sudden death and Aegis reflection."""
+    mult = 1.0
+    if dfn_act == "Defend" or dfn_temp_defend:
+        mult = min(mult, 0.5)
+    if has_afp:
+        if side == "user":
+            if st.opp_afp_charges > 0:
+                mult = min(mult, 0.35)
+                st.opp_afp_charges -= 1
+        else:
+            if st.user_afp_charges > 0:
+                mult = min(mult, 0.35)
+                st.user_afp_charges -= 1
+    dmg = max(1, math.ceil(dmg * mult))
+    if sudden_death_mult > 1.0:
+        dmg = max(1, math.ceil(dmg * sudden_death_mult))
+    if side == "user":
+        st.opp_current_hp -= dmg
+        new_hp = st.opp_current_hp
+        max_hp = st.opp_max_hp
+        if has_afp and not st.opp_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+            st.opp_afp_charges = 2
+            st.opp_afp_triggered = True
+            st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
+    else:
+        st.user_current_hp -= dmg
+        new_hp = st.user_current_hp
+        max_hp = st.user_max_hp
+        if has_afp and not st.user_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
+            st.user_afp_charges = 2
+            st.user_afp_triggered = True
+            st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
+    if side == "user" and st.opp_aegis_charges > 0:
+        reflect = max(1, math.ceil(dmg * 0.5 * st.opp_aegis_charges))
+        st.user_current_hp -= reflect
+        st.logs.append(
+            f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
+        )
+        st.opp_aegis_charges = 0
+        st.user_aegis_charges = 0
+    elif side == "opp" and st.user_aegis_charges > 0:
+        reflect = max(1, math.ceil(dmg * 0.5 * st.user_aegis_charges))
+        st.opp_current_hp -= reflect
+        st.logs.append(
+            f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
+        )
+        st.user_aegis_charges = 0
+        st.opp_aegis_charges = 0
+    return dmg
+
+
+def _standard_attack(
+    st: BattleState,
+    side: str,
+    atk: dict,
+    dfn: dict,
+    act: str,
+    dfn_act: str,
+    sudden_death_mult: float,
+) -> None:
+    has_afp = any(a.get("name") == ABLATIVE_FOAM_PODS for a in dfn.get("augments", []))
+    has_sbg = any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", []))
+    dfn_temp_defend = st.opp_temp_defend if side == "user" else st.user_temp_defend
+    swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
+    for _ in range(swings):
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
+        S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+        AR_val = 0 if act == "Special" else dfn["stats"]["AR"] // 2
+        rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
+        s = sum(rolls)
+        dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
+        if act == "Aggressive":
+            dmg = math.ceil(dmg * 1.25)
+        if act in ("Attack", "Aggressive") and has_sbg:
+            dmg = max(1, math.ceil(dmg * 0.9))
+        note = " (defended)" if dfn_act == "Defend" or dfn_temp_defend else ""
+        dmg = _deal_damage(st, side, atk, dfn, dmg, dfn_act, has_afp, dfn_temp_defend, sudden_death_mult)
+        act_word = {
+            "Attack": "hits",
+            "Aggressive": "aggressively hits",
+            "Special": "unleashes a special attack on",
+        }[act]
+        st.logs.append(
+            f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg"
+            + (f" (rolls {rolls})" if act != "Special" else "")
+            + note
+        )
+        if st.user_current_hp <= 0:
+            st.logs.append(f"{st.user_creature['name']} is down!")
+        if st.opp_current_hp <= 0:
+            st.logs.append(f"{st.opp_creature['name']} is down!")
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
+
+
+def _blink_attack(
+    st: BattleState,
+    side: str,
+    atk: dict,
+    dfn: dict,
+    dfn_act: str,
+    sudden_death_mult: float,
+) -> None:
+    has_afp = any(a.get("name") == ABLATIVE_FOAM_PODS for a in dfn.get("augments", []))
+    has_sbg = any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", []))
+    dfn_temp_defend = st.opp_temp_defend if side == "user" else st.user_temp_defend
+    swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
+    for _ in range(swings):
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
+        S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+        AR_val = dfn["stats"]["AR"] // 2
+        rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
+        s = sum(rolls)
+        dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
+        dmg = math.ceil(dmg * 1.25)
+        if has_sbg:
+            dmg = max(1, math.ceil(dmg * 0.9))
+        note = " (defended)" if dfn_act == "Defend" or dfn_temp_defend else ""
+        dmg = _deal_damage(st, side, atk, dfn, dmg, dfn_act, has_afp, dfn_temp_defend, sudden_death_mult)
+        st.logs.append(
+            f"{atk['name']} blinks and strikes {dfn['name']} for {dmg} dmg (rolls {rolls}){note}"
+        )
+        if st.user_current_hp <= 0:
+            st.logs.append(f"{st.user_creature['name']} is down!")
+        if st.opp_current_hp <= 0:
+            st.logs.append(f"{st.opp_creature['name']} is down!")
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
+
+
+def _prism_coil_attack(
+    st: BattleState,
+    side: str,
+    atk: dict,
+    dfn: dict,
+    dfn_act: str,
+    sudden_death_mult: float,
+    aggressive: bool = False,
+) -> None:
+    has_afp = any(a.get("name") == ABLATIVE_FOAM_PODS for a in dfn.get("augments", []))
+    has_sbg = any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", []))
+    dfn_temp_defend = st.opp_temp_defend if side == "user" else st.user_temp_defend
+    S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+    rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10) + 2)]
+    s = sum(rolls)
+    dmg = max(1, math.ceil((s * s) / (s if s > 0 else 1)))
+    dmg = math.ceil(dmg * 1.20)
+    if aggressive:
+        dmg = math.ceil(dmg * 1.25)
+        if has_sbg:
+            dmg = max(1, math.ceil(dmg * 0.9))
+    note = " (defended)" if dfn_act == "Defend" or dfn_temp_defend else ""
+    dmg = _deal_damage(st, side, atk, dfn, dmg, dfn_act, has_afp, dfn_temp_defend, sudden_death_mult)
+    st.logs.append(
+        f"{atk['name']} fires {PRISM_COIL} at {dfn['name']} for {dmg} dmg (rolls {rolls}){note}"
+    )
+    if st.user_current_hp <= 0:
+        st.logs.append(f"{st.user_creature['name']} is down!")
+    if st.opp_current_hp <= 0:
+        st.logs.append(f"{st.opp_creature['name']} is down!")
+
+
+def _shock_fangs_attack(
+    st: BattleState,
+    side: str,
+    atk: dict,
+    dfn: dict,
+    dfn_act: str,
+    sudden_death_mult: float,
+) -> None:
+    has_afp = any(a.get("name") == ABLATIVE_FOAM_PODS for a in dfn.get("augments", []))
+    has_sbg = any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", []))
+    dfn_temp_defend = st.opp_temp_defend if side == "user" else st.user_temp_defend
+    swings = 2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1
+    for _ in range(swings):
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
+        S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
+        AR_val = math.floor(dfn["stats"]["AR"] * 0.35)
+        rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
+        s = sum(rolls)
+        dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
+        dmg = math.ceil(dmg * 1.10)
+        if has_sbg:
+            dmg = max(1, math.ceil(dmg * 0.9))
+        true_dmg = math.ceil((atk["stats"]["PATK"] + atk["stats"]["SATK"]) / 8)
+        dmg += true_dmg
+        note = " (defended)" if dfn_act == "Defend" or dfn_temp_defend else ""
+        dmg = _deal_damage(st, side, atk, dfn, dmg, dfn_act, has_afp, dfn_temp_defend, sudden_death_mult)
+        st.logs.append(
+            f"{atk['name']} strikes with {SHOCK_FANGS} at {dfn['name']} for {dmg} dmg (rolls {rolls}){note}"
+        )
+        if st.user_current_hp <= 0:
+            st.logs.append(f"{st.user_creature['name']} is down!")
+        if st.opp_current_hp <= 0:
+            st.logs.append(f"{st.opp_creature['name']} is down!")
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
+        if ((side == "user" and st.opp_current_hp > 0 and st.opp_stunned == 0 and st.opp_stun_immunity == 0) or
+            (side == "opp" and st.user_current_hp > 0 and st.user_stunned == 0 and st.user_stun_immunity == 0)):
+            p_stun = max(20, min(80, 40 + 0.8 * (atk["stats"]["SPD"] - dfn["stats"]["SPD"])))
+            if random.randint(1, 100) <= p_stun:
+                if side == "user":
+                    st.opp_stunned = 1
+                else:
+                    st.user_stunned = 1
+                st.logs.append(f"{dfn['name']} is stunned and will miss the next turn!")
+
 
 async def ensure_registered(inter: discord.Interaction) -> Optional[asyncpg.Record]:
     row = await (await db_pool()).fetchrow(
@@ -1080,14 +1362,36 @@ async def _record_win_and_maybe_unlock(creature_id: int, tier: int) -> Tuple[int
 
 def simulate_round(st: BattleState):
     st.rounds += 1
+    st.user_temp_defend = False
+    st.opp_temp_defend = False
     st.logs.append(f"Round {st.rounds}")
     sudden_death_mult = 1.1 ** (st.rounds // 10)
     if st.rounds % 10 == 0:
         st.logs.append(f"⚡ Sudden Death intensifies! Global damage ×{sudden_death_mult:.2f}")
+    uc, oc = st.user_creature, st.opp_creature
     while True:
-        user_act, opp_act = choose_action(), choose_action()
+        if st.user_stunned > 0:
+            user_act = "Stunned"
+        else:
+            user_act = choose_action(uc.get("augments", []))
+        if st.opp_stunned > 0:
+            opp_act = "Stunned"
+        else:
+            opp_act = choose_action(oc.get("augments", []))
         if not (user_act == "Defend" and opp_act == "Defend"):
             break
+    if user_act == "Stunned":
+        st.user_stunned -= 1
+        if st.user_stunned == 0:
+            st.user_stun_immunity = 1
+    elif st.user_stun_immunity > 0:
+        st.user_stun_immunity -= 1
+    if opp_act == "Stunned":
+        st.opp_stunned -= 1
+        if st.opp_stunned == 0:
+            st.opp_stun_immunity = 1
+    elif st.opp_stun_immunity > 0:
+        st.opp_stun_immunity -= 1
     st.logs.append(
         f"{st.user_creature['name']} chooses **{user_act}** | "
         f"{st.opp_creature['name']} chooses **{opp_act}**"
@@ -1096,49 +1400,73 @@ def simulate_round(st: BattleState):
         f"{st.user_creature['name']} HP {st.user_current_hp}/{st.user_max_hp} | "
         f"{st.opp_creature['name']} HP {st.opp_current_hp}/{st.opp_max_hp}"
     )
-    uc, oc = st.user_creature, st.opp_creature
     order = [("user", uc, oc, user_act, opp_act), ("opp", oc, uc, opp_act, user_act)]
     if uc["stats"]["SPD"] < oc["stats"]["SPD"] or (
         uc["stats"]["SPD"] == oc["stats"]["SPD"] and random.choice([0, 1])
     ):
         order.reverse()
     for side, atk, dfn, act, dfn_act in order:
-        if st.user_current_hp <= 0 or st.opp_current_hp <= 0: break
+        if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
+            break
         has_flux = any(a.get("name") == FLUX_CAPACITOR for a in atk.get("augments", []))
         has_afp = any(a.get("name") == ABLATIVE_FOAM_PODS for a in dfn.get("augments", []))
-        activated_aug = None
-        use_prism_coil = False
+        if act == "Stunned":
+            st.logs.append(f"{atk['name']} is stunned and cannot act.")
+            continue
+        attacks: List[Tuple[str, bool]] = []
         if act == "Activate":
-            active_aug = next(
-                (a for a in atk.get("augments", []) if a.get("type", "").lower() == "active"),
-                None,
-            )
-            if active_aug:
-                activated_aug = active_aug["name"]
-                st.logs.append(f"{atk['name']} activates {activated_aug}!")
-                if activated_aug == IMPROVED_CLOTTING_MATRIX:
-                    max_hp = st.user_max_hp if side == "user" else st.opp_max_hp
-                    heal = max(1, math.ceil(0.10 * max_hp))
-                    if side == "user":
-                        st.user_current_hp = min(st.user_current_hp + heal, st.user_max_hp)
-                    else:
-                        st.opp_current_hp = min(st.opp_current_hp + heal, st.opp_max_hp)
-                    st.logs.append(f"{atk['name']} heals {heal} HP.")
-                elif activated_aug == AEGIS_COUNTER:
-                    if side == "user":
-                        st.user_aegis_charges += 1
-                        st.logs.append(f"{atk['name']}'s {AEGIS_COUNTER} is primed ({st.user_aegis_charges}).")
-                    else:
-                        st.opp_aegis_charges += 1
-                        st.logs.append(f"{atk['name']}'s {AEGIS_COUNTER} is primed ({st.opp_aegis_charges}).")
-                elif activated_aug == PRISM_COIL:
-                    use_prism_coil = True
-                act = "Attack"
+            active_augs = [
+                a for a in atk.get("augments", []) if a.get("type", "").lower() == "active"
+            ]
+            if active_augs:
+                st.logs.append(
+                    f"{atk['name']} activates {', '.join(a['name'] for a in active_augs)}!"
+                )
+                blink_attack = False
+                for aug in active_augs:
+                    name = aug["name"]
+                    if name == IMPROVED_CLOTTING_MATRIX:
+                        max_hp = st.user_max_hp if side == "user" else st.opp_max_hp
+                        heal = max(1, math.ceil(0.10 * max_hp))
+                        if side == "user":
+                            st.user_current_hp = min(st.user_current_hp + heal, st.user_max_hp)
+                        else:
+                            st.opp_current_hp = min(st.opp_current_hp + heal, st.opp_max_hp)
+                        st.logs.append(f"{atk['name']} heals {heal} HP.")
+                    elif name == AEGIS_COUNTER:
+                        if side == "user":
+                            st.user_aegis_charges += 1
+                            st.logs.append(
+                                f"{atk['name']}'s {AEGIS_COUNTER} is primed ({st.user_aegis_charges})."
+                            )
+                        else:
+                            st.opp_aegis_charges += 1
+                            st.logs.append(
+                                f"{atk['name']}'s {AEGIS_COUNTER} is primed ({st.opp_aegis_charges})."
+                            )
+                    elif name == QUANTUM_BLINK:
+                        if side == "user":
+                            st.user_temp_defend = True
+                        else:
+                            st.opp_temp_defend = True
+                        blink_attack = True
+                    elif name == SHOCK_FANGS:
+                        attacks.append(("shock_fangs", False))
+                    elif name == PRISM_COIL:
+                        attacks.append(("prism_coil", False))
+                # handle interactions
+                prism_idx = next((i for i, t in enumerate(attacks) if t[0] == "prism_coil"), None)
+                if prism_idx is not None and blink_attack:
+                    attacks[prism_idx] = ("prism_coil", True)
+                    blink_attack = False
+                if blink_attack:
+                    attacks.append(("blink", False))
+                if not attacks:
+                    attacks.append(("Attack", False))
             else:
                 st.logs.append(f"{atk['name']} has no activate augment; attacks aggressively.")
-                act = "Aggressive"
-        if act == "Defend":
-
+                attacks.append(("Aggressive", False))
+        elif act == "Defend":
             st.logs.append(f"{atk['name']} is defending.")
             if has_flux and st.rounds % 5 == 0 and st.user_current_hp > 0 and st.opp_current_hp > 0:
                 extra_attacks = st.rounds // 5
@@ -1150,123 +1478,43 @@ def simulate_round(st: BattleState):
                     dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
                     if any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])):
                         dmg = max(1, math.ceil(dmg * 0.9))
-                    if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
-                    if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
-                    if has_afp:
-                        if side == "user":
-                            if st.opp_afp_charges > 0:
-                                dmg = max(1, math.ceil(dmg * 0.35))
-                                st.opp_afp_charges -= 1
-                        else:
-                            if st.user_afp_charges > 0:
-                                dmg = max(1, math.ceil(dmg * 0.35))
-                                st.user_afp_charges -= 1
-                    if side == "user":
-                        st.opp_current_hp -= dmg
-                        new_hp = st.opp_current_hp
-                        max_hp = st.opp_max_hp
-                        if has_afp and not st.opp_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
-                            st.opp_afp_charges = 2
-                            st.opp_afp_triggered = True
-                            st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
-                    else:
-                        st.user_current_hp -= dmg
-                        new_hp = st.user_current_hp
-                        max_hp = st.user_max_hp
-                        if has_afp and not st.user_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
-                            st.user_afp_charges = 2
-                            st.user_afp_triggered = True
-                            st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
-                    st.logs.append(
-                        f"{atk['name']} makes an extra attack on {dfn['name']} for {dmg} dmg" +
-                        f" (rolls {rolls})" + (" (defended)" if dfn_act == "Defend" else "")
+                    dfn_temp_defend = st.opp_temp_defend if side == "user" else st.user_temp_defend
+                    dmg = _deal_damage(
+                        st,
+                        side,
+                        atk,
+                        dfn,
+                        dmg,
+                        dfn_act,
+                        has_afp,
+                        dfn_temp_defend,
+                        sudden_death_mult,
                     )
+                    st.logs.append(
+                        f"{atk['name']} makes an extra attack on {dfn['name']} for {dmg} dmg (rolls {rolls})"
+                        + (" (defended)" if dfn_act == "Defend" or dfn_temp_defend else "")
+                    )
+                    if st.user_current_hp <= 0:
+                        st.logs.append(f"{st.user_creature['name']} is down!")
+                    if st.opp_current_hp <= 0:
+                        st.logs.append(f"{st.opp_creature['name']} is down!")
                     if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
-                        st.logs.append(f"{dfn['name']} is down!")
                         break
             continue
-        swings = 1 if use_prism_coil else (2 if atk["stats"]["SPD"] >= 1.5 * dfn["stats"]["SPD"] else 1)
-        for _ in range(swings):
+        else:
+            attacks.append((act, False))
+
+        for atype, flag in attacks:
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
                 break
-            S = max(atk["stats"]["PATK"], atk["stats"]["SATK"])
-            if use_prism_coil:
-                rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10) + 2)]
-                s = sum(rolls)
-                dmg = max(1, math.ceil((s * s) / (s if s > 0 else 1)))
-                dmg = math.ceil(dmg * 1.20)
+            if atype == "shock_fangs":
+                _shock_fangs_attack(st, side, atk, dfn, dfn_act, sudden_death_mult)
+            elif atype == "prism_coil":
+                _prism_coil_attack(st, side, atk, dfn, dfn_act, sudden_death_mult, aggressive=flag)
+            elif atype == "blink":
+                _blink_attack(st, side, atk, dfn, dfn_act, sudden_death_mult)
             else:
-                AR_val = 0 if act == "Special" else dfn["stats"]["AR"] // 2
-                rolls = [random.randint(1, 6) for _ in range(math.ceil(S / 10))]
-                s = sum(rolls)
-                dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
-                if act == "Aggressive":
-                    dmg = math.ceil(dmg * 1.25)
-                if act in ("Attack", "Aggressive") and any(
-                    a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])
-                ):
-                    dmg = max(1, math.ceil(dmg * 0.9))
-            if dfn_act == "Defend":
-                dmg = max(1, math.ceil(dmg * 0.5))
-            if sudden_death_mult > 1.0:
-                dmg = max(1, math.ceil(dmg * sudden_death_mult))
-            if has_afp:
-                if side == "user":
-                    if st.opp_afp_charges > 0:
-                        dmg = max(1, math.ceil(dmg * 0.35))
-                        st.opp_afp_charges -= 1
-                else:
-                    if st.user_afp_charges > 0:
-                        dmg = max(1, math.ceil(dmg * 0.35))
-                        st.user_afp_charges -= 1
-            if side == "user":
-                st.opp_current_hp -= dmg
-                new_hp = st.opp_current_hp
-                max_hp = st.opp_max_hp
-                if has_afp and not st.opp_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
-                    st.opp_afp_charges = 2
-                    st.opp_afp_triggered = True
-                    st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
-            else:
-                st.user_current_hp -= dmg
-                new_hp = st.user_current_hp
-                max_hp = st.user_max_hp
-                if has_afp and not st.user_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
-                    st.user_afp_charges = 2
-                    st.user_afp_triggered = True
-                    st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
-            if use_prism_coil:
-                note = " (defended)" if dfn_act == "Defend" else ""
-                st.logs.append(
-                    f"{atk['name']} fires {PRISM_COIL} at {dfn['name']} for {dmg} dmg (rolls {rolls}){note}"
-                )
-            else:
-                act_word = {"Attack": "hits", "Aggressive": "aggressively hits", "Special": "unleashes a special attack on"}[act]
-                note = " (defended)" if dfn_act == "Defend" else ""
-                st.logs.append(
-                    f"{atk['name']} {act_word} {dfn['name']} for {dmg} dmg" +
-                    (f" (rolls {rolls})" if act != "Special" else "") + note
-                )
-            if side == "user" and st.opp_aegis_charges > 0:
-                reflect = max(1, math.ceil(dmg * 0.5 * st.opp_aegis_charges))
-                st.user_current_hp -= reflect
-                st.logs.append(
-                    f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
-                )
-                st.opp_aegis_charges = 0
-                st.user_aegis_charges = 0
-            elif side == "opp" and st.user_aegis_charges > 0:
-                reflect = max(1, math.ceil(dmg * 0.5 * st.user_aegis_charges))
-                st.opp_current_hp -= reflect
-                st.logs.append(
-                    f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
-                )
-                st.user_aegis_charges = 0
-                st.opp_aegis_charges = 0
-            if st.user_current_hp <= 0:
-                st.logs.append(f"{st.user_creature['name']} is down!")
-            if st.opp_current_hp <= 0:
-                st.logs.append(f"{st.opp_creature['name']} is down!")
+                _standard_attack(st, side, atk, dfn, atype, dfn_act, sudden_death_mult)
             if st.user_current_hp <= 0 or st.opp_current_hp <= 0:
                 break
 
@@ -1280,53 +1528,22 @@ def simulate_round(st: BattleState):
                 dmg = max(1, math.ceil((s * s) / (s + AR_val) if (s + AR_val) > 0 else s))
                 if any(a.get("name") == SUBDERMAL_BALLISTICS_GEL for a in dfn.get("augments", [])):
                     dmg = max(1, math.ceil(dmg * 0.9))
-                if dfn_act == "Defend": dmg = max(1, math.ceil(dmg * 0.5))
-                if sudden_death_mult > 1.0: dmg = max(1, math.ceil(dmg * sudden_death_mult))
-                if has_afp:
-                    if side == "user":
-                        if st.opp_afp_charges > 0:
-                            dmg = max(1, math.ceil(dmg * 0.35))
-                            st.opp_afp_charges -= 1
-                    else:
-                        if st.user_afp_charges > 0:
-                            dmg = max(1, math.ceil(dmg * 0.35))
-                            st.user_afp_charges -= 1
-                if side == "user":
-                    st.opp_current_hp -= dmg
-                    new_hp = st.opp_current_hp
-                    max_hp = st.opp_max_hp
-                    if has_afp and not st.opp_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
-                        st.opp_afp_charges = 2
-                        st.opp_afp_triggered = True
-                        st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
-                else:
-                    st.user_current_hp -= dmg
-                    new_hp = st.user_current_hp
-                    max_hp = st.user_max_hp
-                    if has_afp and not st.user_afp_triggered and new_hp > 0 and new_hp <= math.floor(0.4 * max_hp):
-                        st.user_afp_charges = 2
-                        st.user_afp_triggered = True
-                        st.logs.append(f"{dfn['name']}'s {ABLATIVE_FOAM_PODS} deploy!")
-                st.logs.append(
-                    f"{atk['name']} makes an extra attack on {dfn['name']} for {dmg} dmg" +
-                    f" (rolls {rolls})" + (" (defended)" if dfn_act == "Defend" else "")
+                dfn_temp_defend = st.opp_temp_defend if side == "user" else st.user_temp_defend
+                dmg = _deal_damage(
+                    st,
+                    side,
+                    atk,
+                    dfn,
+                    dmg,
+                    dfn_act,
+                    has_afp,
+                    dfn_temp_defend,
+                    sudden_death_mult,
                 )
-                if side == "user" and st.opp_aegis_charges > 0:
-                    reflect = max(1, math.ceil(dmg * 0.5 * st.opp_aegis_charges))
-                    st.user_current_hp -= reflect
-                    st.logs.append(
-                        f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
-                    )
-                    st.opp_aegis_charges = 0
-                    st.user_aegis_charges = 0
-                elif side == "opp" and st.user_aegis_charges > 0:
-                    reflect = max(1, math.ceil(dmg * 0.5 * st.user_aegis_charges))
-                    st.opp_current_hp -= reflect
-                    st.logs.append(
-                        f"{dfn['name']}'s {AEGIS_COUNTER} reflects {reflect} dmg back to {atk['name']}!"
-                    )
-                    st.user_aegis_charges = 0
-                    st.opp_aegis_charges = 0
+                st.logs.append(
+                    f"{atk['name']} makes an extra attack on {dfn['name']} for {dmg} dmg (rolls {rolls})"
+                    + (" (defended)" if dfn_act == "Defend" or dfn_temp_defend else "")
+                )
                 if st.user_current_hp <= 0:
                     st.logs.append(f"{st.user_creature['name']} is down!")
                 if st.opp_current_hp <= 0:

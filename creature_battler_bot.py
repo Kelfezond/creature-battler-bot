@@ -4082,9 +4082,11 @@ async def _do_upgrade(inter: discord.Interaction):
     )
     new_bonus = FACILITY_LEVELS[next_level]["bonus"]
     await inter.response.send_message(
-        f"✅ Upgraded to **Level {next_level} – {FACILITY_LEVELS[next_level]['name']}**!\n",
-        f"Your facility now grants **+{new_bonus} trainer points/day** "
-        f"(total {daily_trainer_points_for(next_level)}/day).",
+        (
+            f"✅ Upgraded to **Level {next_level} – {FACILITY_LEVELS[next_level]['name']}**!\n"
+            f"Your facility now grants **+{new_bonus} trainer points/day** "
+            f"(total {daily_trainer_points_for(next_level)}/day)."
+        ),
         ephemeral=True,
     )
 

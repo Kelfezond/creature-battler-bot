@@ -2455,6 +2455,7 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
             loser_died = True
             await _record_death(loser_user, loser_cre["name"])
             await pool.execute("DELETE FROM creatures WHERE id=$1", loser_id)
+            asyncio.create_task(update_shop_now(reason="death"))
             st.logs.append(f"💀 Death roll {pct} (<50): **{loser_cre['name']}** died (kept on leaderboard).")
         else:
             st.logs.append(f"🛡️ Death roll {pct} (≥50): **{loser_cre['name']}** survived the defeat.")
@@ -2541,6 +2542,7 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
             await _record_death(st.user_id, st.user_creature["name"])
             died = True
             await pool.execute("DELETE FROM creatures WHERE id=$1", st.creature_id)
+            asyncio.create_task(update_shop_now(reason="death"))
             st.logs.append(f"💀 Death roll {pct} (<50): **{st.user_creature['name']}** died (kept on leaderboard).")
         else:
             st.logs.append(f"🛡️ Death roll {pct} (≥50): **{st.user_creature['name']}** survived the defeat.")
@@ -3630,16 +3632,6 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
     if not c_row:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
 
-    listed = await (await db_pool()).fetchval(
-        "SELECT 1 FROM creature_shop WHERE creature_id=$1",
-        c_row["id"],
-    )
-    if listed:
-        return await inter.response.send_message(
-            f"{c_row['name']} is listed in the shop and cannot battle.",
-            ephemeral=True,
-        )
-
     stats = json.loads(c_row["stats"])
     max_hp = stats["HP"] * 5
     if c_row["current_hp"] <= 0:
@@ -3760,7 +3752,7 @@ async def pvp(inter: discord.Interaction):
         return
     pool = await db_pool()
     my_creatures = await pool.fetch(
-        "SELECT id,name,stats FROM creatures WHERE owner_id=$1 AND NOT EXISTS (SELECT 1 FROM creature_shop cs WHERE cs.creature_id = creatures.id)",
+        "SELECT id,name,stats FROM creatures WHERE owner_id=$1",
         inter.user.id,
     )
     if not my_creatures:
@@ -3800,7 +3792,6 @@ async def pvp(inter: discord.Interaction):
         FROM creatures c
         JOIN trainers t ON t.user_id = c.owner_id
         WHERE c.owner_id <> $1
-          AND NOT EXISTS (SELECT 1 FROM creature_shop cs WHERE cs.creature_id = c.id)
         """,
         inter.user.id,
     )

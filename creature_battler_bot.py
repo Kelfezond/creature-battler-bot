@@ -158,6 +158,14 @@ CREATE TABLE IF NOT EXISTS battle_caps (
   PRIMARY KEY (creature_id, day)
 );
 
+-- Per-trainer/day spawn cap (resets at midnight Europe/London)
+CREATE TABLE IF NOT EXISTS spawn_caps (
+  user_id BIGINT NOT NULL REFERENCES trainers(user_id) ON DELETE CASCADE,
+  day DATE NOT NULL,
+  count INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, day)
+);
+
 -- Per-creature per-tier progress (wins & glyph unlock)
 CREATE TABLE IF NOT EXISTS creature_progress (
   creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
@@ -290,6 +298,7 @@ async def db_pool() -> asyncpg.Pool:
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5
 DAILY_BATTLE_CAP = 2  # <— used for display of remaining battles
+DAILY_SPAWN_CAP = 2
 PVP_COOLDOWN_HOURS = 12
 
 SELL_PRICES: Dict[str, int] = {
@@ -1275,6 +1284,55 @@ async def _battles_left_map(creature_ids: List[int]) -> Dict[int, int]:
         left = max(0, DAILY_BATTLE_CAP - int(r["count"]))
         result[int(r["creature_id"])] = left
     return result
+
+# ─── Spawn cap helper ────────────────────────────────────────
+async def _can_spawn_and_increment(user_id: int) -> Tuple[bool, int]:
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+            row = await conn.fetchrow(
+                "SELECT count FROM spawn_caps WHERE user_id=$1 AND day=$2 FOR UPDATE",
+                user_id, day,
+            )
+            if not row:
+                await conn.execute(
+                    "INSERT INTO spawn_caps(user_id, day, count) VALUES($1,$2,1)",
+                    user_id, day,
+                )
+                return True, 1
+            current = row["count"]
+            if current >= DAILY_SPAWN_CAP:
+                return False, current
+            new_count = current + 1
+            await conn.execute(
+                "UPDATE spawn_caps SET count=$3 WHERE user_id=$1 AND day=$2",
+                user_id, day, new_count,
+            )
+            return True, new_count
+
+async def _decrement_spawn_count(user_id: int) -> None:
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+            row = await conn.fetchrow(
+                "SELECT count FROM spawn_caps WHERE user_id=$1 AND day=$2 FOR UPDATE",
+                user_id, day,
+            )
+            if not row:
+                return
+            current = int(row["count"]) - 1
+            if current <= 0:
+                await conn.execute(
+                    "DELETE FROM spawn_caps WHERE user_id=$1 AND day=$2",
+                    user_id, day,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE spawn_caps SET count=$3 WHERE user_id=$1 AND day=$2",
+                    user_id, day, current,
+                )
 
 # ─── PvP cooldown helpers ────────────────────────────────────
 async def _pvp_ready_map(creature_ids: List[int]) -> Dict[int, bool]:
@@ -2924,7 +2982,7 @@ async def register(inter: discord.Interaction):
         ephemeral=True
     )
 
-@bot.tree.command(description="Spawn a new creature egg (10'000 cash)")
+@bot.tree.command(description="Spawn a new creature egg (10'000 cash, max 2/day)")
 async def spawn(inter: discord.Interaction):
     row = await ensure_registered(inter)
     if not row:
@@ -2934,6 +2992,12 @@ async def spawn(inter: discord.Interaction):
         return
     if row["cash"] < 10_000:
         return await inter.response.send_message("Not enough cash.", ephemeral=True)
+    ok, count = await _can_spawn_and_increment(inter.user.id)
+    if not ok:
+        return await inter.response.send_message(
+            f"Daily spawn limit reached: {count}/{DAILY_SPAWN_CAP} used.",
+            ephemeral=True,
+        )
 
     await (await db_pool()).execute(
         "UPDATE trainers SET cash = cash - 10000 WHERE user_id=$1", inter.user.id
@@ -2946,6 +3010,7 @@ async def spawn(inter: discord.Interaction):
         await (await db_pool()).execute(
             "UPDATE trainers SET cash = cash + 10000 WHERE user_id=$1", inter.user.id
         )
+        await _decrement_spawn_count(inter.user.id)
         await inter.followup.send(
             f"Creature generation timed out. {fmt_cash(10000)} cash has been reimbursed.",
             ephemeral=True,
@@ -5179,7 +5244,7 @@ async def info(inter: discord.Interaction):
         "**Basic Commands**\n"
         "/register — create your trainer account.\n"
         "/record <creature_name> — view a creature's lifetime record.\n"
-        "/spawn — spend 10,000 cash to hatch a new creature.\n"
+        "/spawn — spend 10,000 cash to hatch a new creature (max 2/day).\n"
         "/battle <creature_name> <tier> — fight an AI opponent in a chosen tier.\n"
         "/pvp — challenge another trainer to battle.\n"
         "/frc — show your friend recruitment code.\n"

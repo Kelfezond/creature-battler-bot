@@ -5162,8 +5162,16 @@ class CreatureView(discord.ui.View):
 
     @discord.ui.button(label="Quick Sell", style=discord.ButtonStyle.danger)
     async def btn_quicksell(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = await (await db_pool()).fetchrow(
+            "SELECT rarity FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+            interaction.user.id,
+            self.creature_name,
+        )
+        if not row:
+            return await interaction.response.send_message("Creature not found.", ephemeral=True)
+        price = SELL_PRICES.get(row["rarity"], 0)
         await interaction.response.send_message(
-            f"Are you sure you want to quick sell **{self.creature_name}**? This cannot be undone.",
+            f"Are you sure you want to quick sell **{self.creature_name}** for **{fmt_cash(price)}** cash? This cannot be undone.",
             ephemeral=True,
             view=QuickSellConfirmView(interaction.user.id, self.creature_name),
         )

@@ -3104,6 +3104,13 @@ async def spawn(inter: discord.Interaction):
     # Send the final creature details publicly so everyone can see the spawn.
     await inter.followup.send(embed=embed)
     asyncio.create_task(update_leaderboard_now(reason="spawn"))
+
+@bot.tree.command(description="Admin: Force spawn ignoring daily limit")
+async def spawnforce(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized.", ephemeral=True)
+    await _decrement_spawn_count(inter.user.id)
+    await spawn(inter)
 @bot.tree.command(description="List your creatures")
 async def creatures(inter: discord.Interaction):
     if not await ensure_registered(inter):
@@ -5313,6 +5320,7 @@ async def info(inter: discord.Interaction):
         "/register — create your trainer account.\n"
         "/record <creature_name> — view a creature's lifetime record.\n"
         "/spawn — spend 10,000 cash to hatch a new creature (max 2/day).\n"
+        "/spawnforce — admin: spawn ignoring daily limit.\n"
         "/battle <creature_name> <tier> — fight an AI opponent in a chosen tier.\n"
         "/pvp — challenge another trainer to battle.\n"
         "/frc — show your friend recruitment code.\n"

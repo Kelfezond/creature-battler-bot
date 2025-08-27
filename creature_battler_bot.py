@@ -1023,7 +1023,7 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
                     input=prompt,
                     max_output_tokens=MAX_OUTPUT_TOKENS,
                 )),
-                timeout=30.0
+                timeout=60.0
             )
             text = (getattr(resp, 'output_text', '') or '').strip()
             if not text:

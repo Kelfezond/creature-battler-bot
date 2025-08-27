@@ -166,6 +166,14 @@ CREATE TABLE IF NOT EXISTS spawn_caps (
   PRIMARY KEY (user_id, day)
 );
 
+-- Cache of pre-generated spawn names/descriptors
+CREATE TABLE IF NOT EXISTS spawn_name_cache (
+  id SERIAL PRIMARY KEY,
+  rarity TEXT NOT NULL,
+  name TEXT NOT NULL,
+  descriptors TEXT[] NOT NULL
+);
+
 -- Per-creature per-tier progress (wins & glyph unlock)
 CREATE TABLE IF NOT EXISTS creature_progress (
   creature_id INT NOT NULL REFERENCES creatures(id) ON DELETE CASCADE,
@@ -971,22 +979,39 @@ async def enforce_creature_cap(inter: discord.Interaction) -> bool:
         return False
     return True
 
-async def generate_creature_meta(rarity: str) -> Dict[str, Any] | None:
+async def _generate_creature_meta_batch(rarity: str, count: int = 10) -> List[Dict[str, Any]] | None:
     pool = await db_pool()
     rows = await pool.fetch("SELECT name, descriptors FROM creatures")
-    used_names = [r["name"].lower() for r in rows]
+    used_names = {r["name"].lower() for r in rows}
     used_words = {w.lower() for r in rows for w in (r["descriptors"] or [])}
 
-    # Random 50 sample for prompt compactness
-    used_names_list = list(used_names)
-    used_words_list = list(used_words)
+    lb_rows = await pool.fetch(
+        """
+        SELECT COALESCE(c.original_name, r.name) AS name
+        FROM creature_records r
+        LEFT JOIN creatures c ON c.id = r.creature_id
+        ORDER BY r.wins DESC, r.losses ASC, r.name ASC
+        LIMIT 20
+        """
+    )
+    leaderboard_names = [row["name"].lower() for row in lb_rows if row["name"]]
+    used_names |= set(leaderboard_names)
+
     from random import sample as _rsample
-    avoid_names = _rsample(used_names_list, min(50, len(used_names_list)))
+    remaining = list(used_names - set(leaderboard_names))
+    sampled = _rsample(remaining, min(50, len(remaining)))
+    avoid_names = sorted(set(leaderboard_names + sampled))
+
+    used_words_list = list(used_words)
     avoid_words = _rsample(used_words_list, min(50, len(used_words_list)))
+
     prompt = f"""
-Invent a creature of rarity **{rarity}**. Return ONLY JSON:
-{{"name":"1-3 words","descriptors":["w1","w2","w3"]}}
-Avoid names: {', '.join(sorted(avoid_names)) if avoid_names else 'None'}
+Invent {count} creatures of rarity **{rarity}**. Return ONLY JSON list:
+[
+{{"name":"1-3 words","descriptors":["w1","w2","w3"]}},
+... (total {count} entries)
+]
+Avoid names: {', '.join(avoid_names) if avoid_names else 'None'}
 Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
 """
     import asyncio as _asyncio, json as _json, re as _re
@@ -1006,18 +1031,48 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
             try:
                 data = _json.loads(text)
             except Exception:
-                m = _re.search(r"\{[\s\S]*\}", text)
+                m = _re.search(r"\[[\s\S]*\]", text)
                 if not m:
                     raise
                 data = _json.loads(m.group(0))
-            if "name" in data and len(data.get("descriptors", [])) == 3:
-                data["name"] = str(data["name"]).title()
-                return data
+            if isinstance(data, list) and data:
+                result = []
+                for entry in data[:count]:
+                    if "name" in entry and len(entry.get("descriptors", [])) == 3:
+                        entry["name"] = str(entry["name"]).title()
+                        result.append(entry)
+                if len(result) >= count:
+                    return result
         except _asyncio.TimeoutError:
             logger.warning("generate_creature_meta timed out; retrying…")
         except Exception as e:
             logger.error("OpenAI error: %s", e)
     return None
+
+
+async def get_spawn_meta(rarity: str) -> Dict[str, Any] | None:
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name, descriptors FROM spawn_name_cache WHERE rarity=$1 ORDER BY id LIMIT 1",
+            rarity,
+        )
+        if not row:
+            metas = await _generate_creature_meta_batch(rarity)
+            if not metas:
+                return None
+            await conn.executemany(
+                "INSERT INTO spawn_name_cache(rarity, name, descriptors) VALUES ($1,$2,$3)",
+                [(rarity, m["name"], m["descriptors"]) for m in metas],
+            )
+            row = await conn.fetchrow(
+                "SELECT id, name, descriptors FROM spawn_name_cache WHERE rarity=$1 ORDER BY id LIMIT 1",
+                rarity,
+            )
+            if not row:
+                return None
+        await conn.execute("DELETE FROM spawn_name_cache WHERE id=$1", row["id"])
+    return {"name": row["name"], "descriptors": row["descriptors"]}
 
 
 # ─── Name-only generator for battles ──────────────────────────────────────
@@ -3005,7 +3060,7 @@ async def spawn(inter: discord.Interaction):
     await inter.response.defer(thinking=True)
 
     rarity = spawn_rarity()
-    meta = await generate_creature_meta(rarity)
+    meta = await get_spawn_meta(rarity)
     if not meta:
         await (await db_pool()).execute(
             "UPDATE trainers SET cash = cash + 10000 WHERE user_id=$1", inter.user.id

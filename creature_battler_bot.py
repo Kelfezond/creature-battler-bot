@@ -3057,6 +3057,8 @@ async def spawn(inter: discord.Interaction):
     await (await db_pool()).execute(
         "UPDATE trainers SET cash = cash - 10000 WHERE user_id=$1", inter.user.id
     )
+    # Defer the response early so the interaction doesn't time out while
+    # generating the creature. The final spawn result will be sent publicly.
     await inter.response.defer(thinking=True)
 
     rarity = spawn_rarity()
@@ -3097,6 +3099,7 @@ async def spawn(inter: discord.Interaction):
     except Exception:
         pass
     embed.set_footer(text="Legendary spawn chance: 0.5%")
+    # Send the final creature details publicly so everyone can see the spawn.
     await inter.followup.send(embed=embed)
     asyncio.create_task(update_leaderboard_now(reason="spawn"))
 @bot.tree.command(description="List your creatures")

@@ -1021,7 +1021,9 @@ Avoid words: {', '.join(sorted(avoid_words)) if avoid_words else 'None'}
                 _to_thread(lambda: client.responses.create(
                     model=TEXT_MODEL,
                     input=prompt,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    # Generate multiple names/descriptors in a single request,
+                    # so scale the token allowance with the batch size.
+                    max_output_tokens=MAX_OUTPUT_TOKENS * count,
                 )),
                 timeout=60.0
             )

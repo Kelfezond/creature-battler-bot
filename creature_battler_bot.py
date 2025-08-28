@@ -1329,6 +1329,29 @@ async def _can_start_battle_and_increment(creature_id: int) -> Tuple[bool, int]:
             )
             return True, new_count
 
+async def _decrement_battle_count(creature_id: int) -> None:
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+            row = await conn.fetchrow(
+                "SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE",
+                creature_id, day,
+            )
+            if not row:
+                return
+            current = int(row["count"]) - 1
+            if current <= 0:
+                await conn.execute(
+                    "DELETE FROM battle_caps WHERE creature_id=$1 AND day=$2",
+                    creature_id, day,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2",
+                    creature_id, day, current,
+                )
+
 # NEW: bulk fetch remaining battles for /creatures
 async def _battles_left_map(creature_ids: List[int]) -> Dict[int, int]:
     """
@@ -3181,9 +3204,8 @@ async def creatures(inter: discord.Interaction):
         overall = int(st.get("HP", 0) + st.get("AR", 0) + st.get("PATK", 0) + st.get("SATK", 0) + st.get("SPD", 0))
 
         # For PvP battles, creatures are fully healed at the start, so current HP
-        # shouldn't restrict eligibility. Only check that the creature isn't
-        # listed in the shop and respects the PvP cooldown map.
-        pvp_ready = r["not_listed"] and pvp_ready_map.get(int(r["id"]), True)
+        # shouldn't restrict eligibility. Only enforce the PvP cooldown map.
+        pvp_ready = pvp_ready_map.get(int(r["id"]), True)
         pvp_icon = "✅" if pvp_ready else "❌"
 
         augments = augment_map.get(int(r["id"]), [])
@@ -3787,16 +3809,19 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
             ephemeral=True
         )
 
-    allowed, count = await _can_start_battle_and_increment(c_row["id"])
-    if not allowed:
-        return await inter.response.send_message(
-            f"Daily battle cap reached for **{c_row['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
-            "Try again after midnight Europe/London.", ephemeral=True
-        )
-
     await battle_lock.acquire()
     current_battler_id = inter.user.id
+    incremented = False
     try:
+        allowed, count = await _can_start_battle_and_increment(c_row["id"])
+        incremented = allowed
+        if not allowed:
+            await inter.response.send_message(
+                f"Daily battle cap reached for **{c_row['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
+                "Try again after midnight Europe/London.", ephemeral=True
+            )
+            return
+
         await inter.response.defer(thinking=True)
 
         aug_rows = await (await db_pool()).fetch(
@@ -3875,7 +3900,12 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
                 await send_chunks(inter, "\n".join(pending), ephemeral=True)
                 await asyncio.sleep(0.35)
             await inter.followup.send(format_public_battle_summary(st, summary, trainer_name), ephemeral=False)
+    except Exception:
+        if incremented:
+            await _decrement_battle_count(c_row["id"])
+        raise
     finally:
+        active_battles.pop(inter.user.id, None)
         try:
             current_battler_id = None
             if battle_lock.locked():

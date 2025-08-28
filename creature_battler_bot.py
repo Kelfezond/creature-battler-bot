@@ -674,13 +674,13 @@ async def regenerate_hp():
         UPDATE creatures c
         SET current_hp = LEAST(
                 COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
-                + CEIL((c.stats->>'HP')::numeric * 1.0) * r.cycles,
+                + CEIL((c.stats->>'HP')::numeric * 5 * 0.2) * r.cycles,
                 (c.stats->>'HP')::int * 5
             ),
             last_hp_regen = CASE
                 WHEN LEAST(
                         COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
-                        + CEIL((c.stats->>'HP')::numeric * 1.0) * r.cycles,
+                        + CEIL((c.stats->>'HP')::numeric * 5 * 0.2) * r.cycles,
                         (c.stats->>'HP')::int * 5
                      ) > COALESCE(c.current_hp, 0)
                 THEN $1

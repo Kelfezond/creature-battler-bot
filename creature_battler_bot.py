@@ -677,9 +677,17 @@ async def regenerate_hp():
                 + CEIL((c.stats->>'HP')::numeric * 1.0) * r.cycles,
                 (c.stats->>'HP')::int * 5
             ),
-            last_hp_regen = CASE WHEN r.cycles > 0 THEN $1 ELSE c.last_hp_regen END
+            last_hp_regen = CASE
+                WHEN LEAST(
+                        COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
+                        + CEIL((c.stats->>'HP')::numeric * 1.0) * r.cycles,
+                        (c.stats->>'HP')::int * 5
+                     ) > COALESCE(c.current_hp, 0)
+                THEN $1
+                ELSE c.last_hp_regen
+            END
         FROM regen r
-        WHERE c.id = r.id AND r.cycles > 0
+        WHERE c.id = r.id AND r.cycles > 0 AND c.current_hp < (c.stats->>'HP')::int * 5
         """,
         now,
         now_minus_12h,

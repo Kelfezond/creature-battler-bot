@@ -659,28 +659,28 @@ async def _catch_up_trainer_points_now():
             last_tp_grant = (SELECT d FROM today)
     """)
 
-@tasks.loop(hours=12)
+@tasks.loop(hours=1)
 async def regenerate_hp():
     now = datetime.now(timezone.utc)
-    # Pre-calc 12 hours ago to avoid relying on SQL interval arithmetic on placeholders
-    now_minus_12h = now - timedelta(hours=12)
+    # Pre-calc 1 hour ago to avoid relying on SQL interval arithmetic on placeholders
+    now_minus_1h = now - timedelta(hours=1)
     await (await db_pool()).execute(
         """
         WITH regen AS (
             SELECT id,
-                   FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - COALESCE(last_hp_regen, $2::timestamptz))) / 43200) AS cycles
+                   FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - COALESCE(last_hp_regen, $2::timestamptz))) / 3600) AS cycles
             FROM creatures
         )
         UPDATE creatures c
         SET current_hp = LEAST(
                 COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
-                + CEIL((c.stats->>'HP')::numeric * 5 * 0.33) * r.cycles,
+                + CEIL((c.stats->>'HP')::numeric * 5 * 0.03) * r.cycles,
                 (c.stats->>'HP')::int * 5
             ),
             last_hp_regen = CASE
                 WHEN LEAST(
                         COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
-                        + CEIL((c.stats->>'HP')::numeric * 5 * 0.33) * r.cycles,
+                        + CEIL((c.stats->>'HP')::numeric * 5 * 0.03) * r.cycles,
                         (c.stats->>'HP')::int * 5
                      ) > COALESCE(c.current_hp, 0)
                 THEN $1
@@ -690,7 +690,7 @@ async def regenerate_hp():
         WHERE c.id = r.id AND r.cycles > 0 AND c.current_hp < (c.stats->>'HP')::int * 5
         """,
         now,
-        now_minus_12h,
+        now_minus_1h,
     )
     logger.info("Regenerated HP for creatures needing it")
 

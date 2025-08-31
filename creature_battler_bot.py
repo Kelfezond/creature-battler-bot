@@ -3499,6 +3499,17 @@ async def buy(inter: discord.Interaction, creature_name: str):
                 price,
                 c_row["owner_id"],
             )
+            # Transfer leaderboard record ownership to the buyer
+            await conn.execute(
+                "DELETE FROM creature_records WHERE owner_id=$1 AND LOWER(name)=LOWER($2)",
+                inter.user.id,
+                c_row["name"],
+            )
+            await conn.execute(
+                "UPDATE creature_records SET owner_id=$1 WHERE creature_id=$2",
+                inter.user.id,
+                c_row["id"],
+            )
 
     await _ensure_record(inter.user.id, c_row["id"], c_row["name"])
     await inter.response.send_message(

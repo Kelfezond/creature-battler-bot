@@ -309,13 +309,89 @@ DAILY_BATTLE_CAP = 2  # <— used for display of remaining battles
 DAILY_SPAWN_CAP = 2
 PVP_COOLDOWN_HOURS = 12
 
-SELL_PRICES: Dict[str, int] = {
-    "Common": 1_000,
-    "Uncommon": 2_000,
-    "Rare": 10_000,
-    "Epic": 20_000,
-    "Legendary": 50_000,
+RARITY_FLOORS: Dict[str, int] = {
+    "Common": 2_000,
+    "Uncommon": 3_000,
+    "Rare": 5_000,
+    "Epic": 12_000,
+    "Legendary": 25_000,
 }
+
+RARITY_MULTS: Dict[str, float] = {
+    "Common": 1.00,
+    "Uncommon": 1.10,
+    "Rare": 1.30,
+    "Epic": 1.60,
+    "Legendary": 2.20,
+}
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    """Clamp a value between minimum and maximum."""
+    return max(minimum, min(maximum, value))
+
+
+def calc_quicksell_price(
+    ovr: int,
+    rarity: str,
+    current_hp: int,
+    max_hp: int,
+    wins: int,
+    losses: int,
+    glyph_tier: int,
+) -> int:
+    """Calculate the quicksell price for a creature."""
+    rarity_mult = RARITY_MULTS.get(rarity, 1.0)
+    floor_price = RARITY_FLOORS.get(rarity, 0)
+
+    health_mult = 0.30 + 0.70 * (current_hp / max_hp) if max_hp > 0 else 0.30
+    performance = 1 + 0.12 * (wins - losses) / (wins + losses + 8)
+    performance = clamp(performance, 0.90, 1.12)
+
+    glyph_mult = 1 + 0.02 * glyph_tier
+    if glyph_tier >= 3:
+        glyph_mult += 0.03
+    if glyph_tier >= 6:
+        glyph_mult += 0.05
+
+    price = (60 * (ovr ** 1.05)) * rarity_mult * health_mult * performance * glyph_mult
+    price = clamp(price, floor_price, 500_000)
+    return int(round(price / 100.0)) * 100
+
+
+async def _get_quicksell_info(owner_id: int, creature_name: str):
+    """Fetch creature info and compute its quicksell price."""
+    row = await (await db_pool()).fetchrow(
+        """
+        SELECT c.id, c.name, c.rarity, c.stats, c.current_hp,
+               COALESCE(r.wins, 0) AS wins,
+               COALESCE(r.losses, 0) AS losses,
+               COALESCE(r.highest_glyph_tier, 0) AS glyph
+        FROM creatures c
+        LEFT JOIN creature_records r ON r.creature_id = c.id
+        WHERE c.owner_id=$1 AND c.name ILIKE $2
+        """,
+        owner_id,
+        creature_name,
+    )
+    if not row:
+        return None
+    try:
+        stats = json.loads(row["stats"])
+    except Exception:
+        stats = {}
+    ovr = int(sum(stats.values()))
+    max_hp = stats.get("HP", 0) * 5
+    price = calc_quicksell_price(
+        ovr,
+        row["rarity"],
+        row["current_hp"],
+        max_hp,
+        row["wins"],
+        row["losses"],
+        row["glyph"],
+    )
+    return row, price, ovr
 
 SMALL_HEALING_INJECTOR = "Small Healing Injector"
 SMALL_HEALING_INJECTOR_PRICE = 26_000
@@ -3251,27 +3327,23 @@ async def quicksell(inter: discord.Interaction, creature_name: str):
     row = await ensure_registered(inter)
     if not row:
         return
-    c_row = await (await db_pool()).fetchrow(
-        "SELECT id, name, rarity FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
-    )
-    if not c_row:
+    info = await _get_quicksell_info(inter.user.id, creature_name)
+    if not info:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
+    c_row, price, ovr = info
     st = active_battles.get(inter.user.id)
     if st and st.creature_id == c_row["id"]:
         return await inter.response.send_message(
             f"**{c_row['name']}** is currently in a battle. Finish or cancel the battle before selling.",
             ephemeral=True
         )
-    rarity = c_row["rarity"]
-    price = SELL_PRICES.get(rarity, 0)
-    await _ensure_record(inter.user.id, c_row["id"], c_row["name"])
+    await _ensure_record(inter.user.id, c_row["id"], c_row["name"], ovr)
     async with (await db_pool()).acquire() as conn:
         async with conn.transaction():
             await conn.execute("DELETE FROM creatures WHERE id=$1", c_row["id"])
             await conn.execute("UPDATE trainers SET cash = cash + $1 WHERE user_id=$2", price, inter.user.id)
     await inter.response.send_message(
-        f"Sold **{c_row['name']}** ({rarity}) for **{fmt_cash(price)}** cash.",
+        f"Sold **{c_row['name']}** ({c_row['rarity']}) for **{fmt_cash(price)}** cash.",
         ephemeral=True,
     )
     asyncio.create_task(update_leaderboard_now(reason="quicksell"))
@@ -5267,14 +5339,10 @@ class CreatureView(discord.ui.View):
 
     @discord.ui.button(label="Quick Sell", style=discord.ButtonStyle.danger)
     async def btn_quicksell(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = await (await db_pool()).fetchrow(
-            "SELECT rarity FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-            interaction.user.id,
-            self.creature_name,
-        )
-        if not row:
+        info = await _get_quicksell_info(interaction.user.id, self.creature_name)
+        if not info:
             return await interaction.response.send_message("Creature not found.", ephemeral=True)
-        price = SELL_PRICES.get(row["rarity"], 0)
+        _, price, _ = info
         await interaction.response.send_message(
             f"Are you sure you want to quick sell **{self.creature_name}** for **{fmt_cash(price)}** cash? This cannot be undone.",
             ephemeral=True,

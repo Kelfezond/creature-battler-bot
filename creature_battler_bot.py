@@ -1857,7 +1857,9 @@ async def _ensure_record(owner_id: int, creature_id: int, name: str, ovr: Option
     await (await db_pool()).execute("""
         INSERT INTO creature_records (creature_id, owner_id, name, ovr)
         VALUES ($1,$2,$3,$4)
-        ON CONFLICT (owner_id, name) DO NOTHING
+        ON CONFLICT (owner_id, name) DO UPDATE
+        SET ovr = EXCLUDED.ovr,
+            creature_id = EXCLUDED.creature_id
     """, creature_id, owner_id, name, ovr)
 
 async def _record_result(owner_id: int, name: str, won: bool):
@@ -2650,6 +2652,9 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
                 json.dumps(new_stats), new_cur_hp, winner_id,
             )
             winner_cre["stats"] = new_stats
+            new_ovr = int(sum(new_stats.values()))
+            winner_owner_id = st.user_id if player_won else st.opp_user_id
+            await _ensure_record(winner_owner_id, winner_id, winner_cre["name"], new_ovr)
             if player_won:
                 st.user_max_hp = new_max_hp
                 st.user_current_hp = new_cur_hp
@@ -2743,6 +2748,8 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
                 json.dumps(new_stats), new_cur_hp, st.creature_id
             )
             st.user_creature["stats"] = new_stats
+            new_ovr = int(sum(new_stats.values()))
+            await _ensure_record(st.user_id, st.creature_id, st.user_creature["name"], new_ovr)
             st.user_max_hp = new_max_hp
             st.user_current_hp = new_cur_hp
             if gained_stat == "HP":
@@ -4462,6 +4469,8 @@ async def _train_creature(inter: discord.Interaction, creature_name: str, stat: 
         "UPDATE creatures SET stats=$1,current_hp=$2 WHERE id=$3",
         json.dumps(stats), new_cur_hp, c["id"]
     )
+    new_ovr = int(sum(stats.values()))
+    await _ensure_record(inter.user.id, c["id"], c["name"], new_ovr)
     await (await db_pool()).execute(
         "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id=$2",
         increase, inter.user.id
@@ -4910,6 +4919,8 @@ async def _use_stat_trainer(inter: discord.Interaction, creature_name: str, stat
             new_cur_hp,
             c_row["id"],
         )
+        new_ovr = int(sum(stats.values()))
+        await _ensure_record(inter.user.id, c_row["id"], c_row["name"], new_ovr)
         await conn.execute(
             "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
             inter.user.id,
@@ -4963,6 +4974,8 @@ async def _use_premium_stat_trainer(inter: discord.Interaction, creature_name: s
             new_cur_hp,
             c_row["id"],
         )
+        new_ovr = int(sum(stats.values()))
+        await _ensure_record(inter.user.id, c_row["id"], c_row["name"], new_ovr)
         await conn.execute(
             "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
             inter.user.id,

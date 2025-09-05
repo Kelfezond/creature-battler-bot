@@ -191,3 +191,49 @@ def test_exhaustion_eliminator_restores_battle_without_healing(monkeypatch):
     assert state["creatures"][1]["current_hp"] == 5
     assert not any("current_hp" in q for q in state.get("executed", []))
     assert interaction.response.message == "Restored one daily battle for **Alpha**."
+
+
+def test_exhaustion_eliminator_multiple_uses(monkeypatch):
+    state = {
+        "creatures": [
+            {"id": 1, "owner_id": 1, "name": "Alpha"},
+        ],
+        "battle_caps": [{"creature_id": 1, "day": "2024-01-01", "count": 2}],
+        "trainer_items": {(1, EXHAUSTION_ELIMINATOR): 2},
+        "day": "2024-01-01",
+    }
+    async def fake_db_pool():
+        return FakePool(state)
+    async def fake_ensure_registered(inter):
+        return {"cash": 0}
+    monkeypatch.setattr(cbb, "db_pool", fake_db_pool)
+    monkeypatch.setattr(cbb, "ensure_registered", fake_ensure_registered)
+    interaction = SimpleNamespace(user=SimpleNamespace(id=1), response=DummyResponse())
+    asyncio.run(cbb._use_exhaustion_eliminator(interaction, "Alpha"))
+    assert state["battle_caps"][0]["count"] == 1
+    assert state["trainer_items"][(1, EXHAUSTION_ELIMINATOR)] == 1
+    interaction.response = DummyResponse()
+    asyncio.run(cbb._use_exhaustion_eliminator(interaction, "Alpha"))
+    assert state["battle_caps"] == []
+    assert state["trainer_items"][(1, EXHAUSTION_ELIMINATOR)] == 0
+
+
+def test_exhaustion_eliminator_deletes_stale_rows(monkeypatch):
+    state = {
+        "creatures": [
+            {"id": 1, "owner_id": 1, "name": "Alpha"},
+        ],
+        "battle_caps": [{"creature_id": 1, "day": "2024-01-01", "count": 0}],
+        "trainer_items": {(1, EXHAUSTION_ELIMINATOR): 1},
+        "day": "2024-01-01",
+    }
+    async def fake_db_pool():
+        return FakePool(state)
+    async def fake_ensure_registered(inter):
+        return {"cash": 0}
+    monkeypatch.setattr(cbb, "db_pool", fake_db_pool)
+    monkeypatch.setattr(cbb, "ensure_registered", fake_ensure_registered)
+    interaction = SimpleNamespace(user=SimpleNamespace(id=1), response=DummyResponse())
+    asyncio.run(cbb._use_exhaustion_eliminator(interaction, "Alpha"))
+    assert state["battle_caps"] == []
+    assert state["trainer_items"][(1, EXHAUSTION_ELIMINATOR)] == 1

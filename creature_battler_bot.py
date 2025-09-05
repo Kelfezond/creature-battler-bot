@@ -4847,12 +4847,22 @@ async def _use_exhaustion_eliminator(inter: discord.Interaction, creature_name: 
                     c_row["id"],
                     day,
                 )
-                if not row_cap or int(row_cap["count"]) <= 0:
+                if not row_cap:
                     return await inter.response.send_message(
                         f"**{c_row['name']}** already has 2/2 battles remaining today.",
                         ephemeral=True,
                     )
                 current = int(row_cap["count"])
+                if current <= 0:
+                    await conn.execute(
+                        "DELETE FROM battle_caps WHERE creature_id=$1 AND day=$2",
+                        c_row["id"],
+                        day,
+                    )
+                    return await inter.response.send_message(
+                        f"**{c_row['name']}** already has 2/2 battles remaining today.",
+                        ephemeral=True,
+                    )
                 new_count = current - 1
                 if new_count == 0:
                     await conn.execute(

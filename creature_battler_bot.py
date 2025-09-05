@@ -2649,6 +2649,12 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
                 "UPDATE creatures SET stats=$1, current_hp=$2 WHERE id=$3",
                 json.dumps(new_stats), new_cur_hp, winner_id,
             )
+            await _ensure_record(
+                st.user_id if player_won else st.opp_user_id,
+                winner_id,
+                winner_cre["name"],
+                int(sum(new_stats.values())),
+            )
             winner_cre["stats"] = new_stats
             if player_won:
                 st.user_max_hp = new_max_hp
@@ -2741,6 +2747,12 @@ async def finalize_battle(inter: discord.Interaction, st: BattleState):
             await pool.execute(
                 "UPDATE creatures SET stats=$1, current_hp=$2 WHERE id=$3",
                 json.dumps(new_stats), new_cur_hp, st.creature_id
+            )
+            await _ensure_record(
+                st.user_id,
+                st.creature_id,
+                st.user_creature["name"],
+                int(sum(new_stats.values())),
             )
             st.user_creature["stats"] = new_stats
             st.user_max_hp = new_max_hp
@@ -4462,6 +4474,13 @@ async def _train_creature(inter: discord.Interaction, creature_name: str, stat: 
         "UPDATE creatures SET stats=$1,current_hp=$2 WHERE id=$3",
         json.dumps(stats), new_cur_hp, c["id"]
     )
+    await _ensure_record(
+        inter.user.id,
+        c["id"],
+        c["name"],
+        int(sum(stats.values())),
+    )
+    asyncio.create_task(update_leaderboard_now(reason="train"))
     await (await db_pool()).execute(
         "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id=$2",
         increase, inter.user.id
@@ -4910,11 +4929,18 @@ async def _use_stat_trainer(inter: discord.Interaction, creature_name: str, stat
             new_cur_hp,
             c_row["id"],
         )
+        await _ensure_record(
+            inter.user.id,
+            c_row["id"],
+            c_row["name"],
+            int(sum(stats.values())),
+        )
         await conn.execute(
             "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
             inter.user.id,
             STAT_TRAINER,
         )
+    asyncio.create_task(update_leaderboard_now(reason="stat_trainer"))
     display_inc = 5 if stat == "HP" else 1
     await inter.response.send_message(
         f"{c_row['name']} trained: +{display_inc} {stat}.", ephemeral=True
@@ -4963,11 +4989,18 @@ async def _use_premium_stat_trainer(inter: discord.Interaction, creature_name: s
             new_cur_hp,
             c_row["id"],
         )
+        await _ensure_record(
+            inter.user.id,
+            c_row["id"],
+            c_row["name"],
+            int(sum(stats.values())),
+        )
         await conn.execute(
             "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
             inter.user.id,
             PREMIUM_STAT_TRAINER,
         )
+    asyncio.create_task(update_leaderboard_now(reason="premium_stat_trainer"))
     await inter.response.send_message(
         f"{c_row['name']} trained: +1 to all stats.", ephemeral=True
     )

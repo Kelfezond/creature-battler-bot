@@ -4471,6 +4471,7 @@ async def _train_creature(inter: discord.Interaction, creature_name: str, stat: 
     )
     new_ovr = int(sum(stats.values()))
     await _ensure_record(inter.user.id, c["id"], c["name"], new_ovr)
+    asyncio.create_task(update_leaderboard_now(reason="train"))
     await (await db_pool()).execute(
         "UPDATE trainers SET trainer_points = trainer_points - $1 WHERE user_id=$2",
         increase, inter.user.id
@@ -4921,6 +4922,7 @@ async def _use_stat_trainer(inter: discord.Interaction, creature_name: str, stat
         )
         new_ovr = int(sum(stats.values()))
         await _ensure_record(inter.user.id, c_row["id"], c_row["name"], new_ovr)
+        asyncio.create_task(update_leaderboard_now(reason="stat_trainer"))
         await conn.execute(
             "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
             inter.user.id,
@@ -4976,6 +4978,7 @@ async def _use_premium_stat_trainer(inter: discord.Interaction, creature_name: s
         )
         new_ovr = int(sum(stats.values()))
         await _ensure_record(inter.user.id, c_row["id"], c_row["name"], new_ovr)
+        asyncio.create_task(update_leaderboard_now(reason="premium_stat_trainer"))
         await conn.execute(
             "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
             inter.user.id,

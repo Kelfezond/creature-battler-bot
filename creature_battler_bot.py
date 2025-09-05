@@ -3517,9 +3517,16 @@ async def buy(inter: discord.Interaction, creature_name: str):
                 c_row["name"],
             )
             await conn.execute(
-                "UPDATE creature_records SET owner_id=$1 WHERE creature_id=$2",
+                """
+                UPDATE creature_records
+                SET owner_id = $1,
+                    creature_id = $2
+                WHERE owner_id = $3 AND LOWER(name) = LOWER($4)
+                """,
                 inter.user.id,
                 c_row["id"],
+                c_row["owner_id"],
+                c_row["name"],
             )
 
     await _ensure_record(inter.user.id, c_row["id"], c_row["name"])

@@ -693,6 +693,9 @@ active_battles: Dict[int, BattleState] = {}
 battle_lock = asyncio.Lock()
 current_battler_id: Optional[int] = None
 
+# Lock to prevent HP regeneration during sensitive item transactions
+hp_regen_lock = asyncio.Lock()
+
 # ─── Scheduled rewards & regen ───────────────────────────────
 @tasks.loop(hours=1)
 async def distribute_cash():
@@ -737,38 +740,39 @@ async def _catch_up_trainer_points_now():
 
 @tasks.loop(hours=1)
 async def regenerate_hp():
-    now = datetime.now(timezone.utc)
-    # Pre-calc 1 hour ago to avoid relying on SQL interval arithmetic on placeholders
-    now_minus_1h = now - timedelta(hours=1)
-    await (await db_pool()).execute(
-        """
-        WITH regen AS (
-            SELECT id,
-                   FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - COALESCE(last_hp_regen, $2::timestamptz))) / 3600) AS cycles
-            FROM creatures
+    async with hp_regen_lock:
+        now = datetime.now(timezone.utc)
+        # Pre-calc 1 hour ago to avoid relying on SQL interval arithmetic on placeholders
+        now_minus_1h = now - timedelta(hours=1)
+        await (await db_pool()).execute(
+            """
+            WITH regen AS (
+                SELECT id,
+                       FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - COALESCE(last_hp_regen, $2::timestamptz))) / 3600) AS cycles
+                FROM creatures
+            )
+            UPDATE creatures c
+            SET current_hp = LEAST(
+                    COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
+                    + CEIL((c.stats->>'HP')::numeric * 5 * 0.03) * r.cycles,
+                    (c.stats->>'HP')::int * 5
+                ),
+                last_hp_regen = CASE
+                    WHEN LEAST(
+                            COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
+                            + CEIL((c.stats->>'HP')::numeric * 5 * 0.03) * r.cycles,
+                            (c.stats->>'HP')::int * 5
+                         ) > COALESCE(c.current_hp, 0)
+                    THEN $1
+                    ELSE c.last_hp_regen
+                END
+            FROM regen r
+            WHERE c.id = r.id AND r.cycles > 0 AND c.current_hp < (c.stats->>'HP')::int * 5
+            """,
+            now,
+            now_minus_1h,
         )
-        UPDATE creatures c
-        SET current_hp = LEAST(
-                COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
-                + CEIL((c.stats->>'HP')::numeric * 5 * 0.03) * r.cycles,
-                (c.stats->>'HP')::int * 5
-            ),
-            last_hp_regen = CASE
-                WHEN LEAST(
-                        COALESCE(c.current_hp, (c.stats->>'HP')::int * 5)
-                        + CEIL((c.stats->>'HP')::numeric * 5 * 0.03) * r.cycles,
-                        (c.stats->>'HP')::int * 5
-                     ) > COALESCE(c.current_hp, 0)
-                THEN $1
-                ELSE c.last_hp_regen
-            END
-        FROM regen r
-        WHERE c.id = r.id AND r.cycles > 0 AND c.current_hp < (c.stats->>'HP')::int * 5
-        """,
-        now,
-        now_minus_1h,
-    )
-    logger.info("Regenerated HP for creatures needing it")
+        logger.info("Regenerated HP for creatures needing it")
 
 # ─── Utility functions ───────────────────────────────────────
 def roll_d100() -> int: return random.randint(1, 100)
@@ -4820,53 +4824,54 @@ async def _use_exhaustion_eliminator(inter: discord.Interaction, creature_name: 
     if not row:
         return
     pool = await db_pool()
-    async with pool.acquire() as conn:
-        c_row = await conn.fetchrow(
-            "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
-            inter.user.id,
-            creature_name,
-        )
-        if not c_row:
-            return await inter.response.send_message("Creature not found.", ephemeral=True)
-        qty = await conn.fetchval(
-            "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
-            inter.user.id,
-            EXHAUSTION_ELIMINATOR,
-        )
-        if not qty or int(qty) <= 0:
-            return await inter.response.send_message("You don't have any Exhaustion Eliminators.", ephemeral=True)
-        async with conn.transaction():
-            day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
-            row_cap = await conn.fetchrow(
-                "SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE",
-                c_row["id"],
-                day,
+    async with hp_regen_lock:
+        async with pool.acquire() as conn:
+            c_row = await conn.fetchrow(
+                "SELECT id, name FROM creatures WHERE owner_id=$1 AND name ILIKE $2",
+                inter.user.id,
+                creature_name,
             )
-            if not row_cap or int(row_cap["count"]) <= 0:
-                return await inter.response.send_message(
-                    f"**{c_row['name']}** already has 2/2 battles remaining today.",
-                    ephemeral=True,
-                )
-            current = int(row_cap["count"])
-            new_count = current - 1
-            if new_count == 0:
-                await conn.execute(
-                    "DELETE FROM battle_caps WHERE creature_id=$1 AND day=$2",
-                    c_row["id"],
-                    day,
-                )
-            else:
-                await conn.execute(
-                    "UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2",
-                    c_row["id"],
-                    day,
-                    new_count,
-                )
-            await conn.execute(
-                "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+            if not c_row:
+                return await inter.response.send_message("Creature not found.", ephemeral=True)
+            qty = await conn.fetchval(
+                "SELECT quantity FROM trainer_items WHERE user_id=$1 AND item_name=$2",
                 inter.user.id,
                 EXHAUSTION_ELIMINATOR,
             )
+            if not qty or int(qty) <= 0:
+                return await inter.response.send_message("You don't have any Exhaustion Eliminators.", ephemeral=True)
+            async with conn.transaction():
+                day = await conn.fetchval("SELECT (now() AT TIME ZONE 'Europe/London')::date")
+                row_cap = await conn.fetchrow(
+                    "SELECT count FROM battle_caps WHERE creature_id=$1 AND day=$2 FOR UPDATE",
+                    c_row["id"],
+                    day,
+                )
+                if not row_cap or int(row_cap["count"]) <= 0:
+                    return await inter.response.send_message(
+                        f"**{c_row['name']}** already has 2/2 battles remaining today.",
+                        ephemeral=True,
+                    )
+                current = int(row_cap["count"])
+                new_count = current - 1
+                if new_count == 0:
+                    await conn.execute(
+                        "DELETE FROM battle_caps WHERE creature_id=$1 AND day=$2",
+                        c_row["id"],
+                        day,
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE battle_caps SET count=$3 WHERE creature_id=$1 AND day=$2",
+                        c_row["id"],
+                        day,
+                        new_count,
+                    )
+                await conn.execute(
+                    "UPDATE trainer_items SET quantity=quantity-1 WHERE user_id=$1 AND item_name=$2",
+                    inter.user.id,
+                    EXHAUSTION_ELIMINATOR,
+                )
     await inter.response.send_message(
         f"Restored one daily battle for **{c_row['name']}**.", ephemeral=True
     )

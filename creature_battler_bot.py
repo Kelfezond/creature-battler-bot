@@ -4084,13 +4084,20 @@ async def pvp(inter: discord.Interaction):
     if not opp_rows:
         return await inter.followup.send("No eligible opponent creatures found.", ephemeral=True)
 
-    options = [
-        discord.SelectOption(
-            label=f"{r['display_name']}'s {r['name']}",
-            value=f"{r['owner_id']}:{r['id']}"
+    options = []
+    for r in opp_rows:
+        opp_stats = json.loads(r["stats"])
+        opp_ovr = sum(opp_stats.values())
+        diff = opp_ovr - challenger_ovr
+        diff_round = (abs(diff) + 5) // 10 * 10
+        diff_round = diff_round if diff >= 0 else -diff_round
+        sign = "+" if diff_round > 0 else ""
+        options.append(
+            discord.SelectOption(
+                label=f"{r['display_name']}'s {r['name']} ~{sign}{diff_round}",
+                value=f"{r['owner_id']}:{r['id']}"
+            )
         )
-        for r in opp_rows
-    ]
 
     async def handle_challenge(modal_inter: discord.Interaction, opp_row: asyncpg.Record, wager: int):
         opponent_id = int(opp_row["owner_id"])

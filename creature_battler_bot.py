@@ -3878,8 +3878,7 @@ async def dailylimit(inter: discord.Interaction, creature_name: str, number: int
         ephemeral=True
     )
 
-@bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
-async def battle(inter: discord.Interaction, creature_name: str, tier: int):
+async def _battle_impl(inter: discord.Interaction, creature_id: int, tier: int):
     if tier not in TIER_EXTRAS:
         return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
     if inter.user.id in active_battles:
@@ -3896,9 +3895,8 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         )
         return
     c_row = await (await db_pool()).fetchrow(
-        "SELECT id,name,stats,current_hp FROM creatures "
-        "WHERE owner_id=$1 AND name ILIKE $2",
-        inter.user.id, creature_name
+        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND id=$2",
+        inter.user.id, creature_id
     )
     if not c_row:
         return await inter.response.send_message("Creature not found.", ephemeral=True)
@@ -3974,7 +3972,7 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
         max_tier = await _max_unlocked_tier(c_row["id"])
         st.logs.append(f"Tier gate: {user_cre['name']} can currently queue Tier 1..{max_tier}.")
 
-    
+
         # Public start (concise)
         start_public = (
             f"**Battle Start** — {user_cre['name']} vs {opp_cre['name']} (Tier {tier})\n"
@@ -4021,6 +4019,70 @@ async def battle(inter: discord.Interaction, creature_name: str, tier: int):
                 battle_lock.release()
         except Exception:
             pass
+
+@bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
+async def battle(inter: discord.Interaction):
+    if inter.user.id in active_battles:
+        return await inter.response.send_message("You already have an active battle in progress.", ephemeral=True)
+    row = await ensure_registered(inter)
+    if not row:
+        return
+    pool = await db_pool()
+    rows = await pool.fetch(
+        "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1",
+        inter.user.id,
+    )
+    if not rows:
+        return await inter.response.send_message("You have no creatures.", ephemeral=True)
+    left_map = await _battles_left_map([int(r["id"]) for r in rows])
+    eligible = []
+    for r in rows:
+        stats = json.loads(r["stats"])
+        max_hp = stats["HP"] * 5
+        if r["current_hp"] > 0 and left_map.get(int(r["id"]), 0) > 0:
+            label = f"{r['name']} ({r['current_hp']}/{max_hp} HP)"
+            eligible.append((r, max_hp, label))
+    if not eligible:
+        return await inter.response.send_message("No creatures with remaining battles available.", ephemeral=True)
+    options = [discord.SelectOption(label=lab, value=str(r["id"])) for (r, max_hp, lab) in eligible]
+
+    class CreatureSelect(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.selected = None
+
+        @discord.ui.select(placeholder="Select your creature", options=options)
+        async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+            if interaction.user.id != inter.user.id:
+                return await interaction.response.send_message("This menu isn't for you.", ephemeral=True)
+            self.selected = next(item for item in eligible if str(item[0]["id"]) == select.values[0])
+            await interaction.response.defer()
+            self.stop()
+
+    view = CreatureSelect()
+    await inter.response.send_message("Choose your creature:", view=view, ephemeral=True)
+    await view.wait()
+    if not view.selected:
+        return
+    c_row, max_hp, _ = view.selected
+    allowed_tier = await _max_unlocked_tier(c_row["id"])
+    tier_options = [discord.SelectOption(label=f"Tier {t}", value=str(t)) for t in range(1, allowed_tier + 1)]
+
+    class TierSelect(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+
+        @discord.ui.select(placeholder="Select tier", options=tier_options)
+        async def tier_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+            if interaction.user.id != inter.user.id:
+                return await interaction.response.send_message("This menu isn't for you.", ephemeral=True)
+            tier = int(select.values[0])
+            await _battle_impl(interaction, c_row["id"], tier)
+            self.stop()
+
+    tier_view = TierSelect()
+    await inter.followup.send("Choose a tier:", view=tier_view, ephemeral=True)
+    await tier_view.wait()
 
 @bot.tree.command(description="Challenge another trainer to a PvP battle")
 async def pvp(inter: discord.Interaction):

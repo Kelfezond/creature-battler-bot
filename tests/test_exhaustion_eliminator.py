@@ -113,9 +113,17 @@ class DummyResponse:
     def __init__(self):
         self.message = None
         self.ephemeral = None
+        self._done = False
     async def send_message(self, message, ephemeral=False):
         self.message = message
         self.ephemeral = ephemeral
+        self._done = True
+    async def defer(self, **kwargs):
+        if self._done:
+            raise AssertionError("defer called after response already done")
+        self._done = True
+    def is_done(self):
+        return self._done
 
 class FakeConn:
     def __init__(self, state):

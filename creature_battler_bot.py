@@ -3907,13 +3907,18 @@ async def _battle_impl(inter: discord.Interaction, creature_id: int, tier: int):
         return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
 
     allowed_tier = await _max_unlocked_tier(c_row["id"])
-    if tier > allowed_tier:
-        need_prev = tier - 1
-        wins_prev = await _get_wins_for_tier(c_row["id"], need_prev)
+    if tier != allowed_tier:
+        if tier > allowed_tier:
+            need_prev = tier - 1
+            wins_prev = await _get_wins_for_tier(c_row["id"], need_prev)
+            return await inter.response.send_message(
+                f"Tier {tier} is locked for **{c_row['name']}**. Current unlock: **1..{allowed_tier}**. "
+                f"You need **5 wins at Tier {need_prev}** to unlock Tier {tier} (current: {wins_prev}/5).",
+                ephemeral=True
+            )
         return await inter.response.send_message(
-            f"Tier {tier} is locked for **{c_row['name']}**. Current unlock: **1..{allowed_tier}**. "
-            f"You need **5 wins at Tier {need_prev}** to unlock Tier {tier} (current: {wins_prev}/5).",
-            ephemeral=True
+            f"{c_row['name']} must battle at Tier {allowed_tier}; lower tiers are no longer available.",
+            ephemeral=True,
         )
 
     await battle_lock.acquire()
@@ -4020,7 +4025,7 @@ async def _battle_impl(inter: discord.Interaction, creature_id: int, tier: int):
         except Exception:
             pass
 
-@bot.tree.command(description="Battle one of your creatures vs. a tiered opponent")
+@bot.tree.command(description="Battle one of your creatures at its highest unlocked tier")
 async def battle(inter: discord.Interaction):
     if inter.user.id in active_battles:
         return await inter.response.send_message("You already have an active battle in progress.", ephemeral=True)
@@ -4066,23 +4071,7 @@ async def battle(inter: discord.Interaction):
         return
     c_row, max_hp, _ = view.selected
     allowed_tier = await _max_unlocked_tier(c_row["id"])
-    tier_options = [discord.SelectOption(label=f"Tier {t}", value=str(t)) for t in range(1, allowed_tier + 1)]
-
-    class TierSelect(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=60)
-
-        @discord.ui.select(placeholder="Select tier", options=tier_options)
-        async def tier_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
-            if interaction.user.id != inter.user.id:
-                return await interaction.response.send_message("This menu isn't for you.", ephemeral=True)
-            tier = int(select.values[0])
-            await _battle_impl(interaction, c_row["id"], tier)
-            self.stop()
-
-    tier_view = TierSelect()
-    await inter.followup.send("Choose a tier:", view=tier_view, ephemeral=True)
-    await tier_view.wait()
+    await _battle_impl(inter, c_row["id"], allowed_tier)
 
 @bot.tree.command(description="Challenge another trainer to a PvP battle")
 async def pvp(inter: discord.Interaction):
@@ -5553,7 +5542,7 @@ async def info(inter: discord.Interaction):
         "/record <creature_name> — view a creature's lifetime record.\n"
         "/spawn — spend 10,000 cash to hatch a new creature (max 2/day).\n"
         "/spawnforce — admin: spawn ignoring daily limit.\n"
-        "/battle <creature_name> <tier> — fight an AI opponent in a chosen tier.\n"
+        "/battle <creature_name> — fight an AI opponent at its highest unlocked tier.\n"
         "/pvp — challenge another trainer to battle.\n"
         "/frc — show your friend recruitment code.\n"
         "/fr <code> — redeem a friend code for rewards.\n"

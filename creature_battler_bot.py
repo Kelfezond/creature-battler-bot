@@ -3879,47 +3879,59 @@ async def dailylimit(inter: discord.Interaction, creature_name: str, number: int
     )
 
 async def _battle_impl(inter: discord.Interaction, creature_id: int, tier: int):
+    async def _respond(msg: str, *, ephemeral: bool = True):
+        if not inter.response.is_done():
+            await inter.response.send_message(msg, ephemeral=ephemeral)
+        else:
+            await inter.followup.send(msg, ephemeral=ephemeral)
+
     if tier not in TIER_EXTRAS:
-        return await inter.response.send_message("Invalid tier (1-9).", ephemeral=True)
+        await _respond("Invalid tier (1-9).", ephemeral=True)
+        return
     if inter.user.id in active_battles:
-        return await inter.response.send_message("You already have an active battle in progress.", ephemeral=True)
+        await _respond("You already have an active battle in progress.", ephemeral=True)
+        return
     if not await ensure_registered(inter):
         return
 
     # Global battle gate: only one battle may run at a time
     global current_battler_id
     if battle_lock.locked() and (current_battler_id is not None) and (current_battler_id != inter.user.id):
-        await inter.response.send_message(
+        await _respond(
             f"⚔ A battle is already in progress by <@{current_battler_id}>. Please try again shortly.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
     c_row = await (await db_pool()).fetchrow(
         "SELECT id,name,stats,current_hp FROM creatures WHERE owner_id=$1 AND id=$2",
-        inter.user.id, creature_id
+        inter.user.id, creature_id,
     )
     if not c_row:
-        return await inter.response.send_message("Creature not found.", ephemeral=True)
+        await _respond("Creature not found.", ephemeral=True)
+        return
 
     stats = json.loads(c_row["stats"])
     max_hp = stats["HP"] * 5
     if c_row["current_hp"] <= 0:
-        return await inter.response.send_message(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
+        await _respond(f"{c_row['name']} has fainted and needs healing.", ephemeral=True)
+        return
 
     allowed_tier = await _max_unlocked_tier(c_row["id"])
     if tier != allowed_tier:
         if tier > allowed_tier:
             need_prev = tier - 1
             wins_prev = await _get_wins_for_tier(c_row["id"], need_prev)
-            return await inter.response.send_message(
+            await _respond(
                 f"Tier {tier} is locked for **{c_row['name']}**. Current unlock: **1..{allowed_tier}**. "
                 f"You need **5 wins at Tier {need_prev}** to unlock Tier {tier} (current: {wins_prev}/5).",
-                ephemeral=True
+                ephemeral=True,
             )
-        return await inter.response.send_message(
+            return
+        await _respond(
             f"{c_row['name']} must battle at Tier {allowed_tier}; lower tiers are no longer available.",
             ephemeral=True,
         )
+        return
 
     await battle_lock.acquire()
     current_battler_id = inter.user.id
@@ -3928,13 +3940,15 @@ async def _battle_impl(inter: discord.Interaction, creature_id: int, tier: int):
         allowed, count = await _can_start_battle_and_increment(c_row["id"])
         incremented = allowed
         if not allowed:
-            await inter.response.send_message(
+            await _respond(
                 f"Daily battle cap reached for **{c_row['name']}**: {DAILY_BATTLE_CAP}/{DAILY_BATTLE_CAP} used. "
-                "Try again after midnight Europe/London.", ephemeral=True
+                "Try again after midnight Europe/London.",
+                ephemeral=True,
             )
             return
 
-        await inter.response.defer(thinking=True)
+        if not inter.response.is_done():
+            await inter.response.defer(thinking=True)
 
         aug_rows = await (await db_pool()).fetch(
             "SELECT augment_name, augment_type FROM creature_augments WHERE creature_id=$1",

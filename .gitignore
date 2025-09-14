@@ -1,3 +1,5 @@
 apply_*.py
 *.patch
 *.bak
+__pycache__/
+*.pyc

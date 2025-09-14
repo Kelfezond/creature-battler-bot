@@ -106,6 +106,11 @@ intents.message_content = True
 # IMPORTANT: do NOT enable members intent; we resolve trainer names via REST/cache
 bot = commands.Bot(command_prefix="/", intents=intents)
 
+# ─── Leaderboard update throttling ───────────────────────────
+LEADERBOARD_UPDATE_COOLDOWN = 5.0  # seconds between leaderboard edits
+_leaderboard_update_lock = asyncio.Lock()
+_last_leaderboard_update: float = 0.0
+
 # ─── Database helpers ────────────────────────────────────────
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS trainers (
@@ -2151,104 +2156,114 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
     return bio_text, image_url, image_bytes
 
 async def update_leaderboard_now(reason: str = "manual/trigger") -> None:
-    channel_id = await _get_leaderboard_channel_id()
-    if not channel_id:
+    if _leaderboard_update_lock.locked():
         return
-    message = await _get_or_create_leaderboard_message(channel_id)
-    pvp_message = await _get_or_create_pvp_leaderboard_message(channel_id)
-    if message is None and pvp_message is None:
-        return
+    async with _leaderboard_update_lock:
+        global _last_leaderboard_update
+        now = time.monotonic()
+        elapsed = now - _last_leaderboard_update
+        if elapsed < LEADERBOARD_UPDATE_COOLDOWN:
+            await asyncio.sleep(LEADERBOARD_UPDATE_COOLDOWN - elapsed)
+        _last_leaderboard_update = time.monotonic()
 
-    pool = await db_pool()
-    # UPDATED: pull highest obtained glyph tier for each creature via subquery
-    # Refresh lifetime highest glyphs from creature_progress so leaderboard never regresses to '-'
-    try:
-        await pool.execute(
-            """
-            UPDATE creature_records r
-            SET highest_glyph_tier = GREATEST(
-                COALESCE(r.highest_glyph_tier, 0),
-                COALESCE(g.max_tier, 0)
+        channel_id = await _get_leaderboard_channel_id()
+        if not channel_id:
+            return
+        message = await _get_or_create_leaderboard_message(channel_id)
+        pvp_message = await _get_or_create_pvp_leaderboard_message(channel_id)
+        if message is None and pvp_message is None:
+            return
+
+        pool = await db_pool()
+        # UPDATED: pull highest obtained glyph tier for each creature via subquery
+        # Refresh lifetime highest glyphs from creature_progress so leaderboard never regresses to '-'
+        try:
+            await pool.execute(
+                """
+                UPDATE creature_records r
+                SET highest_glyph_tier = GREATEST(
+                    COALESCE(r.highest_glyph_tier, 0),
+                    COALESCE(g.max_tier, 0)
+                )
+                FROM (
+                    SELECT cp.creature_id, MAX(cp.tier) AS max_tier
+                    FROM creature_progress cp
+                    WHERE cp.glyph_unlocked = TRUE
+                    GROUP BY cp.creature_id
+                ) g
+                WHERE r.creature_id = g.creature_id
+                """
             )
-            FROM (
-                SELECT cp.creature_id, MAX(cp.tier) AS max_tier
-                FROM creature_progress cp
-                WHERE cp.glyph_unlocked = TRUE
-                GROUP BY cp.creature_id
-            ) g
-            WHERE r.creature_id = g.creature_id
+        except Exception as e:
+            logger.warning("Failed to refresh highest_glyph_tier before leaderboard: %s", e)
+
+        rows = await pool.fetch(
+            """
+            SELECT
+                r.name,
+                r.wins,
+                r.losses,
+                r.is_dead,
+                COALESCE(t.display_name, r.owner_id::text) AS trainer_name,
+                COALESCE(r.highest_glyph_tier, 0) AS max_glyph_tier,
+                COALESCE(r.ovr, 0) AS ovr
+            FROM creature_records r
+            LEFT JOIN trainers t ON t.user_id = r.owner_id
+            ORDER BY max_glyph_tier DESC, r.wins DESC, r.losses ASC, r.name ASC
+            LIMIT 20
             """
         )
-    except Exception as e:
-        logger.warning("Failed to refresh highest_glyph_tier before leaderboard: %s", e)
-
-    rows = await pool.fetch(
-    """
-        SELECT
-            r.name,
-            r.wins,
-            r.losses,
-            r.is_dead,
-            COALESCE(t.display_name, r.owner_id::text) AS trainer_name,
-            COALESCE(r.highest_glyph_tier, 0) AS max_glyph_tier,
-            COALESCE(r.ovr, 0) AS ovr
-        FROM creature_records r
-        LEFT JOIN trainers t ON t.user_id = r.owner_id
-        ORDER BY max_glyph_tier DESC, r.wins DESC, r.losses ASC, r.name ASC
-        LIMIT 20
-    """
-)
-    formatted: List[Tuple[str, int, int, bool, str, int, int]] = [
-        (
-            r["name"],
-            r["wins"],
-            r["losses"],
-            r["is_dead"],
-            r["trainer_name"],
-            r["max_glyph_tier"],
-            r["ovr"],
+        formatted: List[Tuple[str, int, int, bool, str, int, int]] = [
+            (
+                r["name"],
+                r["wins"],
+                r["losses"],
+                r["is_dead"],
+                r["trainer_name"],
+                r["max_glyph_tier"],
+                r["ovr"],
+            )
+            for r in rows
+        ]
+        updated_ts = int(time.time())
+        title = (
+            f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph / OVR)**\n"
+            f"Updated: <t:{updated_ts}:R>\n"
         )
-        for r in rows
-    ]
-    updated_ts = int(time.time())
-    title = (
-        f"**Creature Leaderboard — Top 20 (Wins / Losses / Highest Glyph / OVR)**\n"
-        f"Updated: <t:{updated_ts}:R>\n"
-    )
-    content = title + _format_leaderboard_lines(formatted)
-    if message is not None:
-        try:
-            await message.edit(content=content)
-            logger.info("Leaderboard updated (%s).", reason)
-        except Exception as e:
-            logger.error("Failed to edit leaderboard message: %s", e)
+        content = title + _format_leaderboard_lines(formatted)
+        if message is not None:
+            try:
+                await message.edit(content=content)
+                logger.info("Leaderboard updated (%s).", reason)
+            except Exception as e:
+                logger.error("Failed to edit leaderboard message: %s", e)
 
-    # PvP leaderboard
-    pvp_rows = await pool.fetch(
-        """
-        SELECT
-            COALESCE(t.display_name, pr.user_id::text) AS trainer_name,
-            pr.wins,
-            pr.losses
-        FROM pvp_records pr
-        LEFT JOIN trainers t ON t.user_id = pr.user_id
-        ORDER BY pr.wins DESC, pr.losses ASC, trainer_name ASC
-        LIMIT 20
-        """
-    )
-    pvp_formatted: List[Tuple[str, int, int]] = [
-        (r["trainer_name"], r["wins"], r["losses"]) for r in pvp_rows
-    ]
-    pvp_title = (
-        f"**Trainer PvP Leaderboard — Top 20 (Wins / Losses)**\n"
-        f"Updated: <t:{updated_ts}:R>\n"
-    )
-    pvp_content = pvp_title + _format_pvp_leaderboard_lines(pvp_formatted)
-    if pvp_message is not None:
-        try:
-            await pvp_message.edit(content=pvp_content)
-        except Exception as e:
-            logger.error("Failed to edit PvP leaderboard message: %s", e)
+        # PvP leaderboard
+        pvp_rows = await pool.fetch(
+            """
+            SELECT
+                COALESCE(t.display_name, pr.user_id::text) AS trainer_name,
+                pr.wins,
+                pr.losses
+            FROM pvp_records pr
+            LEFT JOIN trainers t ON t.user_id = pr.user_id
+            ORDER BY pr.wins DESC, pr.losses ASC, trainer_name ASC
+            LIMIT 20
+            """
+        )
+        pvp_formatted: List[Tuple[str, int, int]] = [
+            (r["trainer_name"], r["wins"], r["losses"]) for r in pvp_rows
+        ]
+        pvp_title = (
+            f"**Trainer PvP Leaderboard — Top 20 (Wins / Losses)**\n"
+            f"Updated: <t:{updated_ts}:R>\n"
+        )
+        pvp_content = pvp_title + _format_pvp_leaderboard_lines(pvp_formatted)
+        if pvp_message is not None:
+            try:
+                await pvp_message.edit(content=pvp_content)
+            except Exception as e:
+                logger.error("Failed to edit PvP leaderboard message: %s", e)
 
 @tasks.loop(minutes=5)
 async def update_leaderboard_periodic():

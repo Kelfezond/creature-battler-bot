@@ -2072,9 +2072,10 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
     try:
         sys_prompt = (
             "You are writing a concise creature entry for an arena-battler encyclopedia. "
-            "These creatures are NOT from natural Warcraft lore—they are laboratory-bred specifically for fighting arenas. "
+            "These combatants are laboratory-forged for gladiatorial arenas—never ordinary wildlife, plants, humans, or humanoids. "
+            "They should feel monstrous, bestial, or arcane-construct in nature. "
             "Tone: punchy, evocative, 3–6 sentences max. "
-            "Include a hint of distinctive abilities implied by the stats/traits. Do not mention that you are an AI."
+            "Highlight distinctive abilities implied by the stats/traits without meta commentary. Do not mention that you are an AI."
         )
         user_prompt = (
             f"Name: {cre_name}\n"
@@ -2111,11 +2112,23 @@ async def _gpt_generate_bio_and_image(cre_name: str, rarity: str, traits: list[s
     image_url = None
     try:
         traits_str = ", ".join(traits) if traits else ""
-        img_prompt = (
-            f"{cre_name}, {rarity} rarity, {traits_str}. "
+        rarity_descriptor = (rarity or "unknown").lower()
+        sanitized_bio = " ".join(bio_text.split()) if bio_text else ""
+        img_prompt_parts = [
+            f"{cre_name}, a {rarity_descriptor} rarity arena combat creature.",
+            f"Traits: {traits_str if traits_str else 'no listed traits'}.",
+        ]
+        if sanitized_bio:
+            img_prompt_parts.append(f"Description: {sanitized_bio}.")
+        img_prompt_parts.append(
+            "Depict a battle-ready, monstrous entity engineered for gladiatorial combat. "
+            "It must not resemble humans, humanoids, ordinary animals, or plants."
+        )
+        img_prompt_parts.append(
             "Ultra-detailed digital image in the style of Warcraft Cinematic CGI, dramatic lighting, "
             "fantasy composition, moody backdrop, crisp focus, volumetric light, high contrast."
         )
+        img_prompt = " ".join(img_prompt_parts)
         loop = asyncio.get_running_loop()
         image_url = None
         image_bytes = None

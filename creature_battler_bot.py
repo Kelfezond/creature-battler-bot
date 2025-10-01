@@ -4517,19 +4517,6 @@ async def stats(inter: discord.Interaction):
             """
         )
 
-        most_creatures = await conn.fetchrow(
-            """
-            SELECT c.owner_id,
-                   COALESCE(t.display_name, c.owner_id::text) AS name,
-                   COUNT(*) AS owned
-            FROM creatures c
-            LEFT JOIN trainers t ON t.user_id = c.owner_id
-            GROUP BY c.owner_id, COALESCE(t.display_name, c.owner_id::text)
-            ORDER BY owned DESC
-            LIMIT 1
-            """
-        )
-
         most_deaths = await conn.fetchrow(
             """
             SELECT r.owner_id,
@@ -4689,7 +4676,6 @@ async def stats(inter: discord.Interaction):
         format_trainer_stat("Most battles fought", most_battles, "total_battles", "battles"),
         format_trainer_stat("Most total wins across all creatures", most_wins, "wins", "wins"),
         cash_line,
-        format_trainer_stat("Most creatures owned", most_creatures, "owned", "creatures"),
         format_trainer_stat("Most creatures died", most_deaths, "deaths", "deaths"),
         format_ratio(best_ratio),
         format_active(most_active),

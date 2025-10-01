@@ -3,3 +3,4 @@ apply_*.py
 *.bak
 __pycache__/
 *.pyc
+season_backups/

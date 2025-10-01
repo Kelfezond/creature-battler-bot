@@ -390,16 +390,27 @@ async def _perform_season_end() -> Path:
                 STARTING_TRAINER_POINTS,
                 STARTING_FACILITY_LEVEL,
             )
-            await conn.execute(
-                "UPDATE leaderboard_messages SET message_id = NULL, pvp_message_id = NULL"
-            )
-            await conn.execute("UPDATE shop_messages SET message_id = NULL")
-            await conn.execute("UPDATE item_store_messages SET message_id = NULL")
-            await conn.execute("UPDATE augment_store_messages SET message_id = NULL")
-            await conn.execute("UPDATE controls_messages SET message_id = NULL")
-
     logger.info("Season end completed; backup saved to %s", backup_path)
     return backup_path
+
+
+async def _refresh_after_season_end() -> None:
+    """Refresh persistent Discord messages after a season reset."""
+
+    async def _run(name: str, coro):
+        try:
+            await coro
+        except Exception:
+            logger.exception("Season end follow-up failed during %s", name)
+
+    await _run("leaderboard", update_leaderboard_now(reason="season_end"))
+    await _run("shop", update_shop_now(reason="season_end"))
+    await _run("item_store", update_item_store_now(reason="season_end"))
+    await _run("augment_store", update_augment_store_now(reason="season_end"))
+
+    controls_chan = await _get_controls_channel_id()
+    if controls_chan:
+        await _run("controls", _get_or_create_controls_message(controls_chan))
 
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5
@@ -3383,7 +3394,7 @@ async def creatures(inter: discord.Interaction):
         inter.user.id,
     )
     if not rows:
-        return await inter.response.send_message("You own no creatures.", ephemeral=True)
+        return await inter.followup.send("You own no creatures.", ephemeral=True)
 
     ids = [int(r["id"]) for r in rows]
 
@@ -4824,6 +4835,7 @@ class SeasonEndConfirmView(discord.ui.View):
         await interaction.edit_original_response(content="Season end in progress…", view=self)
         try:
             backup_path = await _perform_season_end()
+            await _refresh_after_season_end()
         except Exception as exc:
             logger.exception("Season end failed")
             await interaction.edit_original_response(content="Season end failed.", view=self)

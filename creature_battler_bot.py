@@ -3377,11 +3377,14 @@ async def spawnforce(inter: discord.Interaction):
         return await inter.response.send_message("Not authorized.", ephemeral=True)
     await _decrement_spawn_count(inter.user.id)
     await spawn(inter)
-@bot.tree.command(description="List your creatures")
-async def creatures(inter: discord.Interaction):
+async def _show_creature_list(inter: discord.Interaction) -> None:
+    """Shared handler for listing the calling trainer's creatures."""
+
     if not await ensure_registered(inter):
         return
-    await inter.response.defer(ephemeral=True)
+
+    if not inter.response.is_done():
+        await inter.response.defer(ephemeral=True)
     rows = await (await db_pool()).fetch(
         """
         SELECT c.id, c.name, c.rarity, c.descriptors, c.stats, c.current_hp,
@@ -3460,6 +3463,11 @@ async def creatures(inter: discord.Interaction):
         msg = "\n".join(lines)
 
         await inter.followup.send(msg, ephemeral=True, view=CreatureView(r["name"]))
+
+
+@bot.tree.command(description="List your creatures")
+async def creatures(inter: discord.Interaction):
+    await _show_creature_list(inter)
 
 @bot.tree.command(description="See your creature's lifetime win/loss record")
 async def record(inter: discord.Interaction, creature_name: str):
@@ -4528,13 +4536,24 @@ async def pvp(inter: discord.Interaction):
     )
     await select_view.wait()
 
+async def _show_cash(inter: discord.Interaction) -> None:
+    """Shared handler for showing the trainer's cash balance."""
+
+    row = await ensure_registered(inter)
+    if not row:
+        return
+
+    msg = f"You have {fmt_cash(row['cash'])} cash."
+
+    if inter.response.is_done():
+        await inter.followup.send(msg, ephemeral=True)
+    else:
+        await inter.response.send_message(msg, ephemeral=True)
+
+
 @bot.tree.command(description="Check your cash")
 async def cash(inter: discord.Interaction):
-    row = await ensure_registered(inter)
-    if row:
-        await inter.response.send_message(
-            f"You have {fmt_cash(row['cash'])} cash.", ephemeral=True
-        )
+    await _show_cash(inter)
 
 @bot.tree.command(description="(Admin) Add cash to a player by name/mention/id, or 'all'")
 async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
@@ -4914,19 +4933,31 @@ async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str 
     name = await _resolve_trainer_name_from_db(user_id) or str(user_id)
     await inter.response.send_message(f"Added **{amount}** trainer points to **{name}**.", ephemeral=True)
 
+async def _show_trainer_points(inter: discord.Interaction) -> None:
+    """Shared handler for displaying trainer point totals."""
+
+    row = await ensure_registered(inter)
+    if not row:
+        return
+
+    level = row["facility_level"]
+    bonus = facility_bonus(level)
+    daily = 5 + bonus
+    msg = (
+        f"You have {row['trainer_points']} points. "
+        f"Facility Level {level} ({FACILITY_LEVELS[level]['name']}) gives +{bonus} extra per day "
+        f"(total {daily}/day)."
+    )
+
+    if inter.response.is_done():
+        await inter.followup.send(msg, ephemeral=True, view=TrainerPointsView())
+    else:
+        await inter.response.send_message(msg, ephemeral=True, view=TrainerPointsView())
+
+
 @bot.tree.command(description="Check your trainer points")
 async def trainerpoints(inter: discord.Interaction):
-    row = await ensure_registered(inter)
-    if row:
-        level = row["facility_level"]
-        bonus = facility_bonus(level)
-        daily = 5 + bonus
-        msg = (
-            f"You have {row['trainer_points']} points. "
-            f"Facility Level {level} ({FACILITY_LEVELS[level]['name']}) gives +{bonus} extra per day "
-            f"(total {daily}/day)."
-        )
-        await inter.response.send_message(msg, ephemeral=True, view=TrainerPointsView())
+    await _show_trainer_points(inter)
 
 
 @bot.tree.command(description="Show your friend recruitment code")
@@ -5038,11 +5069,13 @@ async def _train_creature(inter: discord.Interaction, creature_name: str, stat: 
 async def train(inter: discord.Interaction):
     await inter.response.send_modal(TrainModal())
 
-@bot.tree.command(description="Show and confirm upgrading your training facility")
-async def upgrade(inter: discord.Interaction):
+async def _show_upgrade_prompt(inter: discord.Interaction) -> None:
+    """Shared handler for presenting the facility upgrade confirmation."""
+
     row = await ensure_registered(inter)
     if not row:
         return
+
     level = row["facility_level"]
     current = FACILITY_LEVELS[level]
     msg = [
@@ -5052,9 +5085,15 @@ async def upgrade(inter: discord.Interaction):
         f"Description: {current['desc']}",
         ""
     ]
+
     if level >= MAX_FACILITY_LEVEL:
         msg.append("You're already at the **maximum level**. No further upgrades available.")
-        return await inter.response.send_message("\n".join(msg), ephemeral=True)
+        text = "\n".join(msg)
+        if inter.response.is_done():
+            await inter.followup.send(text, ephemeral=True)
+        else:
+            await inter.response.send_message(text, ephemeral=True)
+        return
 
     next_level = level + 1
     nxt = FACILITY_LEVELS[next_level]
@@ -5066,11 +5105,18 @@ async def upgrade(inter: discord.Interaction):
         "",
         "Confirm upgrade?"
     ]
-    await inter.response.send_message(
-        "\n".join(msg),
-        ephemeral=True,
-        view=UpgradeConfirmView(inter.user.id),
-    )
+
+    text = "\n".join(msg)
+    view = UpgradeConfirmView(inter.user.id)
+    if inter.response.is_done():
+        await inter.followup.send(text, ephemeral=True, view=view)
+    else:
+        await inter.response.send_message(text, ephemeral=True, view=view)
+
+
+@bot.tree.command(description="Show and confirm upgrading your training facility")
+async def upgrade(inter: discord.Interaction):
+    await _show_upgrade_prompt(inter)
 
 @bot.tree.command(description="Confirm upgrading your training facility (costs cash)")
 async def upgradeyes(inter: discord.Interaction):
@@ -5968,7 +6014,7 @@ class ControlsView(discord.ui.View):
         custom_id="controls_creatures",
     )
     async def btn_creatures(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await creatures.callback(interaction)
+        await _show_creature_list(interaction)
 
     @discord.ui.button(
         label="Trainer Points",
@@ -5976,7 +6022,7 @@ class ControlsView(discord.ui.View):
         custom_id="controls_tp",
     )
     async def btn_tp(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await trainerpoints.callback(interaction)
+        await _show_trainer_points(interaction)
 
     @discord.ui.button(
         label="Cash",
@@ -5984,7 +6030,7 @@ class ControlsView(discord.ui.View):
         custom_id="controls_cash",
     )
     async def btn_cash(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await cash.callback(interaction)
+        await _show_cash(interaction)
 
     @discord.ui.button(
         label="Upgrade",
@@ -5992,7 +6038,7 @@ class ControlsView(discord.ui.View):
         custom_id="controls_upgrade",
     )
     async def btn_upgrade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await upgrade.callback(interaction)
+        await _show_upgrade_prompt(interaction)
 
 controls_view: Optional[ControlsView] = None
 

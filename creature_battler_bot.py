@@ -2558,12 +2558,6 @@ async def _get_controls_channel_id() -> Optional[int]:
 
 
 async def _get_or_create_controls_message(channel_id: int) -> Optional[discord.Message]:
-    try:
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-    except Exception as e:
-        logger.error("Failed to fetch controls channel %s: %s", channel_id, e)
-        return None
-
     global controls_view
     if controls_view is None:
         controls_view = ControlsView()
@@ -2574,12 +2568,41 @@ async def _get_or_create_controls_message(channel_id: int) -> Optional[discord.M
         channel_id,
     )
 
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except discord.Forbidden as e:
+        # The bot no longer has access to the channel. We can still re-register
+        # the persistent view so existing control buttons keep working, as long
+        # as we know the original message id.
+        if msg_id:
+            bot.add_view(controls_view, message_id=int(msg_id))
+            logger.warning(
+                "Missing access to controls channel %s; re-registered persistent view only.",
+                channel_id,
+            )
+        else:
+            logger.error("Failed to fetch controls channel %s: %s", channel_id, e)
+        return None
+    except discord.HTTPException as e:
+        logger.error("Failed to fetch controls channel %s: %s", channel_id, e)
+        return None
+
     message: Optional[discord.Message] = None
     if msg_id:
         try:
             message = await channel.fetch_message(int(msg_id))
             bot.add_view(controls_view, message_id=message.id)
-        except Exception:
+        except discord.Forbidden:
+            bot.add_view(controls_view, message_id=int(msg_id))
+            logger.warning(
+                "Missing access to fetch controls message %s in channel %s; view registered without fetch.",
+                msg_id,
+                channel_id,
+            )
+            message = None
+        except discord.NotFound:
+            message = None
+        except discord.HTTPException:
             message = None
 
     if message is None:

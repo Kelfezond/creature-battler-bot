@@ -17,7 +17,8 @@ async def _max_glyph_for_trainer(user_id: int) -> int:
         except Exception:
             return 0
 
-import asyncio, json, logging, math, os, random, time, re, secrets, string
+import asyncio, json, logging, math, os, random, time, re, secrets, string, decimal
+from pathlib import Path
 
 
 def fmt_cash(amount: int) -> str:
@@ -39,7 +40,7 @@ import asyncpg
 import discord
 from discord.ext import commands, tasks
 from openai import OpenAI
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime, date
 from zoneinfo import ZoneInfo
 
 # ─── Basic config & logging ──────────────────────────────────
@@ -57,6 +58,9 @@ MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1400"))
 OPENAI_DEBUG = os.getenv("OPENAI_DEBUG", "0") == "1"
 
 logger.info("Using TEXT_MODEL=%s, IMAGE_MODEL=%s", TEXT_MODEL, IMAGE_MODEL)
+
+BASE_DIR = Path(__file__).resolve().parent
+SEASON_BACKUP_DIR = BASE_DIR / "season_backups"
 
 # Optional: channel where the live leaderboard is posted/updated.
 LEADERBOARD_CHANNEL_ID_ENV = os.getenv("LEADERBOARD_CHANNEL_ID")
@@ -308,11 +312,104 @@ async def db_pool() -> asyncpg.Pool:
         bot._pool = await asyncpg.create_pool(DB_URL)
     return bot._pool
 
+SEASON_BACKUP_TABLES: Tuple[str, ...] = (
+    "trainers",
+    "creatures",
+    "creature_progress",
+    "creature_records",
+    "battle_caps",
+    "spawn_caps",
+    "spawn_name_cache",
+    "pvp_records",
+    "pvp_cooldowns",
+    "leaderboard_messages",
+    "creature_shop",
+    "shop_messages",
+    "item_store_messages",
+    "augment_store_messages",
+    "creature_augments",
+    "trainer_items",
+    "controls_messages",
+    "encyclopedia_channel",
+    "friend_codes",
+    "friend_recruits",
+)
+
+
+def _season_backup_json_default(value: object) -> object:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, set):
+        return list(value)
+    return str(value)
+
+
+async def _snapshot_tables(conn: asyncpg.Connection) -> Dict[str, List[Dict[str, Any]]]:
+    snapshot: Dict[str, List[Dict[str, Any]]] = {}
+    for table in SEASON_BACKUP_TABLES:
+        rows = await conn.fetch(f"SELECT * FROM {table}")
+        snapshot[table] = [dict(r) for r in rows]
+    return snapshot
+
+
+async def _perform_season_end() -> Path:
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            snapshot = await _snapshot_tables(conn)
+
+            SEASON_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            backup_path = SEASON_BACKUP_DIR / f"season_{timestamp}.json"
+            backup_path.write_text(
+                json.dumps(snapshot, default=_season_backup_json_default, indent=2),
+                encoding="utf-8",
+            )
+
+            await conn.execute("DELETE FROM creature_progress")
+            await conn.execute("DELETE FROM creature_records")
+            await conn.execute("DELETE FROM creature_augments")
+            await conn.execute("DELETE FROM battle_caps")
+            await conn.execute("DELETE FROM spawn_caps")
+            await conn.execute("DELETE FROM spawn_name_cache")
+            await conn.execute("DELETE FROM pvp_cooldowns")
+            await conn.execute("DELETE FROM pvp_records")
+            await conn.execute("DELETE FROM creature_shop")
+            await conn.execute("DELETE FROM trainer_items")
+            await conn.execute("DELETE FROM friend_recruits")
+            await conn.execute("DELETE FROM creatures")
+            await conn.execute("DELETE FROM friend_codes")
+
+            await conn.execute(
+                "UPDATE trainers SET cash = $1, trainer_points = $2, facility_level = $3, last_tp_grant = NULL",
+                STARTING_CASH,
+                STARTING_TRAINER_POINTS,
+                STARTING_FACILITY_LEVEL,
+            )
+            await conn.execute(
+                "UPDATE leaderboard_messages SET message_id = NULL, pvp_message_id = NULL"
+            )
+            await conn.execute("UPDATE shop_messages SET message_id = NULL")
+            await conn.execute("UPDATE item_store_messages SET message_id = NULL")
+            await conn.execute("UPDATE augment_store_messages SET message_id = NULL")
+            await conn.execute("UPDATE controls_messages SET message_id = NULL")
+
+    logger.info("Season end completed; backup saved to %s", backup_path)
+    return backup_path
+
 # ─── Game constants ──────────────────────────────────────────
 MAX_CREATURES = 5
 DAILY_BATTLE_CAP = 2  # <— used for display of remaining battles
 DAILY_SPAWN_CAP = 2
 PVP_COOLDOWN_HOURS = 12
+
+STARTING_CASH = 20_000
+STARTING_TRAINER_POINTS = 5
+STARTING_FACILITY_LEVEL = 1
 
 RARITY_FLOORS: Dict[str, int] = {
     "Common": 2_000,
@@ -3144,7 +3241,7 @@ async def register(inter: discord.Interaction):
 
     await pool.execute(
         "INSERT INTO trainers(user_id, cash, trainer_points, facility_level, display_name) VALUES($1,$2,$3,$4,$5)",
-        inter.user.id, 20000, 5, 1,
+        inter.user.id, STARTING_CASH, STARTING_TRAINER_POINTS, STARTING_FACILITY_LEVEL,
         (getattr(inter.user, 'global_name', None) or getattr(inter.user, 'display_name', None) or inter.user.name)
     )
 
@@ -3193,7 +3290,7 @@ async def register(inter: discord.Interaction):
         logger.warning("Unexpected error while assigning 'Testers' role: %s", e)
 
     await inter.response.send_message(
-        f"Profile created! You received {fmt_cash(20000)} cash and 5 trainer points.",
+        f"Profile created! You received {fmt_cash(STARTING_CASH)} cash and {STARTING_TRAINER_POINTS} trainer points.",
         ephemeral=True
     )
 
@@ -4689,6 +4786,86 @@ async def stats(inter: discord.Interaction):
     ]
 
     await inter.followup.send("\n".join(lines), ephemeral=False)
+
+
+class SeasonEndConfirmView(discord.ui.View):
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+        self.message: Optional[discord.InteractionMessage] = None
+
+    def _disable_children(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the admin who invoked /seasonend can interact with this confirmation.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        self._disable_children()
+        if self.message is not None:
+            try:
+                await self.message.edit(content="Season end confirmation timed out.", view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Confirm Season End", style=discord.ButtonStyle.danger)
+    async def confirm(  # type: ignore[override]
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        self._disable_children()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.edit_original_response(content="Season end in progress…", view=self)
+        try:
+            backup_path = await _perform_season_end()
+        except Exception as exc:
+            logger.exception("Season end failed")
+            await interaction.edit_original_response(content="Season end failed.", view=self)
+            await interaction.followup.send(f"Season end failed: {exc}", ephemeral=True)
+        else:
+            try:
+                display_path = str(backup_path.relative_to(BASE_DIR))
+            except ValueError:
+                display_path = str(backup_path)
+            await interaction.edit_original_response(content="Season end completed.", view=self)
+            await interaction.followup.send(
+                "Season ended successfully. Backup saved to ``{}``.".format(display_path),
+                ephemeral=True,
+            )
+        finally:
+            self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(  # type: ignore[override]
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        self._disable_children()
+        await interaction.response.edit_message(content="Season end cancelled.", view=self)
+        self.stop()
+
+
+@bot.tree.command(description="(Admin) Back up all data and reset progress for a new season")
+async def seasonend(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+
+    view = SeasonEndConfirmView(inter.user.id)
+    await inter.response.send_message(
+        "⚠️ This will save a backup of all data and reset every trainer to starting values. Continue?",
+        view=view,
+        ephemeral=True,
+    )
+    try:
+        view.message = await inter.original_response()
+    except Exception:
+        view.message = None
+
 
 @bot.tree.command(description="(Admin) Add trainer points to a player by name/mention/id, or 'all'")
 async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str = "me"):

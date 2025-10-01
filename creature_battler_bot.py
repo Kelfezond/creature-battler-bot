@@ -4468,6 +4468,242 @@ async def cashadd(inter: discord.Interaction, amount: int, target: str = "me"):
         f"Added **{fmt_cash(amount)}** cash to **{name}**.", ephemeral=True
     )
 
+
+@bot.tree.command(description="(Admin) Show overall game statistics")
+async def stats(inter: discord.Interaction):
+    if inter.user.id not in ADMIN_USER_IDS:
+        return await inter.response.send_message("Not authorized to use this command.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=False, thinking=True)
+
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        most_battles = await conn.fetchrow(
+            """
+            SELECT r.owner_id,
+                   COALESCE(t.display_name, r.owner_id::text) AS name,
+                   SUM(r.wins + r.losses) AS total_battles
+            FROM creature_records r
+            LEFT JOIN trainers t ON t.user_id = r.owner_id
+            GROUP BY r.owner_id, COALESCE(t.display_name, r.owner_id::text)
+            HAVING SUM(r.wins + r.losses) > 0
+            ORDER BY total_battles DESC
+            LIMIT 1
+            """
+        )
+
+        most_wins = await conn.fetchrow(
+            """
+            SELECT r.owner_id,
+                   COALESCE(t.display_name, r.owner_id::text) AS name,
+                   SUM(r.wins) AS wins
+            FROM creature_records r
+            LEFT JOIN trainers t ON t.user_id = r.owner_id
+            GROUP BY r.owner_id, COALESCE(t.display_name, r.owner_id::text)
+            HAVING SUM(r.wins) > 0
+            ORDER BY wins DESC
+            LIMIT 1
+            """
+        )
+
+        most_cash = await conn.fetchrow(
+            """
+            SELECT tr.user_id AS owner_id,
+                   COALESCE(tr.display_name, tr.user_id::text) AS name,
+                   tr.cash
+            FROM trainers tr
+            ORDER BY tr.cash DESC
+            LIMIT 1
+            """
+        )
+
+        most_creatures = await conn.fetchrow(
+            """
+            SELECT c.owner_id,
+                   COALESCE(t.display_name, c.owner_id::text) AS name,
+                   COUNT(*) AS owned
+            FROM creatures c
+            LEFT JOIN trainers t ON t.user_id = c.owner_id
+            GROUP BY c.owner_id, COALESCE(t.display_name, c.owner_id::text)
+            ORDER BY owned DESC
+            LIMIT 1
+            """
+        )
+
+        most_deaths = await conn.fetchrow(
+            """
+            SELECT r.owner_id,
+                   COALESCE(t.display_name, r.owner_id::text) AS name,
+                   COUNT(*) AS deaths
+            FROM creature_records r
+            LEFT JOIN trainers t ON t.user_id = r.owner_id
+            WHERE r.is_dead = TRUE
+            GROUP BY r.owner_id, COALESCE(t.display_name, r.owner_id::text)
+            ORDER BY deaths DESC
+            LIMIT 1
+            """
+        )
+
+        best_ratio = await conn.fetchrow(
+            """
+            SELECT r.owner_id,
+                   COALESCE(t.display_name, r.owner_id::text) AS name,
+                   SUM(r.wins) AS wins,
+                   SUM(r.losses) AS losses,
+                   SUM(r.wins)::float / NULLIF(SUM(r.wins) + SUM(r.losses), 0) AS ratio
+            FROM creature_records r
+            LEFT JOIN trainers t ON t.user_id = r.owner_id
+            GROUP BY r.owner_id, COALESCE(t.display_name, r.owner_id::text)
+            HAVING SUM(r.wins) + SUM(r.losses) >= 5
+            ORDER BY ratio DESC, wins DESC
+            LIMIT 1
+            """
+        )
+
+        most_active = await conn.fetchrow(
+            """
+            SELECT p.user_id AS owner_id,
+                   COALESCE(t.display_name, p.user_id::text) AS name,
+                   p.wins,
+                   p.losses,
+                   (p.wins + p.losses) AS total
+            FROM pvp_records p
+            LEFT JOIN trainers t ON t.user_id = p.user_id
+            WHERE (p.wins + p.losses) > 0
+            ORDER BY total DESC, p.wins DESC
+            LIMIT 1
+            """
+        )
+
+        toughest_creature = await conn.fetchrow(
+            """
+            SELECT c.name,
+                   COALESCE(t.display_name, c.owner_id::text) AS trainer,
+                   (c.stats->>'HP')::int AS value
+            FROM creatures c
+            LEFT JOIN trainers t ON t.user_id = c.owner_id
+            WHERE c.stats ? 'HP'
+            ORDER BY value DESC NULLS LAST, c.id ASC
+            LIMIT 1
+            """
+        )
+
+        fastest_creature = await conn.fetchrow(
+            """
+            SELECT c.name,
+                   COALESCE(t.display_name, c.owner_id::text) AS trainer,
+                   (c.stats->>'SPD')::int AS value
+            FROM creatures c
+            LEFT JOIN trainers t ON t.user_id = c.owner_id
+            WHERE c.stats ? 'SPD'
+            ORDER BY value DESC NULLS LAST, c.id ASC
+            LIMIT 1
+            """
+        )
+
+        strongest_creature = await conn.fetchrow(
+            """
+            SELECT c.name,
+                   COALESCE(t.display_name, c.owner_id::text) AS trainer,
+                   (c.stats->>'PATK')::int AS value
+            FROM creatures c
+            LEFT JOIN trainers t ON t.user_id = c.owner_id
+            WHERE c.stats ? 'PATK'
+            ORDER BY value DESC NULLS LAST, c.id ASC
+            LIMIT 1
+            """
+        )
+
+        cunning_creature = await conn.fetchrow(
+            """
+            SELECT c.name,
+                   COALESCE(t.display_name, c.owner_id::text) AS trainer,
+                   (c.stats->>'SATK')::int AS value
+            FROM creatures c
+            LEFT JOIN trainers t ON t.user_id = c.owner_id
+            WHERE c.stats ? 'SATK'
+            ORDER BY value DESC NULLS LAST, c.id ASC
+            LIMIT 1
+            """
+        )
+
+        armoured_creature = await conn.fetchrow(
+            """
+            SELECT c.name,
+                   COALESCE(t.display_name, c.owner_id::text) AS trainer,
+                   (c.stats->>'AR')::int AS value
+            FROM creatures c
+            LEFT JOIN trainers t ON t.user_id = c.owner_id
+            WHERE c.stats ? 'AR'
+            ORDER BY value DESC NULLS LAST, c.id ASC
+            LIMIT 1
+            """
+        )
+
+    def format_trainer_stat(title: str, row, value_key: str, suffix: str, formatter=lambda x: x):
+        if not row or row[value_key] in (None, 0):
+            return f"• **{title}:** —"
+        value = formatter(row[value_key])
+        return f"• **{title}:** {row['name']} — {value} {suffix}".rstrip()
+
+    def format_ratio(row):
+        if not row:
+            return "• **Best win/loss ratio across all creatures:** —"
+        ratio = row["ratio"]
+        if ratio is None:
+            return "• **Best win/loss ratio across all creatures:** —"
+        battles = (row["wins"] or 0) + (row["losses"] or 0)
+        pct = ratio * 100
+        return (
+            f"• **Best win/loss ratio across all creatures:** {row['name']} — "
+            f"{pct:.1f}% ({row['wins']}W-{row['losses']}L over {battles} battles)"
+        )
+
+    def format_active(row):
+        if not row:
+            return "• **Most active player:** —"
+        return (
+            f"• **Most active player:** {row['name']} — {row['total']} PvP matches "
+            f"({row['wins']}W-{row['losses']}L)"
+        )
+
+    def format_creature(title: str, row):
+        if not row or row["value"] is None:
+            return f"• **{title}:** —"
+        return f"• **{title}:** {row['name']} ({row['trainer']}) — {row['value']}"
+
+    cash_line = format_trainer_stat(
+        "Most cash at season end",
+        most_cash,
+        "cash",
+        "cash",
+        formatter=lambda v: fmt_cash(int(v)),
+    )
+    if most_cash and most_cash["cash"] not in (None, 0):
+        cash_line += " (current balance)"
+
+    lines = [
+        "📊 **Global Highlights**",
+        "",
+        "__Trainer Records__",
+        format_trainer_stat("Most battles fought", most_battles, "total_battles", "battles"),
+        format_trainer_stat("Most total wins across all creatures", most_wins, "wins", "wins"),
+        cash_line,
+        format_trainer_stat("Most creatures owned", most_creatures, "owned", "creatures"),
+        format_trainer_stat("Most creatures died", most_deaths, "deaths", "deaths"),
+        format_ratio(best_ratio),
+        format_active(most_active),
+        "",
+        "__Creature Standouts__",
+        format_creature("Toughest Creature: Highest HP", toughest_creature),
+        format_creature("Fastest Creature: Highest SPD", fastest_creature),
+        format_creature("Strongest Creature: Highest PATK", strongest_creature),
+        format_creature("Most Cunning Creature: Highest SATK", cunning_creature),
+        format_creature("Most Armoured Creature: Highest AR", armoured_creature),
+    ]
+
+    await inter.followup.send("\n".join(lines), ephemeral=False)
+
 @bot.tree.command(description="(Admin) Add trainer points to a player by name/mention/id, or 'all'")
 async def trainerpointsadd(inter: discord.Interaction, amount: int, target: str = "me"):
     if inter.user.id not in ADMIN_USER_IDS:

@@ -3165,11 +3165,14 @@ async def setleaderboardchannel(inter: discord.Interaction):
         return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
 
     pool = await db_pool()
+    await pool.execute("DELETE FROM leaderboard_messages")
     await pool.execute(
         """
         INSERT INTO leaderboard_messages(channel_id, message_id, pvp_message_id)
         VALUES ($1, NULL, NULL)
-        ON CONFLICT (channel_id) DO NOTHING
+        ON CONFLICT (channel_id) DO UPDATE
+            SET message_id = EXCLUDED.message_id,
+                pvp_message_id = EXCLUDED.pvp_message_id
         """,
         inter.channel.id,
     )
@@ -3258,6 +3261,7 @@ async def setencyclopediachannel(inter: discord.Interaction):
         return await inter.response.send_message("Cannot determine channel.", ephemeral=True)
 
     pool = await db_pool()
+    await pool.execute("DELETE FROM encyclopedia_channel")
     await pool.execute("""
         INSERT INTO encyclopedia_channel(channel_id)
         VALUES ($1)
